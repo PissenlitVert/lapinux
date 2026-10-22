@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ludus
+GenericName=Gestionnaire de jeux
+Comment=Bibliothèque Steam sans Steam, Proton, manettes et overlay
+Exec=ludus
+Icon=applications-games
+Terminal=false
+Categories=Game;Player;
+Keywords=steam;proton;gamepad;launcher;
+StartupNotify=true

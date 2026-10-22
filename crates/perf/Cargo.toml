@@ -1,0 +1,15 @@
+[package]
+name = "ludus-perf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ludus-core = { path = "../core" }
+ludus-proton = { path = "../proton" }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+thiserror = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

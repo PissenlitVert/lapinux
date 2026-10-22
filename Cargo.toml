@@ -1,0 +1,35 @@
+[package]
+name = "ludus"
+version = "0.1.0"
+edition = "2021"
+description = "Gestionnaire de jeux léger pour Linux : Steam sans Steam, Proton, manettes et overlay"
+license = "MIT"
+
+[workspace]
+members = ["crates/core", "crates/steam", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
+default-members = [".", "crates/core", "crates/steam", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
+
+[dependencies]
+ludus-core = { path = "crates/core" }
+ludus-steam = { path = "crates/steam" }
+ludus-proton = { path = "crates/proton" }
+ludus-perf = { path = "crates/perf" }
+ludus-input = { path = "crates/input" }
+ludus-overlay = { path = "crates/overlay" }
+ludus-ui = { path = "crates/ui" }
+ludus-daemon = { path = "crates/daemon" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 1

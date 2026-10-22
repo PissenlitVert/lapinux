@@ -1,0 +1,16 @@
+[package]
+name = "ludus-input"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ludus-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+thiserror = "1"
+evdev = "0.13"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

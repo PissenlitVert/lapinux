@@ -1,0 +1,18 @@
+[Unit]
+Description=Ludus — daemon de jeux (bibliothèque, téléchargements, overlay)
+Documentation=https://github.com/ludus-games/ludus
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ludus --daemon
+Restart=on-failure
+RestartSec=2
+Environment=LUDUS_LOG=info
+# Téléchargements : ne pas être tué par le gestionnaire de mémoire.
+OOMScoreAdjust=-200
+Nice=5
+
+[Install]
+WantedBy=default.target
