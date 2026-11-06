@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/PissenlitVert/lapinux-configurations/main/schema/configuration.schema.json",
+  "title": "Lapinux configuration manifest",
+  "description": "A declarative fix, translation or mod. No script is ever executed: Lapinux only applies settings and copies files.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "title",
+    "description",
+    "solution",
+    "type",
+    "platform",
+    "author",
+    "version",
+    "license",
+    "game",
+    "actions"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "description": "Stable identifier, globally unique. Never reuse an id for a different configuration."
+    },
+    "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The problem the player sees, in English."
+    },
+    "solution": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the configuration changes and why it helps."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["graphics", "performance", "display", "language", "compatibility", "input", "content"]
+    },
+    "platform": {
+      "type": "string",
+      "enum": ["windows", "linux", "both"],
+      "description": "The game build the configuration targets."
+    },
+    "layers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["dxvk", "vkd3d", "wine", "proton", "gamescope", "mangohud", "game"]
+      },
+      "uniqueItems": true,
+      "description": "Where the change lands. Informational: it is shown in the game sheet."
+    },
+    "language": {
+      "type": "string",
+      "pattern": "^[a-z]{2}(?:-[A-Za-z]{2,4})?$",
+      "description": "Language added or fixed, for a translation."
+    },
+    "author": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "github": { "type": "string", "pattern": "^[A-Za-z0-9-]+$" }
+      }
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$",
+      "description": "Semantic version. Bump it whenever the content changes: Lapinux offers an update."
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SPDX identifier of the content, for example CC0-1.0 or MIT."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["proposed", "verified", "broken"],
+      "default": "proposed",
+      "description": "verified means the author reproduced the test; broken means it must not be installed."
+    },
+    "tested": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "proton": { "type": "string" },
+        "gpu": { "type": "string" },
+        "ram": { "type": "string" },
+        "distro": { "type": "string" },
+        "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
+      }
+    },
+    "game": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["names"],
+      "properties": {
+        "names": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "aliases": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Other spellings the same game may appear under."
+        },
+        "steam_appids": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 },
+          "uniqueItems": true
+        },
+        "store_ids": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^(epic|gog|itch):.+" },
+          "uniqueItems": true,
+          "description": "epic:<appName>, gog:<product id> or itch:<slug>."
+        }
+      }
+    },
+    "requires": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ids that must be installed first."
+    },
+    "conflicts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ids that cannot be installed at the same time."
+    },
+    "retired": {
+      "type": "boolean",
+      "default": false,
+      "description": "Kept installable for players who already have it, but no longer offered."
+    },
+    "actions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "settings": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "env": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "prefixItems": [
+                  { "type": "string", "minLength": 1 },
+                  { "type": "string" }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+              },
+              "description": "Environment variables passed to the game, [NAME, value]."
+            },
+            "dxvk": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "shared_mb": { "type": "integer", "minimum": 1 },
+                "device_mb": { "type": "integer", "minimum": 1 },
+                "device": { "type": "string", "maxLength": 64 }
+              }
+            },
+            "args": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Arguments appended to the command line."
+            }
+          }
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "target", "sha256"],
+            "properties": {
+              "source": {
+                "type": "string",
+                "description": "Path in this repository, relative to the manifest."
+              },
+              "target": {
+                "type": "string",
+                "description": "Path in the game folder, relative to its install directory. No '..', no drive letter."
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{64}$",
+                "description": "Digest of the source file. Recompute it after every change."
+              },
+              "backup": {
+                "type": "boolean",
+                "default": true,
+                "description": "Keep the replaced file so Remove restores it. Defaults to true."
+              }
+            }
+          }
+        }
+      }
+    },
+    "links": {
+      "type": "array",
+      "items": { "type": "string", "format": "uri", "pattern": "^https://" },
+      "description": "Documentation, issue or discussion."
+    }
+  }
+}

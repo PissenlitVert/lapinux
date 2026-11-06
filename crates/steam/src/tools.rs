@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
-pub const USER_AGENT: &str = concat!("ludus/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("lapinux/", env!("CARGO_PKG_VERSION"));
 
 pub fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
@@ -85,55 +85,9 @@ pub fn chmod_exec(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extrait une entrée précise d'un zip (recherche par suffixe).
-pub fn extract_zip_entry(archive: &Path, entry_suffix: &str, dest: &Path) -> Result<()> {
-    let file = File::open(archive)?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| Error::Other(format!("zip : {e}")))?;
-    for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|e| Error::Other(format!("zip : {e}")))?;
-        if entry.is_dir() {
-            continue;
-        }
-        let name = entry.name().to_string();
-        if name.ends_with(entry_suffix) {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut out = File::create(dest)?;
-            std::io::copy(&mut entry, &mut out)?;
-            chmod_exec(dest)?;
-            return Ok(());
-        }
-    }
-    Err(Error::Other(format!(
-        "entrée {entry_suffix} absente de {}",
-        archive.display()
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn extracts_zip_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let archive_path = dir.path().join("a.zip");
-        {
-            let file = File::create(&archive_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default();
-            zip.start_file("bin/tool", options).unwrap();
-            zip.write_all(b"#!/bin/sh\n").unwrap();
-            zip.finish().unwrap();
-        }
-        let out = dir.path().join("tool");
-        extract_zip_entry(&archive_path, "bin/tool", &out).unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), b"#!/bin/sh\n");
-    }
 
     #[test]
     fn extracts_tar_gz() {

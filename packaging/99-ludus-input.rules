@@ -1,6 +1,0 @@
-# Accès manettes et pad virtuel pour les sessions sans ACL logind.
-# Installation facultative (root) :
-#   sudo cp packaging/99-ludus-input.rules /etc/udev/rules.d/
-#   sudo udevadm control --reload-rules && sudo udevadm trigger
-KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
-SUBSYSTEM=="input", TAG+="uaccess"

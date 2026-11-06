@@ -1,0 +1,6 @@
+# Accès manettes et pad virtuel pour les sessions sans ACL logind.
+# Installation facultative, en root :
+#   cp packaging/99-lapinux-input.rules /etc/udev/rules.d/
+#   udevadm control --reload-rules && udevadm trigger
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", TAG+="uaccess"

@@ -13,7 +13,7 @@ impl Mapping {
     /// Crée un memfd de `len` octets et le mappe.
     pub fn new(len: usize) -> Result<Self> {
         unsafe {
-            let name = c"ludus-overlay";
+            let name = c"lapinux-overlay";
             let fd = libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC);
             if fd < 0 {
                 return Err(Error::Other(format!(
@@ -50,10 +50,37 @@ impl Mapping {
         }
     }
 
-    pub fn write(&mut self, data: &[u8]) {
+    /// Copie un Pixmap tiny-skia (RGBA prémultiplié) vers un tampon
+    /// `wl_shm::Format::Argb8888`. Ce format est natif : sur little-endian,
+    /// la mémoire attend BGRA. Écrire les octets RGBA tels quels inversait le
+    /// rouge et le bleu de tout l'overlay.
+    pub fn write_rgba(&mut self, data: &[u8]) {
         let count = data.len().min(self.len);
+        let pixels = count / 4 * 4;
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr, count);
+            for offset in (0..pixels).step_by(4) {
+                #[cfg(target_endian = "little")]
+                {
+                    *self.ptr.add(offset) = data[offset + 2];
+                    *self.ptr.add(offset + 1) = data[offset + 1];
+                    *self.ptr.add(offset + 2) = data[offset];
+                    *self.ptr.add(offset + 3) = data[offset + 3];
+                }
+                #[cfg(target_endian = "big")]
+                {
+                    *self.ptr.add(offset) = data[offset + 3];
+                    *self.ptr.add(offset + 1) = data[offset];
+                    *self.ptr.add(offset + 2) = data[offset + 1];
+                    *self.ptr.add(offset + 3) = data[offset + 2];
+                }
+            }
+            if count > pixels {
+                std::ptr::copy_nonoverlapping(
+                    data[pixels..].as_ptr(),
+                    self.ptr.add(pixels),
+                    count - pixels,
+                );
+            }
         }
     }
 }
@@ -67,3 +94,19 @@ impl Drop for Mapping {
 }
 
 unsafe impl Send for Mapping {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba_is_written_in_native_argb8888_order() {
+        let mut mapping = Mapping::new(8).expect("mapping");
+        mapping.write_rgba(&[10, 20, 30, 255, 1, 2, 3, 4]);
+        let bytes = unsafe { std::slice::from_raw_parts(mapping.ptr, 8) };
+        #[cfg(target_endian = "little")]
+        assert_eq!(bytes, &[30, 20, 10, 255, 3, 2, 1, 4]);
+        #[cfg(target_endian = "big")]
+        assert_eq!(bytes, &[255, 10, 20, 30, 4, 1, 2, 3]);
+    }
+}

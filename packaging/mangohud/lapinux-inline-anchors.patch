@@ -1,0 +1,102 @@
+--- a/src/overlay.cpp
++++ b/src/overlay.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include <sstream>
+ #include <iomanip>
+ #include <algorithm>
+@@ -358,6 +360,18 @@
+    if (real_params->offset_x > 0 || real_params->offset_y > 0 || real_params->enabled[OVERLAY_PARAM_ENABLED_hud_no_margin])
+       margin = 0.0f;
+ 
++   // [Lapinux] En ligne, la fenêtre s'ajuste à son contenu : `window_size`
++   // vient de l'estimation de la trame précédente et peut être négatif
++   // (MangoHud 0.8 sort alors de l'écran à droite et dérive au centre).
++   // L'ancrage se calcule sur la taille réelle de la dernière fenêtre du HUD ;
++   // les neuf ancrages tombent juste, à une trame près.
++   ImVec2 anchor = window_size;
++   if (real_params->enabled[OVERLAY_PARAM_ENABLED_horizontal]) {
++      ImGuiWindow* hud = ImGui::FindWindowByName("Main");
++      if (hud && hud->SizeFull.x > 0.0f && hud->SizeFull.y > 0.0f)
++         anchor = hud->SizeFull;
++   }
++
+    ImGui::SetNextWindowBgAlpha(real_params->background_alpha);
+    ImGui::SetNextWindowSize(window_size, ImGuiCond_Always);
+    switch (real_params->position) {
+@@ -366,46 +380,45 @@
+       ImGui::SetNextWindowPos(data.main_window_pos, ImGuiCond_Always);
+       break;
+    case LAYER_POSITION_TOP_RIGHT:
+-      data.main_window_pos = ImVec2(width - window_size.x - margin + real_params->offset_x, margin + real_params->offset_y);
++      data.main_window_pos = ImVec2(width - anchor.x - margin + real_params->offset_x, margin + real_params->offset_y);
+       ImGui::SetNextWindowPos(data.main_window_pos, ImGuiCond_Always);
+       break;
+    case LAYER_POSITION_MIDDLE_LEFT:
+-      data.main_window_pos = ImVec2(margin + params.offset_x, height / 2 - window_size.y / 2 - margin + real_params->offset_y);
++      data.main_window_pos = ImVec2(margin + params.offset_x, height / 2 - anchor.y / 2 - margin + real_params->offset_y);
+       ImGui::SetNextWindowPos(data.main_window_pos, ImGuiCond_Always);
+       break;
+    case LAYER_POSITION_MIDDLE_RIGHT:
+-      data.main_window_pos = ImVec2(width - window_size.x - margin + real_params->offset_x, height / 2 - window_size.y / 2 - margin + real_params->offset_y);
++      data.main_window_pos = ImVec2(width - anchor.x - margin + real_params->offset_x, height / 2 - anchor.y / 2 - margin + real_params->offset_y);
+       ImGui::SetNextWindowPos(data.main_window_pos, ImGuiCond_Always);
+       break;
+    case LAYER_POSITION_BOTTOM_LEFT:
+-      data.main_window_pos = ImVec2(margin +real_params->offset_x, height - window_size.y - margin + real_params->offset_y);
++      data.main_window_pos = ImVec2(margin +real_params->offset_x, height - anchor.y - margin + real_params->offset_y);
+       ImGui::SetNextWindowPos(data.main_window_pos, ImGuiCond_Always);
+       break;
+    case LAYER_POSITION_BOTTOM_RIGHT:
+-      data.main_window_pos = ImVec2(width - window_size.x - margin + real_params->offset_x, height - window_size.y - margin + real_params->offset_y);
++      data.main_window_pos = ImVec2(width - anchor.x - margin + real_params->offset_x, height - anchor.y - margin + real_params->offset_y);
+       ImGui::SetNextWindowPos(data.main_window_pos, ImGuiCond_Always);
+       break;
++   // [Lapinux] Le centre se calcule sur la vraie largeur : l'ancien
++   // `table_columns × 64` décalait la ligne et le `offset_x` était ignoré.
+    case LAYER_POSITION_TOP_CENTER:
+-      if (real_params->enabled[OVERLAY_PARAM_ENABLED_horizontal] && !real_params->enabled[OVERLAY_PARAM_ENABLED_horizontal_stretch]) {
+-         float content_width = ( real_params->table_columns  * 64);
+-         data.main_window_pos = ImVec2((width / 2) - (window_size.x / 2) - content_width, margin +  real_params->offset_y);
+-      }
+-      else
+-         data.main_window_pos = ImVec2((width / 2) - (window_size.x / 2), margin + real_params->offset_y);
++      data.main_window_pos = ImVec2((width / 2) - (anchor.x / 2) + real_params->offset_x, margin + real_params->offset_y);
+       ImGui::SetNextWindowPos(data.main_window_pos, ImGuiCond_Always);
+       break;
+    case LAYER_POSITION_BOTTOM_CENTER:
+-      if (real_params->enabled[OVERLAY_PARAM_ENABLED_horizontal] && !real_params->enabled[OVERLAY_PARAM_ENABLED_horizontal_stretch]) {
+-         float content_width = (real_params->table_columns  * 64);
+-         data.main_window_pos = ImVec2((width / 2) - (window_size.x / 2) - content_width,  height - window_size.y - margin + real_params->offset_y);
+-      }
+-      else
+-         data.main_window_pos = ImVec2((width / 2) - (window_size.x / 2), height - window_size.y - margin + real_params->offset_y);
++      data.main_window_pos = ImVec2((width / 2) - (anchor.x / 2) + real_params->offset_x, height - anchor.y - margin + real_params->offset_y);
+       ImGui::SetNextWindowPos(data.main_window_pos, ImGuiCond_Always);
+       break;
+    case LAYER_POSITION_COUNT:
+       break;
+    }
++   if (std::getenv("LAPINUX_MANGOHUD_DEBUG")) {
++      fprintf(stderr,
++              "[lapinux] ligne=%d anchor=%.0fx%.0f ws=%.0fx%.0f pos=%.0f,%.0f ecran=%ux%u\n",
++              (int)real_params->enabled[OVERLAY_PARAM_ENABLED_horizontal],
++              anchor.x, anchor.y, window_size.x, window_size.y,
++              data.main_window_pos.x, data.main_window_pos.y, width, height);
++   }
+ }
+ 
+ void RenderOutlinedText(const char* text, ImU32 textColor) {
+@@ -711,8 +724,9 @@
+             if (HUDElements.table_columns_count > 0 && HUDElements.table_columns_count < 65 )
+                real_params->table_columns = HUDElements.table_columns_count;
+             if(!real_params->enabled[OVERLAY_PARAM_ENABLED_horizontal_stretch]) {
+-               float content_width = ImGui::GetContentRegionAvail().x - (real_params->table_columns * 64);
+-               window_size = ImVec2(content_width, real_params->height);
++               // [Lapinux] 0 = ajustement à la largeur du contenu. La valeur
++               // négative d'origine servait de béquille et faussait l'ancrage.
++               window_size = ImVec2(0.0f, real_params->height);
+             }
+          }
+          ImGui::EndTable();

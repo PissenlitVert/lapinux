@@ -71,6 +71,6 @@ impl VirtualPad {
     }
 
     pub fn name(&self) -> String {
-        "Ludus Virtual Pad".to_string()
+        format!("{} Virtual Pad", lapinux_core::APP_NAME)
     }
 }

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Mesures de performance de Ludus (daemon au repos, latence IPC, scan, taille).
+# Mesures de performance de Lapinux (daemon au repos, latence IPC, scan, taille).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN=${LUDUS_BIN:-$ROOT/target/debug/ludus}
+BIN=${LAPINUX_BIN:-$ROOT/target/debug/lapinux}
 TMP=$(mktemp -d)
-export LUDUS_HOME="$TMP"
+export LAPINUX_HOME="$TMP"
 PID=""
 cleanup() {
   if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
@@ -21,11 +21,11 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-echo "Ludus — rapport de performances"
+echo "Lapinux — rapport de performances"
 echo "binaire : $BIN"
 printf 'taille   : %s Kio\n' "$(( $(stat -c%s "$BIN") / 1024 ))"
 
-# Démarrage du daemon isolé (LUDUS_HOME temporaire).
+# Démarrage du daemon isolé (LAPINUX_HOME temporaire).
 "$BIN" --daemon >"$TMP/daemon.log" 2>&1 &
 PID=$!
 SOCKET="$TMP/run/control.sock"

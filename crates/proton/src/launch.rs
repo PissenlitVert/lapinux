@@ -1,7 +1,7 @@
 //! Construction de la ligne de commande et de l'environnement de lancement.
 
 use crate::{Error, Result};
-use ludus_core::model::ProtonInfo;
+use lapinux_core::model::ProtonInfo;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -30,7 +30,7 @@ pub struct LaunchOptions {
 }
 
 pub fn umu_run_path() -> Option<PathBuf> {
-    ludus_core::paths::which("umu-run")
+    lapinux_core::paths::which("umu-run")
 }
 
 /// Répertoire `steamapps` de la bibliothèque qui contient l'exécutable.
@@ -65,7 +65,7 @@ pub fn build(options: &LaunchOptions) -> Result<LaunchPlan> {
     if options.use_umu {
         if let Some(umu) = &options.umu_run {
             let mut env = vec![
-                ("GAMEID".to_string(), format!("ludus-{}", options.appid)),
+                ("GAMEID".to_string(), format!("lapinux-{}", options.appid)),
                 ("PROTONPATH".to_string(), proton.path.to_string_lossy().to_string()),
                 ("WINEPREFIX".to_string(), options.prefix.to_string_lossy().to_string()),
                 ("STORE".to_string(), "none".to_string()),
@@ -126,7 +126,7 @@ pub fn build(options: &LaunchOptions) -> Result<LaunchPlan> {
     // c'est ce qui fonctionne sur Bazzite/Fedora, sans conteneur supplémentaire.
     let mut proton_args: Vec<String> = vec!["run".to_string(), exe];
     proton_args.extend(options.extra_args.iter().cloned());
-    let (program, mut args) = match ludus_core::paths::which("python3") {
+    let (program, mut args) = match lapinux_core::paths::which("python3") {
         Some(python) => {
             let mut args = vec![proton_script.to_string_lossy().to_string()];
             args.extend(proton_args);
@@ -198,7 +198,7 @@ mod tests {
         assert_eq!(plan.program, PathBuf::from("/usr/bin/umu-run"));
         assert_eq!(plan.args[0], "/jeux/TF2/hl2.exe");
         let env: std::collections::HashMap<_, _> = plan.env.iter().cloned().collect();
-        assert_eq!(env.get("GAMEID").unwrap(), "ludus-440");
+        assert_eq!(env.get("GAMEID").unwrap(), "lapinux-440");
         assert_eq!(env.get("PROTONPATH").unwrap(), &dir.path().to_string_lossy());
         assert_eq!(env.get("WINEPREFIX").unwrap(), "/data/prefixes/440");
         assert_eq!(env.get("DXVK_HUD").unwrap(), "0");

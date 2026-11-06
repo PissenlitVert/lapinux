@@ -1,26 +1,38 @@
-//! Liste et sélection des Proton publiés sur GitHub (GE, CachyOS, DW).
+//! Liste et sélection des Proton publiés (GE, CachyOS, DW).
+//!
+//! Deux hébergeurs, une même forme de réponse JSON : GitHub pour GE-Proton et
+//! Proton-CachyOS, l'instance Forgejo de Dawn Winery pour DW-Proton — son dépôt
+//! GitHub n'existe plus. Chaque source porte donc l'adresse exacte de ses
+//! versions, ce qui évite de deviner l'hébergeur à partir du nom du dépôt.
 
 use crate::{Error, Result};
-use ludus_core::model::ProtonRelease;
+use lapinux_core::model::ProtonRelease;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtonSource {
     pub repo: &'static str,
     pub label: &'static str,
+    /// Adresse de l'API qui liste les versions publiées.
+    pub releases_api: &'static str,
 }
 
 pub const SOURCES: [ProtonSource; 3] = [
     ProtonSource {
         repo: "GloriousEggroll/proton-ge-custom",
         label: "GE-Proton",
+        releases_api: "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases?per_page=20",
     },
     ProtonSource {
         repo: "CachyOS/proton-cachyos",
         label: "Proton-CachyOS",
+        releases_api: "https://api.github.com/repos/CachyOS/proton-cachyos/releases?per_page=20",
     },
     ProtonSource {
-        repo: "daegalus/dw-proton",
+        // Dawn Winery héberge ses builds sur son propre Forgejo : l'API y suit
+        // la même forme que celle de GitHub (tag, date, fichiers, sommes).
+        repo: "dawn-winery/dwproton",
         label: "DW-Proton",
+        releases_api: "https://dawn.wine/api/v1/repos/dawn-winery/dwproton/releases?limit=20",
     },
 ];
 
@@ -120,8 +132,15 @@ pub fn parse_releases(json: &str, repo: &str) -> Result<Vec<ProtonRelease>> {
 }
 
 /// Télécharge la liste des dernières releases d'un dépôt.
+///
+/// Une source connue fournit l'adresse de son API ; un dépôt quelconque est
+/// supposé GitHub, ce qui laisse la porte ouverte aux builds saisis à la main.
 pub fn fetch_releases(repo: &str) -> Result<Vec<ProtonRelease>> {
-    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=20");
+    let url = SOURCES
+        .iter()
+        .find(|source| source.repo == repo)
+        .map(|source| source.releases_api.to_string())
+        .unwrap_or_else(|| format!("https://api.github.com/repos/{repo}/releases?per_page=20"));
     let text = crate::tools::fetch_text(&url)?;
     parse_releases(&text, repo)
 }
@@ -163,6 +182,25 @@ mod tests {
         ]
       }
     ]"#;
+
+    /// Chaque source déclare l'adresse qui liste ses versions : DW-Proton vit
+    /// sur le Forgejo de Dawn Winery, pas sur GitHub.
+    #[test]
+    fn each_source_declares_its_releases_api() {
+        for source in SOURCES {
+            assert!(
+                source.releases_api.contains(source.repo),
+                "{} ne pointe pas vers son dépôt",
+                source.label
+            );
+            assert!(source.releases_api.starts_with("https://"));
+        }
+        let dw = SOURCES
+            .iter()
+            .find(|source| source.label == "DW-Proton")
+            .expect("DW-Proton listé");
+        assert!(dw.releases_api.contains("dawn.wine"), "{}", dw.releases_api);
+    }
 
     #[test]
     fn keeps_x86_64_archives_only() {

@@ -1,19 +1,120 @@
 [package]
-name = "ludus-steam"
+name = "lapinux-steam"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ludus-core = { path = "../core" }
+lapinux-core = { path = "../core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-regex = "1"
+reqwest = "0.13"
 ureq = "2"
 flate2 = "1"
 tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
 tracing = "0.1"
 thiserror = "1"
+steamroom = "0.3.0"
+steamroom-client = "0.3.0"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
+libc = "0.2"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+crc32fast = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# La session sociale passe par un CM WebSocket en TLS. `ring` est choisi
+# explicitement : `aws-lc-rs` est aussi compilé par nos dépendances, et rustls
+# refuse alors de deviner son fournisseur (panique au premier échange).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rsa = "0.9"
+sha1 = "0.10"
+prost = { version = "0.14", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["net", "io-util"] }
+# Les sondes affichent la conversation avec le CM pour diagnostiquer une
+# poussée manquante (amis, famille, notifications) ; celle du QR rend le
+# défi directement dans le terminal.
+qrcode = { version = "0.14", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Les sondes de `examples/` sont des outils de diagnostic, pas du code livré :
+# `cargo test` les compilait à chaque passage, en plus du profil dev, pour
+# ~220 Mo de binaires et quelques secondes perdues. Elles ne se bâtissent plus
+# que sur demande, derrière la fonctionnalité `probes` :
+#   cargo build -p lapinux-steam --examples --features probes
+#   cargo run -p lapinux-steam --example qr_timing --features probes
+[features]
+probes = []
+
+[[example]]
+name = "cloud_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "cloud_download_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "cloud_upload_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "cm_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "depot_keys_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "depot_sizes_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "game_dlc_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "game_read_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "language_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "login_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "pics_dump"
+required-features = ["probes"]
+
+[[example]]
+name = "playtime_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "qr_timing"
+required-features = ["probes"]
+
+[[example]]
+name = "shared_session_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "size_audit_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "social_probe"
+required-features = ["probes"]
+
+# Sonde de la page des licences : l'échange jeton → cookies du site aboutit-il ?
+[[example]]
+name = "web_licenses_probe"
+required-features = ["probes"]
+

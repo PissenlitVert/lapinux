@@ -16,6 +16,10 @@ pub enum Error {
     DbTxn(String),
     #[error("daemon injoignable : {0}")]
     Ipc(String),
+    /// Le socket a répondu, mais pas à temps : le daemon est vivant et
+    /// occupé, ce qui n'est pas une panne et ne doit pas le faire relancer.
+    #[error("délai IPC dépassé : {0}")]
+    IpcTimeout(String),
     #[error("{0}")]
     Other(String),
 }

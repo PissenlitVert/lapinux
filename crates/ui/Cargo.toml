@@ -1,15 +1,31 @@
 [package]
-name = "ludus-ui"
+name = "lapinux-ui"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ludus-core = { path = "../core" }
-ludus-input = { path = "../input" }
+lapinux-core = { path = "../core" }
+lapinux-input = { path = "../input" }
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.29"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Lecture des polices de repli trouvées sur le système : un fichier illisible
+# est écarté avant d'atteindre le moteur de texte, qui paniquerait.
+ab_glyph = "0.2"
+# `webp` en plus du PNG et du JPEG : la boutique sert une partie de ses
+# visuels dans ce format, et `gif` parce qu'itch.io publie certaines
+# couvertures animées (la première image sert de jaquette). AVIF, désormais le
+# plus courant, demanderait un décodeur natif (dav1d) : la fiche écarte ces
+# adresses.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Matrice du QR code de connexion Steam : aucune image générée, la texture est
+# construite directement depuis les modules.
+qrcode = { version = "0.14", default-features = false }
 ureq = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Manifestes de thèmes et plugins : même format TOML que la configuration.
+toml = "0.8"
 tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

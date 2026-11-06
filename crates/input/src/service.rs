@@ -3,24 +3,35 @@
 use crate::codes;
 use crate::device;
 use crate::mapping::{Mapper, Profile};
+use crate::nav::{axis_released, nav_from_event, Nav, NavRepeat};
 use crate::virtual_pad::VirtualPad;
 use crate::{Error, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HotkeySource {
-    Pad,
-    Keyboard,
+/// Pendant que l'overlay est ouvert, les manettes pilotent seulement le menu :
+/// le service garde le grab (le jeu ne reçoit rien) et transmet la navigation
+/// à l'overlay.
+static OVERLAY_NAVIGATION: AtomicBool = AtomicBool::new(false);
+
+pub fn set_overlay_navigation(active: bool) {
+    OVERLAY_NAVIGATION.store(active, Ordering::Relaxed);
+}
+
+fn overlay_navigation() -> bool {
+    OVERLAY_NAVIGATION.load(Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputMsg {
-    Hotkey(HotkeySource),
+    /// Le raccourci manette vient d'être pressé.
+    Hotkey,
+    /// Navigation dans l'overlay, quand il est ouvert.
+    Nav(Nav),
     DevicesChanged,
     Error(String),
 }
@@ -33,12 +44,21 @@ pub struct InputService {
 
 impl InputService {
     pub fn start(profile: Profile, grab: bool) -> Result<Self> {
+        Self::start_with(profile, grab, true)
+    }
+
+    /// Lecture du raccourci manette (Guide) sans grab ni pad virtuel.
+    pub fn start_hotkeys(profile: Profile) -> Result<Self> {
+        Self::start_with(profile, false, false)
+    }
+
+    fn start_with(profile: Profile, grab: bool, remap: bool) -> Result<Self> {
         let (tx, rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
-            .name("ludus-input".into())
-            .spawn(move || run(profile, grab, tx, stop_thread))
+            .name("lapinux-input".into())
+            .spawn(move || run(profile, grab, remap, tx, stop_thread))
             .map_err(Error::Io)?;
         Ok(Self {
             stop,
@@ -65,25 +85,23 @@ struct PadBinding {
     path: PathBuf,
     device: evdev::Device,
     mapper: Mapper,
+    /// Le périphérique est-il exclusivement pris par le service ?
+    grabbed: bool,
 }
 
-struct KeyboardBinding {
-    path: PathBuf,
-    device: evdev::Device,
-    chord: Vec<u16>,
-    held: HashSet<u16>,
-    armed: bool,
-}
-
-fn run(profile: Profile, grab: bool, tx: Sender<InputMsg>, stop: Arc<AtomicBool>) {
-    let mut virtual_pad = match VirtualPad::create("Ludus Virtual Pad") {
-        Ok(pad) => Some(pad),
-        Err(err) => {
-            let _ = tx.send(InputMsg::Error(format!(
-                "{err} ; remapping manette désactivé"
-            )));
-            None
+fn run(profile: Profile, grab: bool, remap: bool, tx: Sender<InputMsg>, stop: Arc<AtomicBool>) {
+    let mut virtual_pad = if remap {
+        match VirtualPad::create(&format!("{} Virtual Pad", lapinux_core::APP_NAME)) {
+            Ok(pad) => Some(pad),
+            Err(err) => {
+                let _ = tx.send(InputMsg::Error(format!(
+                    "{err} ; remapping manette désactivé"
+                )));
+                None
+            }
         }
+    } else {
+        None
     };
 
     let pad_chord: Vec<u16> = profile
@@ -91,43 +109,61 @@ fn run(profile: Profile, grab: bool, tx: Sender<InputMsg>, stop: Arc<AtomicBool>
         .iter()
         .filter_map(|name| codes::button_code(name))
         .collect();
-    let keyboard_chord: Vec<u16> = if profile.keyboard_hotkey.is_empty() {
-        profile
-            .hotkey_chord
-            .iter()
-            .filter_map(|name| codes::key_code(name))
-            .collect()
-    } else {
-        profile
-            .keyboard_hotkey
-            .iter()
-            .filter_map(|name| codes::key_code(name))
-            .collect()
-    };
-
     let mut pads: HashMap<PathBuf, PadBinding> = HashMap::new();
-    let mut keyboards: HashMap<PathBuf, KeyboardBinding> = HashMap::new();
+    let mut nav_repeats: HashMap<(PathBuf, Nav), NavRepeat> = HashMap::new();
     let mut last_scan = Instant::now() - Duration::from_secs(10);
     let can_remap = virtual_pad.is_some();
+    let should_grab = grab && can_remap;
 
     while !stop.load(Ordering::Relaxed) {
+        let overlay_nav = overlay_navigation();
         if last_scan.elapsed() >= Duration::from_secs(2) {
             last_scan = Instant::now();
-            let changed = scan_devices(
-                &profile,
-                grab && can_remap,
-                &pad_chord,
-                &keyboard_chord,
-                &mut pads,
-                &mut keyboards,
-            );
+            let changed = scan_devices(&profile, should_grab, &pad_chord, &mut pads);
             if changed {
                 let _ = tx.send(InputMsg::DevicesChanged);
             }
         }
 
+        if overlay_nav {
+            // Le grab reste en place : le jeu ne voit pas la manette tant que
+            // le menu est ouvert. Le service, lui, continue de lire les
+            // périphériques et transmet la navigation à l'overlay.
+            for binding in pads.values_mut() {
+                let Ok(events) = binding.device.fetch_events() else {
+                    continue;
+                };
+                for event in events {
+                    let kind = event.event_type().0;
+                    if axis_released(kind, event.code(), event.value()) {
+                        nav_repeats.retain(|(device, _), _| device != &binding.path);
+                        continue;
+                    }
+                    let Some((nav, pressed)) =
+                        nav_from_event(kind, event.code(), event.value())
+                    else {
+                        continue;
+                    };
+                    let repeat = nav_repeats
+                        .entry((binding.path.clone(), nav))
+                        .or_default();
+                    if repeat.fire(pressed) {
+                        let _ = tx.send(InputMsg::Nav(nav));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+
         let mut stale: Vec<PathBuf> = Vec::new();
         for binding in pads.values_mut() {
+            if should_grab && !binding.grabbed {
+                match binding.device.grab() {
+                    Ok(()) => binding.grabbed = true,
+                    Err(err) => tracing::warn!("grab {} : {err}", binding.path.display()),
+                }
+            }
             let events = match binding.device.fetch_events() {
                 Ok(events) => events,
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -157,7 +193,7 @@ fn run(profile: Profile, grab: bool, tx: Sender<InputMsg>, stop: Arc<AtomicBool>
                 }
             }
             if hotkey {
-                let _ = tx.send(InputMsg::Hotkey(HotkeySource::Pad));
+                let _ = tx.send(InputMsg::Hotkey);
             }
         }
         if !stale.is_empty() {
@@ -165,38 +201,6 @@ fn run(profile: Profile, grab: bool, tx: Sender<InputMsg>, stop: Arc<AtomicBool>
                 pads.remove(&path);
             }
             let _ = tx.send(InputMsg::DevicesChanged);
-        }
-
-        let mut stale_keyboards: Vec<PathBuf> = Vec::new();
-        for keyboard in keyboards.values_mut() {
-            let events = match keyboard.device.fetch_events() {
-                Ok(events) => events,
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(_) => {
-                    stale_keyboards.push(keyboard.path.clone());
-                    continue;
-                }
-            };
-            let mut triggered = false;
-            for event in events {
-                if event.event_type().0 != codes::EV_KEY {
-                    continue;
-                }
-                if event.value() == 0 {
-                    keyboard.held.remove(&event.code());
-                } else {
-                    keyboard.held.insert(event.code());
-                }
-                if chord_hit(&keyboard.held, &keyboard.chord, &mut keyboard.armed) {
-                    triggered = true;
-                }
-            }
-            if triggered {
-                let _ = tx.send(InputMsg::Hotkey(HotkeySource::Keyboard));
-            }
-        }
-        for path in stale_keyboards {
-            keyboards.remove(&path);
         }
 
         std::thread::sleep(Duration::from_millis(4));
@@ -207,9 +211,7 @@ fn scan_devices(
     profile: &Profile,
     grab: bool,
     pad_chord: &[u16],
-    keyboard_chord: &[u16],
     pads: &mut HashMap<PathBuf, PadBinding>,
-    keyboards: &mut HashMap<PathBuf, KeyboardBinding>,
 ) -> bool {
     let mut changed = false;
     for (path, mut device) in evdev::enumerate() {
@@ -217,11 +219,17 @@ fn scan_devices(
             if pads.contains_key(&path) {
                 continue;
             }
-            if grab {
-                if let Err(err) = device.grab() {
-                    tracing::warn!("grab {} : {err}", path.display());
+            let grabbed = if grab {
+                match device.grab() {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::warn!("grab {} : {err}", path.display());
+                        false
+                    }
                 }
-            }
+            } else {
+                false
+            };
             if let Err(err) = device.set_nonblocking(true) {
                 tracing::warn!("nonblocking {} : {err}", path.display());
                 continue;
@@ -234,24 +242,7 @@ fn scan_devices(
                     path,
                     device,
                     mapper,
-                },
-            );
-            changed = true;
-        } else if !keyboard_chord.is_empty() && device::is_keyboard(&device) {
-            if keyboards.contains_key(&path) {
-                continue;
-            }
-            if device.set_nonblocking(true).is_err() {
-                continue;
-            }
-            keyboards.insert(
-                path.clone(),
-                KeyboardBinding {
-                    path,
-                    device,
-                    chord: keyboard_chord.to_vec(),
-                    held: HashSet::new(),
-                    armed: false,
+                    grabbed,
                 },
             );
             changed = true;
@@ -259,49 +250,5 @@ fn scan_devices(
     }
     // Purge des périphériques disparus.
     pads.retain(|path, _| path.exists());
-    keyboards.retain(|path, _| path.exists());
     changed
-}
-
-pub fn chord_hit(held: &HashSet<u16>, chord: &[u16], armed: &mut bool) -> bool {
-    if chord.is_empty() {
-        return false;
-    }
-    let all = chord.iter().all(|code| held.contains(code));
-    if all && !*armed {
-        *armed = true;
-        return true;
-    }
-    if !all && *armed {
-        *armed = false;
-    }
-    false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chord_triggers_on_complete_press() {
-        let chord = vec![codes::KEY_LEFTMETA, codes::KEY_F1];
-        let mut held = HashSet::new();
-        let mut armed = false;
-        held.insert(codes::KEY_LEFTMETA);
-        assert!(!chord_hit(&held, &chord, &mut armed));
-        held.insert(codes::KEY_F1);
-        assert!(chord_hit(&held, &chord, &mut armed));
-        assert!(!chord_hit(&held, &chord, &mut armed));
-        held.clear();
-        assert!(!chord_hit(&held, &chord, &mut armed));
-        held.insert(codes::KEY_LEFTMETA);
-        held.insert(codes::KEY_F1);
-        assert!(chord_hit(&held, &chord, &mut armed));
-    }
-
-    #[test]
-    fn empty_chord_never_fires() {
-        let mut armed = false;
-        assert!(!chord_hit(&HashSet::new(), &[], &mut armed));
-    }
 }

@@ -4,3 +4,5 @@
 .freebuff/
 /covers/
 /dist/
+# Conversations importées : elles contiennent des clés d'API et des jetons.
+.cloud-attachments/

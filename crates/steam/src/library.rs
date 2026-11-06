@@ -4,33 +4,67 @@ use crate::drm;
 use crate::manifest::{appid_from_filename, AppManifest};
 use crate::vdf;
 use crate::Result;
-use ludus_core::model::{Drm, Game, GameSettings};
+use lapinux_core::model::{Game, GameOrigin, GameSettings};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Library {
     pub root: PathBuf,
+    /// Bibliothèque tenue par Lapinux : les jeux Steam y vivent sous un seul
+    /// dossier `Steam`, leurs manifestes à côté, et les préfixes dans
+    /// `CompatData`. Une vraie bibliothèque Steam garde l'organisation de
+    /// Steam (`steamapps/common`, `steamapps/compatdata`, manifestes dans
+    /// `steamapps`).
+    pub managed: bool,
 }
 
 impl Library {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            managed: false,
+        }
+    }
+
+    pub fn managed(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            managed: true,
+        }
     }
 
     pub fn steamapps(&self) -> PathBuf {
         self.root.join("steamapps")
     }
 
+    /// Dossier qui porte les manifestes du jeu.
+    pub fn manifest_dir(&self) -> PathBuf {
+        if self.managed {
+            self.root.join("Steam")
+        } else {
+            self.steamapps()
+        }
+    }
+
     pub fn common_dir(&self) -> PathBuf {
-        self.steamapps().join("common")
+        if self.managed {
+            self.root.join("Steam")
+        } else {
+            self.steamapps().join("common")
+        }
     }
 
     pub fn compatdata_dir(&self) -> PathBuf {
-        self.steamapps().join("compatdata")
+        if self.managed {
+            self.root.join("CompatData")
+        } else {
+            self.steamapps().join("compatdata")
+        }
     }
 
     pub fn manifest_path(&self, appid: u32) -> PathBuf {
-        self.steamapps().join(format!("appmanifest_{appid}.acf"))
+        self.manifest_dir()
+            .join(format!("appmanifest_{appid}.acf"))
     }
 
     pub fn prefix(&self, appid: u32) -> PathBuf {
@@ -49,21 +83,34 @@ pub struct ScanReport {
     pub warnings: Vec<String>,
 }
 
-/// Toutes les bibliothèques déclarées par les racines Steam fournies.
+/// Bibliothèques Steam déclarées uniquement (compatibilité).
 pub fn discover_libraries(steam_roots: &[PathBuf]) -> Vec<Library> {
+    discover_libraries_with_managed(steam_roots, None)
+}
+
+/// Bibliothèques Steam déclarées, plus la bibliothèque gérée par Lapinux.
+pub fn discover_libraries_with_managed(
+    steam_roots: &[PathBuf],
+    managed_root: Option<&Path>,
+) -> Vec<Library> {
     let mut libraries: Vec<Library> = Vec::new();
-    let mut push = |path: PathBuf| {
-        if !path.join("steamapps").is_dir() {
+    let mut push = |path: PathBuf, managed: bool| {
+        if managed {
+            if !path.is_dir() {
+                return;
+            }
+        } else if !path.join("steamapps").is_dir() {
             return;
         }
         let canon = std::fs::canonicalize(&path).unwrap_or(path);
-        if !libraries.iter().any(|l| l.root == canon) {
-            libraries.push(Library::new(canon));
+        if libraries.iter().any(|l| l.root == canon) {
+            return;
         }
+        libraries.push(Library { root: canon, managed });
     };
 
     for root in steam_roots {
-        push(root.clone());
+        push(root.clone(), false);
         let libraryfolders = root.join("steamapps/libraryfolders.vdf");
         let Ok(text) = std::fs::read_to_string(&libraryfolders) else {
             continue;
@@ -73,15 +120,27 @@ pub fn discover_libraries(steam_roots: &[PathBuf]) -> Vec<Library> {
         };
         for (_key, entry) in obj.objects() {
             if let Some(path) = entry.str("path") {
-                push(PathBuf::from(path));
+                push(PathBuf::from(path), false);
             }
         }
+    }
+    if let Some(root) = managed_root {
+        push(root.to_path_buf(), true);
     }
     libraries
 }
 
+/// Scan des seules bibliothèques Steam (compatibilité).
 pub fn scan(steam_roots: &[PathBuf]) -> ScanReport {
-    let libraries = discover_libraries(steam_roots);
+    scan_with_managed(steam_roots, None)
+}
+
+/// Scan des bibliothèques Steam et de la bibliothèque managée par Lapinux.
+pub fn scan_with_managed(
+    steam_roots: &[PathBuf],
+    managed_root: Option<&Path>,
+) -> ScanReport {
+    let libraries = discover_libraries_with_managed(steam_roots, managed_root);
     let mut report = ScanReport {
         libraries: libraries.iter().map(|l| l.root.clone()).collect(),
         ..Default::default()
@@ -99,8 +158,13 @@ pub fn scan(steam_roots: &[PathBuf]) -> ScanReport {
 }
 
 pub fn scan_library(library: &Library) -> Result<Vec<Game>> {
-    let steamapps = library.steamapps();
-    let entries = std::fs::read_dir(&steamapps)?;
+    let manifests = library.manifest_dir();
+    // Une bibliothèque gérée sans dossier `Steam` n'a simplement encore aucun
+    // jeu : ce n'est pas une erreur de lecture.
+    if library.managed && !manifests.is_dir() {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(&manifests)?;
     let mut games = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -130,16 +194,40 @@ pub fn scan_library(library: &Library) -> Result<Vec<Game>> {
 
 fn build_game(library: &Library, manifest: AppManifest) -> Game {
     let install_dir = library.install_dir(&manifest.installdir);
-    let prefix = library.prefix(manifest.appid);
+    // La marque laissée par l'installateur dit d'où vient un dossier : sans
+    // elle, un jeu Epic installé dans `steamapps/common` passerait pour un jeu
+    // Steam et sa fiche chercherait un appid Steam inexistant.
+    let mark = lapinux_core::stores::StoreMark::read(&install_dir);
+    let store = mark
+        .as_ref()
+        .map(|mark| mark.store)
+        .unwrap_or(lapinux_core::stores::Store::Steam);
+    let store_id = mark.map(|mark| mark.store_id).unwrap_or_default();
+    let origin = if store != lapinux_core::stores::Store::Steam {
+        GameOrigin::Store
+    } else if manifest.lapinux_managed {
+        GameOrigin::Lapinux
+    } else {
+        GameOrigin::Steam
+    };
+    // Un jeu Lapinux ne doit jamais hériter du compatdata de la bibliothèque :
+    // son préfixe vit sous la racine de données de Lapinux.
+    // Un jeu de la bibliothèque gérée range son préfixe dans `CompatData`, à
+    // côté du dossier `Steam` : son nom se déduit du jeu, pas d'un numéro.
+    // Seul un vrai jeu Steam garde le `compatdata` de sa bibliothèque.
+    let prefix = if origin == GameOrigin::Steam && !library.managed {
+        let prefix = library.prefix(manifest.appid);
+        prefix.is_dir().then_some(prefix)
+    } else {
+        None
+    };
     let native_exe = find_native_executable(&install_dir, &manifest.name);
     let exe = native_exe
         .clone()
         .or_else(|| find_launch_exe(&install_dir, &manifest.name));
-    let drm = if native_exe.is_some() {
-        Drm::None
-    } else {
-        drm::detect(&install_dir, exe.as_deref())
-    };
+    // Un build Linux natif embarque `libsteam_api.so` : il n'a pas de DRM,
+    // mais Steamworks a quand même besoin du client pour les succès.
+    let drm = drm::detect(&install_dir, exe.as_deref());
     let installed = manifest.installed() && install_dir.is_dir();
     Game {
         appid: manifest.appid,
@@ -152,7 +240,10 @@ fn build_game(library: &Library, manifest: AppManifest) -> Game {
         last_played: (manifest.last_played > 0).then_some(manifest.last_played),
         build_id: manifest.build_id,
         installed,
-        prefix: prefix.is_dir().then_some(prefix),
+        prefix,
+        origin,
+        store,
+        store_id,
         exe,
         native: native_exe.is_some(),
         drm,
@@ -163,8 +254,12 @@ fn build_game(library: &Library, manifest: AppManifest) -> Game {
 }
 
 /// Conserve les réglages et statistiques des jeux déjà connus.
+///
+/// Les jeux absents du scan frais (disque non monté, manifeste momentanément
+/// absent, changement de bibliothèque) ne sont pas effacés : ils restent dans
+/// la liste, marqués non installés si leur répertoire a réellement disparu.
 pub fn merge_existing(fresh: Vec<Game>, stored: &[Game]) -> Vec<Game> {
-    fresh
+    let mut merged: Vec<Game> = fresh
         .into_iter()
         .map(|mut game| {
             if let Some(old) = stored.iter().find(|g| g.appid == game.appid) {
@@ -175,7 +270,16 @@ pub fn merge_existing(fresh: Vec<Game>, stored: &[Game]) -> Vec<Game> {
             }
             game
         })
-        .collect()
+        .collect();
+    for old in stored {
+        if merged.iter().any(|game| game.appid == old.appid) {
+            continue;
+        }
+        let mut kept = old.clone();
+        kept.installed = old.installed && old.install_dir().is_dir();
+        merged.push(kept);
+    }
+    merged
 }
 
 fn normalize(text: &str) -> String {
@@ -425,6 +529,28 @@ mod tests {
     }
 
     #[test]
+    fn a_native_linux_build_linking_steamworks_needs_the_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = make_library(dir.path(), 3979330, "nophenia", "nophenia");
+        let root = lib.install_dir("nophenia");
+        let exe = root.join("nophenia");
+        std::fs::write(&exe, b"\x7fELF\x02\x01\x01").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(root.join("nophenia_Data/Plugins/x86_64")).unwrap();
+        fs::write(
+            root.join("nophenia_Data/Plugins/x86_64/libsteam_api.so"),
+            b"\x7fELF",
+        )
+        .unwrap();
+        let games = scan_library(&lib).unwrap();
+        let game = &games[0];
+        assert!(game.native);
+        assert_eq!(game.drm, lapinux_core::model::Drm::Steamworks);
+        assert!(game.requires_steam());
+    }
+
+    #[test]
     fn library_folders_are_followed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("Steam");
@@ -440,8 +566,92 @@ mod tests {
             ),
         )
         .unwrap();
-        let libs = discover_libraries(&[root.clone()]);
+        let libs = discover_libraries_with_managed(&[root.clone()], None);
         assert_eq!(libs.len(), 2);
+    }
+
+    #[test]
+    fn managed_root_is_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("LapinuxLibrary");
+        fs::create_dir_all(&root).unwrap();
+        let report = scan_with_managed(&[], Some(&root));
+        assert_eq!(report.libraries, vec![root.clone()]);
+        // La racine ne doit pas être dupliquée si Steam la connaît déjà.
+        let libs = discover_libraries_with_managed(&[root.clone()], Some(&root));
+        assert_eq!(libs.len(), 1);
+    }
+
+    #[test]
+    fn managed_root_appears_after_first_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("LapinuxLibrary");
+        assert!(scan_with_managed(&[], Some(&root)).libraries.is_empty());
+        let lib = Library::managed(&root);
+        fs::create_dir_all(lib.install_dir("Jeu")).unwrap();
+        touch(&lib.install_dir("Jeu").join("jeu.exe"), b"MZ");
+        crate::manifest::write_manifest(&root, 77, "Jeu", "Jeu", 3, true).unwrap();
+        let report = scan_with_managed(&[], Some(&root));
+        assert_eq!(report.libraries, vec![root]);
+        assert_eq!(report.games.len(), 1);
+        assert!(report.games[0].installed);
+    }
+
+    #[test]
+    fn lapinux_manifest_sets_origin_and_skips_compatdata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("LapinuxLibrary");
+        let lib = Library::managed(&root);
+        fs::create_dir_all(lib.install_dir("Team Fortress 2")).unwrap();
+        touch(&lib.install_dir("Team Fortress 2").join("hl2.exe"), b"MZ");
+        crate::manifest::write_manifest(
+            &root,
+            440,
+            "Team Fortress 2",
+            "Team Fortress 2",
+            1,
+            true,
+        )
+        .unwrap();
+        let games = scan_with_managed(&[], Some(&root)).games;
+        let game = games.iter().find(|g| g.appid == 440).unwrap();
+        assert_eq!(game.origin, GameOrigin::Lapinux);
+        assert!(game.prefix.is_none());
+        assert!(game.installed);
+    }
+
+    #[test]
+    fn steam_manifest_in_managed_root_stays_steam_and_needs_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("LapinuxLibrary");
+        let lib = Library::managed(&root);
+        fs::create_dir_all(lib.manifest_dir()).unwrap();
+        fs::write(
+            lib.manifest_path(999),
+            "\"AppState\" { \"appid\" \"999\" \"name\" \"Steam Game\" \"StateFlags\" \"4\" \"installdir\" \"Steam Game\" }",
+        )
+        .unwrap();
+        let games = scan_with_managed(&[], Some(&root)).games;
+        let game = games.iter().find(|g| g.appid == 999).unwrap();
+        assert_eq!(game.origin, GameOrigin::Steam);
+        assert!(!game.installed);
+    }
+
+    #[test]
+    fn steam_library_keeps_steam_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("SteamLibrary");
+        let lib = make_library(&root, 998, "Steam Game", "Steam Game");
+        touch(
+            &lib.install_dir("Steam Game").join("steamgame.exe"),
+            b"MZ",
+        );
+        fs::create_dir_all(lib.prefix(998)).unwrap();
+        let games = scan_library(&lib).unwrap();
+        let game = games.iter().find(|g| g.appid == 998).unwrap();
+        assert_eq!(game.origin, GameOrigin::Steam);
+        assert!(game.installed);
+        assert_eq!(game.prefix.as_deref(), Some(lib.prefix(998).as_path()));
     }
 
     #[test]
@@ -465,5 +675,40 @@ mod tests {
         assert_eq!(merged[0].settings.mangohud, Some(true));
         assert_eq!(merged[0].playtime_secs, 7200);
         assert!(merged[0].favorite);
+    }
+
+    #[test]
+    fn merge_keeps_unseen_stored_game() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("steamapps/common/Kept");
+        fs::create_dir_all(&install).unwrap();
+        let stored = vec![Game {
+            appid: 42,
+            name: "Kept".into(),
+            installdir: "Kept".into(),
+            library: dir.path().to_path_buf(),
+            installed: true,
+            ..Default::default()
+        }];
+        let merged = merge_existing(Vec::new(), &stored);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].installed);
+        assert_eq!(merged[0].name, "Kept");
+    }
+
+    #[test]
+    fn merge_marks_unseen_game_without_files_uninstalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = vec![Game {
+            appid: 43,
+            name: "Gone".into(),
+            installdir: "Gone".into(),
+            library: dir.path().to_path_buf(),
+            installed: true,
+            ..Default::default()
+        }];
+        let merged = merge_existing(Vec::new(), &stored);
+        assert_eq!(merged.len(), 1);
+        assert!(!merged[0].installed);
     }
 }

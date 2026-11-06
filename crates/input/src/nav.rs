@@ -20,6 +20,89 @@ pub enum Nav {
     Menu,
 }
 
+impl Nav {
+    /// Octet écrit dans le tube de navigation de l'overlay.
+    pub fn wire_byte(self) -> u8 {
+        match self {
+            Nav::Up => 0,
+            Nav::Down => 1,
+            Nav::Left => 2,
+            Nav::Right => 3,
+            Nav::Confirm => 4,
+            Nav::Back => 5,
+            Nav::Menu => 6,
+        }
+    }
+}
+
+/// Traduit un événement evdev en navigation. Un bouton relâché renvoie aussi
+/// sa direction, pour que la répétition sache qu'il est remonté. Les axes ne
+/// signalent que l'appui : leur retour au repos est traité par l'appelant.
+/// Le service d'entrée et la lecture directe partagent cette table, pour que
+/// la manette se comporte pareil partout.
+pub fn nav_from_event(kind: u16, code: u16, value: i32) -> Option<(Nav, bool)> {
+    match kind {
+        EV_KEY => {
+            let nav = match code {
+                BTN_DPAD_UP => Nav::Up,
+                BTN_DPAD_DOWN => Nav::Down,
+                BTN_DPAD_LEFT => Nav::Left,
+                BTN_DPAD_RIGHT => Nav::Right,
+                BTN_SOUTH => Nav::Confirm,
+                BTN_EAST => Nav::Back,
+                BTN_START | BTN_MODE => Nav::Menu,
+                // Stick numérique simulé par les manettes Xbox.
+                BTN_THUMBL => Nav::Confirm,
+                _ => return None,
+            };
+            match value {
+                1 => Some((nav, true)),
+                0 => Some((nav, false)),
+                _ => None,
+            }
+        }
+        EV_ABS => match code {
+            ABS_HAT0X => match value {
+                -1 => Some((Nav::Left, true)),
+                1 => Some((Nav::Right, true)),
+                _ => None,
+            },
+            ABS_HAT0Y => match value {
+                -1 => Some((Nav::Up, true)),
+                1 => Some((Nav::Down, true)),
+                _ => None,
+            },
+            ABS_X => {
+                if value > 24000 {
+                    Some((Nav::Right, true))
+                } else if value < -24000 {
+                    Some((Nav::Left, true))
+                } else {
+                    None
+                }
+            }
+            ABS_Y => {
+                if value > 24000 {
+                    Some((Nav::Down, true))
+                } else if value < -24000 {
+                    Some((Nav::Up, true))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Axe revenu au repos : la répétition de toutes ses directions s'arrête.
+pub fn axis_released(kind: u16, code: u16, value: i32) -> bool {
+    kind == EV_ABS
+        && value == 0
+        && matches!(code, ABS_HAT0X | ABS_HAT0Y | ABS_X | ABS_Y)
+}
+
 pub struct NavReader {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -32,7 +115,7 @@ impl NavReader {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
-            .name("ludus-nav".into())
+            .name("lapinux-nav".into())
             .spawn(move || run(tx, stop_thread))
             .map_err(Error::Io)?;
         Ok(Self {
@@ -56,12 +139,12 @@ impl Drop for NavReader {
     }
 }
 
-struct Repeat {
+pub struct NavRepeat {
     last: Instant,
     held: bool,
 }
 
-impl Default for Repeat {
+impl Default for NavRepeat {
     fn default() -> Self {
         Self {
             last: Instant::now() - Duration::from_secs(1),
@@ -70,8 +153,8 @@ impl Default for Repeat {
     }
 }
 
-impl Repeat {
-    fn fire(&mut self, pressed: bool) -> bool {
+impl NavRepeat {
+    pub fn fire(&mut self, pressed: bool) -> bool {
         if !pressed {
             self.held = false;
             return false;
@@ -92,7 +175,7 @@ impl Repeat {
 
 fn run(tx: std::sync::mpsc::Sender<Nav>, stop: Arc<AtomicBool>) {
     let mut devices: HashMap<PathBuf, evdev::Device> = HashMap::new();
-    let mut repeats: HashMap<(PathBuf, Nav), Repeat> = HashMap::new();
+    let mut repeats: HashMap<(PathBuf, Nav), NavRepeat> = HashMap::new();
     let mut last_scan = Instant::now() - Duration::from_secs(5);
     while !stop.load(Ordering::Relaxed) {
         if last_scan.elapsed() >= Duration::from_secs(2) {
@@ -113,66 +196,19 @@ fn run(tx: std::sync::mpsc::Sender<Nav>, stop: Arc<AtomicBool>) {
                 continue;
             };
             for event in events {
-                let nav = match event.event_type().0 {
-                    EV_KEY => match (event.code(), event.value()) {
-                        (c, 1) if c == BTN_DPAD_UP => Some(Nav::Up),
-                        (c, 1) if c == BTN_DPAD_DOWN => Some(Nav::Down),
-                        (c, 1) if c == BTN_DPAD_LEFT => Some(Nav::Left),
-                        (c, 1) if c == BTN_DPAD_RIGHT => Some(Nav::Right),
-                        (c, 1) if c == BTN_SOUTH => Some(Nav::Confirm),
-                        (c, 1) if c == BTN_EAST => Some(Nav::Back),
-                        (c, 1) if c == BTN_START => Some(Nav::Menu),
-                        // Stick numérique simulé par les manettes Xbox.
-                        (c, 1) if c == BTN_THUMBL => Some(Nav::Confirm),
-                        _ => None,
-                    },
-                    EV_ABS => match event.code() {
-                        ABS_HAT0X => {
-                            match event.value() {
-                                -1 => Some(Nav::Left),
-                                1 => Some(Nav::Right),
-                                _ => None,
-                            }
-                        }
-                        ABS_HAT0Y => {
-                            match event.value() {
-                                -1 => Some(Nav::Up),
-                                1 => Some(Nav::Down),
-                                _ => None,
-                            }
-                        }
-                        ABS_X => {
-                            if event.value() > 24000 {
-                                Some(Nav::Right)
-                            } else if event.value() < -24000 {
-                                Some(Nav::Left)
-                            } else {
-                                None
-                            }
-                        }
-                        ABS_Y => {
-                            if event.value() > 24000 {
-                                Some(Nav::Down)
-                            } else if event.value() < -24000 {
-                                Some(Nav::Up)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    },
-                    _ => None,
+                let kind = event.event_type().0;
+                if axis_released(kind, event.code(), event.value()) {
+                    repeats.retain(|(device, _), _| device != path);
+                    continue;
+                }
+                let Some((nav, pressed)) =
+                    nav_from_event(kind, event.code(), event.value())
+                else {
+                    continue;
                 };
-                if let Some(nav) = nav {
-                    let pressed = match event.event_type().0 {
-                        EV_KEY => event.value() == 1,
-                        EV_ABS => event.value() != 0,
-                        _ => false,
-                    };
-                    let repeat = repeats.entry((path.clone(), nav)).or_default();
-                    if repeat.fire(pressed) && tx.send(nav).is_err() {
-                        return;
-                    }
+                let repeat = repeats.entry((path.clone(), nav)).or_default();
+                if repeat.fire(pressed) && tx.send(nav).is_err() {
+                    return;
                 }
             }
         }
@@ -186,8 +222,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn buttons_map_to_navigation_and_release() {
+        assert_eq!(
+            nav_from_event(EV_KEY, BTN_SOUTH, 1),
+            Some((Nav::Confirm, true))
+        );
+        assert_eq!(
+            nav_from_event(EV_KEY, BTN_SOUTH, 0),
+            Some((Nav::Confirm, false))
+        );
+        assert_eq!(
+            nav_from_event(EV_KEY, BTN_DPAD_LEFT, 1),
+            Some((Nav::Left, true))
+        );
+        assert_eq!(nav_from_event(EV_KEY, BTN_TL, 1), None);
+        assert_eq!(
+            nav_from_event(EV_ABS, ABS_HAT0Y, -1),
+            Some((Nav::Up, true))
+        );
+        assert_eq!(
+            nav_from_event(EV_ABS, ABS_X, 30_000),
+            Some((Nav::Right, true))
+        );
+        assert_eq!(nav_from_event(EV_ABS, ABS_X, 0), None);
+        assert!(axis_released(EV_ABS, ABS_X, 0));
+        assert!(!axis_released(EV_KEY, BTN_SOUTH, 0));
+    }
+
+    #[test]
     fn repeat_has_initial_delay() {
-        let mut repeat = Repeat::default();
+        let mut repeat = NavRepeat::default();
         assert!(repeat.fire(true));
         assert!(!repeat.fire(true));
         repeat.last = Instant::now() - Duration::from_millis(200);

@@ -1,6 +1,6 @@
-//! Découverte des Proton installés (Steam, compatibilitytools.d, Ludus, umu).
+//! Découverte des Proton installés (Steam, compatibilitytools.d, Lapinux, umu).
 
-use ludus_core::model::ProtonInfo;
+use lapinux_core::model::ProtonInfo;
 use std::path::{Path, PathBuf};
 
 /// Répertoires à examiner, dans l'ordre de priorité d'affichage.
@@ -50,8 +50,8 @@ fn source_label(dir: &Path) -> String {
         "compatibilitytools".into()
     } else if dir.ends_with("umu/compatibilitytools") {
         "umu".into()
-    } else if dir.to_string_lossy().contains("/ludus/") {
-        "ludus".into()
+    } else if dir.to_string_lossy().contains("/lapinux/") {
+        "lapinux".into()
     } else if dir.ends_with("common") {
         "steam".into()
     } else {

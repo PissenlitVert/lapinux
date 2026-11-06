@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN=${LUDUS_BIN:-$ROOT/target/debug/ludus}
+BIN=${LAPINUX_BIN:-$ROOT/target/debug/lapinux}
 
 if [ ! -x "$BIN" ]; then
   echo "binaire absent : $BIN" >&2
@@ -16,10 +16,10 @@ step "diagnostic"
 "$BIN" cli doctor
 
 step "bibliothèque Steam"
-"$BIN" cli scan --json > /tmp/ludus-scan.json
+"$BIN" cli scan --json > /tmp/lapinux-scan.json
 python3 - <<'PY'
 import json
-games = json.load(open('/tmp/ludus-scan.json'))
+games = json.load(open('/tmp/lapinux-scan.json'))
 installed = [g for g in games if g['installed']]
 print(f"{len(games)} jeux, {len(installed)} installés")
 for g in installed[:5]:
@@ -38,7 +38,7 @@ step "pad virtuel uinput"
 step "lancement (dry-run)"
 APPID=$(python3 - <<'PY'
 import json
-games = json.load(open('/tmp/ludus-scan.json'))
+games = json.load(open('/tmp/lapinux-scan.json'))
 candidates = [g for g in games if g['installed'] and g.get('exe') and not g.get('native')]
 print(candidates[0]['appid'] if candidates else '')
 PY

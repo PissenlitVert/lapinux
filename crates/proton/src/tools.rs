@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub const USER_AGENT: &str = concat!("ludus/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("lapinux/", env!("CARGO_PKG_VERSION"));
 
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()

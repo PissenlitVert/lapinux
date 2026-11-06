@@ -1,0 +1,52 @@
+{
+  "version": 2,
+  "maintainer": {
+    "name": "Pissenlit Vert",
+    "github": "PissenlitVert"
+  },
+  "configurations": [
+    {
+      "id": "bento-blocks-shared-memory",
+      "title": "Bento Blocks — shared-memory fix withdrawn",
+      "description": "The published shared-memory override did not restore the expected frame rate and has been withdrawn.",
+      "solution": "No change is applied. Existing installations can still be removed from the game sheet.",
+      "type": "graphics",
+      "platform": "windows",
+      "layers": [],
+      "author": {
+        "name": "Pissenlit Vert",
+        "github": "PissenlitVert"
+      },
+      "version": "1.0.1",
+      "license": "CC0-1.0",
+      "status": "broken",
+      "tested": {},
+      "game": {
+        "names": [
+          "Bento Blocks"
+        ],
+        "aliases": [
+          "BentoBlocks"
+        ],
+        "steam_appids": [
+          3311670
+        ],
+        "store_ids": []
+      },
+      "requires": [],
+      "conflicts": [],
+      "retired": true,
+      "actions": {
+        "settings": {
+          "env": [],
+          "dxvk": {},
+          "args": []
+        },
+        "files": []
+      },
+      "links": [],
+      "size": 0,
+      "base": ""
+    }
+  ]
+}

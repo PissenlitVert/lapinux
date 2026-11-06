@@ -3,7 +3,7 @@
 //! Aucun contournement n'est implémenté : on se contente de prévenir
 //! l'utilisateur qu'un client Steam est nécessaire pour démarrer le jeu.
 
-use ludus_core::model::Drm;
+use lapinux_core::model::Drm;
 use std::path::Path;
 
 const STUB_SECTIONS: [&str; 4] = [".bind", "steamstub", ".steam", ".ceg"];
@@ -58,6 +58,20 @@ fn read_prefix(path: &Path, max: usize) -> Option<Vec<u8>> {
     Some(buffer)
 }
 
+/// Bibliothèques Steamworks : les DLL Windows, et celles que portent les
+/// builds Linux natifs (`libsteam_api.so`) et macOS.
+fn is_steam_api_library(name: &str) -> bool {
+    matches!(
+        name,
+        "steam_api.dll"
+            | "steam_api64.dll"
+            | "libsteam_api.so"
+            | "steam_api.so"
+            | "libsteam_api.dylib"
+            | "steam_api.dylib"
+    )
+}
+
 fn find_steam_api(dir: &Path) -> bool {
     let mut stack = vec![(dir.to_path_buf(), 0usize)];
     while let Some((path, depth)) = stack.pop() {
@@ -72,8 +86,7 @@ fn find_steam_api(dir: &Path) -> bool {
             if entry_path.is_dir() {
                 stack.push((entry_path, depth + 1));
             } else if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                let lower = name.to_ascii_lowercase();
-                if lower == "steam_api64.dll" || lower == "steam_api.dll" {
+                if is_steam_api_library(&name.to_ascii_lowercase()) {
                     return true;
                 }
             }
@@ -125,6 +138,14 @@ pub mod tests {
     fn rejects_non_pe() {
         assert_eq!(analyze_pe(b"not a pe"), None);
         assert_eq!(analyze_pe(&[]), None);
+    }
+
+    #[test]
+    fn a_native_linux_build_names_steamworks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin/x86_64")).unwrap();
+        std::fs::write(dir.path().join("bin/x86_64/libsteam_api.so"), b"\x7fELF").unwrap();
+        assert_eq!(detect(dir.path(), None), Drm::Steamworks);
     }
 
     #[test]

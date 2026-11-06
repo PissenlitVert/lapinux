@@ -1,0 +1,53 @@
+{
+  "id": "example-game-french",
+  "title": "Example Game — French translation",
+  "description": "The game ships without French text. This template shows how a translation configuration replaces the language file shipped with the game.",
+  "solution": "Copies a French language file over the game's language file. The original file is backed up and restored when the configuration is removed.",
+  "type": "language",
+  "platform": "both",
+  "layers": [
+    "game"
+  ],
+  "language": "fr",
+  "author": {
+    "name": "Your name",
+    "github": "your-github-handle"
+  },
+  "version": "0.1.0",
+  "license": "CC0-1.0",
+  "status": "proposed",
+  "tested": {
+    "proton": "",
+    "gpu": "",
+    "ram": "",
+    "distro": "",
+    "date": ""
+  },
+  "game": {
+    "names": [
+      "Example Game"
+    ],
+    "aliases": [],
+    "steam_appids": [],
+    "store_ids": []
+  },
+  "requires": [],
+  "conflicts": [],
+  "retired": true,
+  "actions": {
+    "settings": {
+      "env": [],
+      "dxvk": {},
+      "args": []
+    },
+    "files": [
+      {
+        "source": "files/fr.txt",
+        "target": "lang/fr.txt",
+        "sha256": "686ede2039aa785bc349ded15888b0b07e635abdcbf3d2ed05659a24c810940d",
+        "backup": true
+      }
+    ]
+  },
+  "links": []
+}

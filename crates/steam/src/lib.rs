@@ -1,15 +1,31 @@
-//! Steam sans client Steam : bibliothèques, manifests, DRM, SteamCMD, DepotDownloader.
+//! Steam sans client Steam : bibliothèques, manifests, DRM, catalogue et
+//! téléchargements natifs Lapinux.
 
-pub mod depotdownloader;
+pub mod account;
+pub mod achievements;
+pub mod catalog;
+pub mod cdn_stream;
+pub mod cloud;
+pub mod cm;
+pub mod download_log;
+pub mod gamedata;
 pub mod drm;
 pub mod library;
 pub mod manifest;
-pub mod meta;
-pub mod steamcmd;
+pub mod native;
+pub mod playtime;
+pub mod session;
+pub mod shared;
+pub mod social;
+pub mod stats;
+mod storecache;
+mod storegate;
+pub mod probe;
+pub mod runtime;
+pub mod throttle;
 pub mod tools;
 pub mod vdf;
-
-use std::path::Path;
+pub mod web;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -22,103 +38,44 @@ pub enum Error {
     #[error("réseau : {0}")]
     Http(String),
     #[error("core : {0}")]
-    Core(#[from] ludus_core::Error),
+    Core(#[from] lapinux_core::Error),
     #[error("{0}")]
     Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl Error {
+    /// Vrai si Steam a refusé la connexion parce que le compte ou l'adresse
+    /// est temporairement bloqué (EResult 84). Ce refus ne dit rien du jeton.
+    pub fn is_rate_limited(&self) -> bool {
+        let text = self.to_string().to_lowercase();
+        text.contains("eresult 84")
+            || text.contains("ratelimitexceeded")
+            || text.contains("rate limit exceeded")
+            || text.contains("trop de tentatives")
+            || text.contains("limite les tentatives")
+    }
+}
+
+/// Installe le fournisseur cryptographique de rustls, une fois pour tout le
+/// processus.
+///
+/// Deux fournisseurs (`ring` et `aws-lc-rs`) sont compilés par nos dépendances :
+/// sans choix explicite, rustls panique à la première connexion TLS, ce qui tuait
+/// le fil social (amis, présence, profil) dès qu'il ouvrait son WebSocket. À
+/// appeler avant toute connexion réseau.
+pub fn install_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // Un fournisseur déjà choisi par l'application reste prioritaire.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub use library::{
-    discover_libraries, find_launch_exe, find_native_executable, merge_existing, scan, scan_library,
-    Library, ScanReport,
+    discover_libraries, discover_libraries_with_managed, find_launch_exe, find_native_executable,
+    merge_existing, scan, scan_library, scan_with_managed, Library, ScanReport,
 };
 pub use manifest::{write_manifest, AppManifest};
-pub use meta::{parse_app_info, AppInfo, LaunchEntry};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Backend {
-    SteamCmd,
-    DepotDownloader,
-}
-
-impl Backend {
-    pub fn label(self) -> &'static str {
-        match self {
-            Backend::SteamCmd => "SteamCMD",
-            Backend::DepotDownloader => "DepotDownloader",
-        }
-    }
-}
-
-/// Choisit un backend de téléchargement selon la préférence et les outils présents.
-pub fn choose_backend(
-    preference: &str,
-    allow_depotdownloader: bool,
-    steamcmd_ok: bool,
-    depotdownloader_ok: bool,
-) -> Option<Backend> {
-    match preference {
-        "steamcmd" => steamcmd_ok.then_some(Backend::SteamCmd),
-        "depotdownloader" => {
-            (allow_depotdownloader && depotdownloader_ok).then_some(Backend::DepotDownloader)
-        }
-        _ => {
-            if steamcmd_ok {
-                Some(Backend::SteamCmd)
-            } else if allow_depotdownloader && depotdownloader_ok {
-                Some(Backend::DepotDownloader)
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// Vrai si SteamCMD possède déjà un jeton de connexion (SSFN).
-pub fn has_steam_token(steamcmd_root: &Path) -> bool {
-    let homes = [steamcmd_root.to_path_buf(), ludus_core::paths::home_dir().join(".steam")];
-    homes.iter().any(|dir| {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries.flatten().any(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                        .starts_with("ssfn")
-                })
-            })
-            .unwrap_or(false)
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backend_preference() {
-        assert_eq!(
-            choose_backend("auto", true, true, true),
-            Some(Backend::SteamCmd)
-        );
-        assert_eq!(
-            choose_backend("auto", true, false, true),
-            Some(Backend::DepotDownloader)
-        );
-        assert_eq!(choose_backend("auto", false, false, true), None);
-        assert_eq!(choose_backend("steamcmd", true, false, true), None);
-        assert_eq!(
-            choose_backend("depotdownloader", true, true, true),
-            Some(Backend::DepotDownloader)
-        );
-    }
-
-    #[test]
-    fn token_detection() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!has_steam_token(dir.path()));
-        std::fs::write(dir.path().join("ssfn1234"), b"x").unwrap();
-        assert!(has_steam_token(dir.path()));
-    }
-}

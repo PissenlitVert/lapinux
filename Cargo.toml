@@ -1,35 +1,75 @@
 [package]
-name = "ludus"
+name = "lapinux"
 version = "0.1.0"
 edition = "2021"
-description = "Gestionnaire de jeux léger pour Linux : Steam sans Steam, Proton, manettes et overlay"
+description = "Lapinux — gestionnaire de jeux léger pour Linux : Steam sans Steam, Proton, manettes et overlay"
 license = "MIT"
+autobins = false
+
+# Le binaire de l'application s'appelle `lapinux` ; la sonde de l'hôte natif
+# Steam garde un binaire distinct pour ne pas dépendre de l'interface.
+[[bin]]
+name = "lapinux"
+path = "src/main.rs"
+
+[[bin]]
+name = "lapinux-probe"
+path = "src/bin/lapinux-probe.rs"
 
 [workspace]
-members = ["crates/core", "crates/steam", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
-default-members = [".", "crates/core", "crates/steam", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
+members = ["crates/core", "crates/steam", "crates/stores", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
+default-members = [".", "crates/core", "crates/steam", "crates/stores", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
 
 [dependencies]
-ludus-core = { path = "crates/core" }
-ludus-steam = { path = "crates/steam" }
-ludus-proton = { path = "crates/proton" }
-ludus-perf = { path = "crates/perf" }
-ludus-input = { path = "crates/input" }
-ludus-overlay = { path = "crates/overlay" }
-ludus-ui = { path = "crates/ui" }
-ludus-daemon = { path = "crates/daemon" }
+lapinux-core = { path = "crates/core" }
+lapinux-steam = { path = "crates/steam" }
+lapinux-stores = { path = "crates/stores" }
+lapinux-proton = { path = "crates/proton" }
+lapinux-perf = { path = "crates/perf" }
+lapinux-input = { path = "crates/input" }
+lapinux-overlay = { path = "crates/overlay" }
+lapinux-ui = { path = "crates/ui" }
+lapinux-daemon = { path = "crates/daemon" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+tempfile = "3"
+
+# ThinLTO plutôt que le LTO « fat » : les deux optimisent entre crates, mais
+# Le profil `release` sert au développement courant : pas de LTO, et
+# `codegen-units = 16` pour compiler en parallèle les unités d'un même crate.
+# Le LTO complet réoptimisait tout le programme à chaque retouche — plus de
+# deux minutes pour un seul fichier de l'interface, contre quelques secondes
+# ici. La compilation incrémentale ne refait que les unités touchées.
+#
+# Pour un binaire publiable, `cargo build --profile dist` (LTO complet, une
+# seule unité de code) sort dans `target/dist/lapinux`.
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = false
+incremental = true
+codegen-units = 16
 panic = "abort"
 strip = true
+
+# Profil de distribution : le LTO complet, pour le binaire publiable.
+# `cargo build --profile dist` ; le binaire sort dans `target/dist/lapinux`.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+incremental = false
+
+# Les builds de développement ne gardent aucune information de débogage :
+# chaque binaire de test pesait ~80 Mo, et le cache `target/debug` dépassait
+# 40 Go. Les messages de panique gardent leur fichier et leur ligne ; seules
+# les piles d'appel détaillées disparaissent.
+[profile.dev]
+debug = 0
 
 [profile.dev.package."*"]
 opt-level = 1

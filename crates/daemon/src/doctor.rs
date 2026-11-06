@@ -1,8 +1,18 @@
-//! Diagnostic de l'environnement, affiché dans l'UI et via `ludus cli doctor`.
+//! Diagnostic de l'environnement, affiché dans l'UI et via `lapinux cli doctor`.
 
 use crate::Shared;
-use ludus_core::model::{Check, CheckStatus, DoctorReport};
-use ludus_core::paths;
+use lapinux_core::model::{Check, CheckStatus, DoctorReport};
+use lapinux_core::paths;
+use lapinux_input::shortcut;
+
+fn daemon_alive(socket: &std::path::Path) -> bool {
+    lapinux_core::ipc::send_request_timeout(
+        socket,
+        &lapinux_core::ipc::Req::Ping,
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
+}
 
 fn check(name: &str, status: CheckStatus, detail: impl Into<String>) -> Check {
     Check {
@@ -14,6 +24,11 @@ fn check(name: &str, status: CheckStatus, detail: impl Into<String>) -> Check {
 
 pub fn report(shared: &Shared) -> DoctorReport {
     let mut checks = Vec::new();
+    // Le fichier fait foi : une modification à la main doit être diagnostiquée
+    // telle qu'elle sera relue au prochain lancement, pas telle qu'elle était
+    // en mémoire au démarrage du daemon.
+    let config = lapinux_core::Config::load(&shared.paths.config_file)
+        .unwrap_or_else(|_| shared.config_snapshot());
 
     let roots = paths::steam_roots();
     checks.push(if roots.is_empty() {
@@ -38,7 +53,7 @@ pub fn report(shared: &Shared) -> DoctorReport {
         )
     });
 
-    let library_root = shared.config_snapshot().library_root();
+    let library_root = config.library_root();
     checks.push(if library_root.exists() {
         check(
             "Bibliothèque",
@@ -64,9 +79,13 @@ pub fn report(shared: &Shared) -> DoctorReport {
     });
 
     checks.push(if paths::which("gamescope").is_some() {
-        check("gamescope", CheckStatus::Ok, "compositeur imbriqué disponible")
+        check("GameScope", CheckStatus::Ok, "compositeur imbriqué disponible")
     } else {
-        check("gamescope", CheckStatus::Warn, "absent : lancement sans gamescope")
+        check(
+            "GameScope",
+            CheckStatus::Warn,
+            "absent : lancement sans GameScope",
+        )
     });
 
     checks.push(if paths::which("mangohud").is_some() {
@@ -75,51 +94,18 @@ pub fn report(shared: &Shared) -> DoctorReport {
         check("MangoHud", CheckStatus::Warn, "absent : HUD désactivé")
     });
 
-    checks.push(match paths::which("gamemoderun") {
-        Some(_) => check("GameMode", CheckStatus::Ok, "gamemoderun détecté"),
-        None => check(
-            "GameMode",
-            CheckStatus::Warn,
-            "absent (rpm-ostree install gamemode, redémarrage requis) : nice/gamescope restent actifs",
-        ),
-    });
-
-    let recorder = shared.config_snapshot().overlay.recorder;
-    checks.push(match paths::which(&recorder) {
-        Some(path) => check("Enregistrement", CheckStatus::Ok, path.display().to_string()),
-        None => check(
-            "Enregistrement",
-            CheckStatus::Warn,
-            "gpu-screen-recorder absent : bouton d'enregistrement désactivé",
-        ),
-    });
-
-    checks.push(match paths::which("steamcmd") {
-        Some(path) => check("SteamCMD", CheckStatus::Ok, path.display().to_string()),
-        None => {
-            if shared.steamcmd.available() {
-                check(
-                    "SteamCMD",
-                    CheckStatus::Ok,
-                    shared.steamcmd.binary().display().to_string(),
-                )
-            } else {
-                check(
-                    "SteamCMD",
-                    CheckStatus::Warn,
-                    "non installé : nécessaire pour télécharger de nouveaux jeux",
-                )
-            }
-        }
-    });
-
-    checks.push(if ludus_steam::has_steam_token(&shared.steamcmd.root) {
-        check("Connexion Steam", CheckStatus::Ok, "jeton SteamCMD présent")
+    let steam = shared.steam_status();
+    checks.push(if steam.token_saved {
+        check(
+            "Connexion Steam",
+            CheckStatus::Ok,
+            "session Lapinux enregistrée : aucun client Steam n'est lancé",
+        )
     } else {
         check(
             "Connexion Steam",
             CheckStatus::Warn,
-            "connectez-vous avec « ludus cli login <compte> »",
+            "connectez votre compte dans Réglages → Compte Steam (le mot de passe n'est jamais stocké)",
         )
     });
 
@@ -139,17 +125,68 @@ pub fn report(shared: &Shared) -> DoctorReport {
         check("Pad virtuel", CheckStatus::Warn, "/dev/uinput absent")
     });
 
-    let devices = ludus_input::device::list();
+    let access = lapinux_input::access::audit();
+    let chord = config.overlay.hotkey.trim();
+    checks.push(match shortcut::state() {
+        Some(shortcut::State::Active(chord)) => check(
+            "Raccourci clavier",
+            CheckStatus::Ok,
+            format!("{chord} actif via KWin (aucune permission /dev/input requise)"),
+        ),
+        Some(shortcut::State::Ready) if shortcut::kwin_available() => check(
+            "Raccourci clavier",
+            CheckStatus::Ok,
+            format!(
+                "KWin répond : « {chord} » sera enregistré au lancement d'un jeu ; aucune permission /dev/input nécessaire"
+            ),
+        ),
+        Some(shortcut::State::Ready) => check(
+            "Raccourci clavier",
+            CheckStatus::Fail,
+            format!(
+                "KWin ne répond pas : « {chord} » ne peut pas être capturé. Le raccourci passe par un script KWin, disponible sous Plasma Wayland."
+            ),
+        ),
+        None if daemon_alive(&shared.paths.socket) => check(
+            "Raccourci clavier",
+            CheckStatus::Fail,
+            format!(
+                "le daemon ne sert pas le raccourci (version antérieure ?) : « {chord} » ne s'ouvrira pas"
+            ),
+        ),
+        None => check(
+            "Raccourci clavier",
+            CheckStatus::Warn,
+            format!("daemon arrêté : « {chord} » sera servi par KWin au démarrage"),
+        ),
+    });
+
+    let devices = lapinux_input::device::list();
     let pads = devices.iter().filter(|d| d.gamepad).count();
-    checks.push(check(
-        "Manettes",
-        if pads > 0 {
-            CheckStatus::Ok
-        } else {
-            CheckStatus::Warn
-        },
-        format!("{pads} manette(s) détectée(s) sur {} périphérique(s) evdev", devices.len()),
-    ));
+    let denied_pads: Vec<_> = access
+        .iter()
+        .filter(|d| !d.readable && d.gamepad)
+        .collect();
+    checks.push(if let Some(device) = denied_pads.first() {
+        check(
+            "Manettes",
+            CheckStatus::Warn,
+            format!(
+                "{} ({}) est illisible : {}",
+                device.name,
+                device.path.display(),
+                device.error.as_deref().unwrap_or("permission refusée")
+            ),
+        )
+    } else if pads > 0 {
+        check(
+            "Manettes",
+            CheckStatus::Ok,
+            format!("{pads} manette(s) lisible(s) sur {} périphérique(s) evdev", devices.len()),
+        )
+    } else {
+        check("Manettes", CheckStatus::Warn, "aucune manette détectée")
+    });
 
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     checks.push(if session == "wayland" {

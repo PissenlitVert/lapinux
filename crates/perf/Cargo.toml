@@ -1,11 +1,11 @@
 [package]
-name = "ludus-perf"
+name = "lapinux-perf"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ludus-core = { path = "../core" }
-ludus-proton = { path = "../proton" }
+lapinux-core = { path = "../core" }
+lapinux-proton = { path = "../proton" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 thiserror = "1"

@@ -20,10 +20,8 @@ pub struct Profile {
     /// Bouton maintenant une couche alternative.
     pub shift_button: Option<String>,
     pub shift_remap: BTreeMap<String, String>,
-    /// Raccourci manette d'ouverture de l'overlay, ex. ["BTN_TL", "BTN_TR", "BTN_START"].
+    /// Raccourci manette d'ouverture de l'overlay, ex. ["Guide"] ou ["LB", "RB", "Start"].
     pub hotkey_chord: Vec<String>,
-    /// Raccourci clavier global (lu via evdev, sans grab), ex. ["Meta", "F1"].
-    pub keyboard_hotkey: Vec<String>,
     /// Réglages gyroscopique (activé quand un périphérique IIO est disponible).
     pub gyro_to_right_stick: bool,
 }
@@ -40,8 +38,7 @@ impl Default for Profile {
             remap: BTreeMap::new(),
             shift_button: None,
             shift_remap: BTreeMap::new(),
-            hotkey_chord: vec!["BTN_TL".into(), "BTN_TR".into(), "BTN_START".into()],
-            keyboard_hotkey: vec!["Meta".into(), "F1".into()],
+            hotkey_chord: vec!["Guide".into()],
             gyro_to_right_stick: false,
         }
     }
@@ -339,8 +336,23 @@ mod tests {
     }
 
     #[test]
-    fn chord_triggers_once_until_release() {
+    fn guide_button_triggers_once_until_release() {
         let mut mapper = mapper();
+        let (_, hotkey) = mapper.on_key(BTN_MODE, 1);
+        assert!(hotkey);
+        let (_, hotkey) = mapper.on_key(BTN_MODE, 1);
+        assert!(!hotkey);
+        let _ = mapper.on_key(BTN_MODE, 0);
+        let (_, hotkey) = mapper.on_key(BTN_MODE, 1);
+        assert!(hotkey);
+    }
+
+    #[test]
+    fn chord_triggers_once_until_release() {
+        let mut mapper = Mapper::new(Profile {
+            hotkey_chord: vec!["LB".into(), "RB".into(), "Start".into()],
+            ..Default::default()
+        });
         let _ = mapper.on_key(BTN_TL, 1);
         let _ = mapper.on_key(BTN_TR, 1);
         let (_, hotkey) = mapper.on_key(BTN_START, 1);

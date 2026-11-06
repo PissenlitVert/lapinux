@@ -1,0 +1,14 @@
+# Example Game — French
+# This is a template, not a real game translation: replace every line with the
+# strings the game actually loads. Keep the keys, translate the values.
+
+menu.play=Jouer
+menu.settings=Réglages
+menu.quit=Quitter
+menu.continue=Continuer
+settings.audio=Audio
+settings.video=Affichage
+settings.language=Langue
+settings.back=Retour
+hud.health=Santé
+hud.paused=En pause

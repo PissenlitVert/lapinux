@@ -1,18 +1,29 @@
 [package]
-name = "ludus-daemon"
+name = "lapinux-daemon"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ludus-core = { path = "../core" }
-ludus-steam = { path = "../steam" }
-ludus-proton = { path = "../proton" }
-ludus-perf = { path = "../perf" }
-ludus-input = { path = "../input" }
+lapinux-core = { path = "../core" }
+lapinux-steam = { path = "../steam" }
+lapinux-stores = { path = "../stores" }
+lapinux-proton = { path = "../proton" }
+lapinux-perf = { path = "../perf" }
+lapinux-input = { path = "../input" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+ureq = "2"
+sha2 = "0.10"
 libc = "0.2"
+# Capture de la fenêtre du jeu par KWin (ScreenShot2), sans portail ni outil
+# externe : l'image arrive par un tube passé sur le bus de session.
+zbus = "5.13"
+# Visuel du jeu en cours et icônes des jeux récents dans le menu du tray.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Première image d'un jeu GameScope qui ne journalise pas de swapchain
+# (OpenGL) : ses fenêtres X11 signalent leur premier dessin par XDamage.
+x11rb = { version = "0.13", features = ["damage"] }
 
 [dev-dependencies]
 tempfile = "3"
