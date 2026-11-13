@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CATALOG = ROOT / "catalog.json"
 ENTRIES = ROOT / "configurations"
 EXAMPLES = ROOT / "examples"
+THEMES = ROOT / "themes"
+THEME_STATUSES = {"proposed", "verified", "experimental", "broken"}
 
 CATALOG_VERSION = 2
 MAINTAINER = {"name": "Pissenlit Vert", "github": "PissenlitVert"}
@@ -266,6 +268,63 @@ def collect(folder: Path, published: bool, problems: Problems) -> list[dict]:
     return entries
 
 
+def theme_field(text: str, name: str) -> str:
+    """Read one string field from a theme manifest, without a TOML parser.
+
+    Theme manifests are flat: every field is a single quoted string, a number
+    or a boolean. A missing field stays empty and is reported by validation.
+    """
+    match = re.search(rf'^{name}\s*=\s*"((?:[^"\\]|\\.)*)"', text, re.MULTILINE)
+    return match.group(1) if match else ""
+
+
+def collect_themes(problems: Problems) -> list[dict]:
+    themes: list[dict] = []
+    if not THEMES.is_dir():
+        return themes
+    for path in sorted(THEMES.glob("*.toml")):
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+        ident = theme_field(text, "id")
+        name = theme_field(text, "name")
+        description = theme_field(text, "description")
+        author = theme_field(text, "author")
+        version = theme_field(text, "version") or "0.1.0"
+        license_name = theme_field(text, "license") or "CC0-1.0"
+        status = theme_field(text, "status") or "experimental"
+        relative = f"themes/{path.name}"
+        if not re.fullmatch(r"[a-z0-9]+(?:[-_][a-z0-9]+)*", ident):
+            problems.add(relative, "invalid or missing id")
+            continue
+        if path.name != f"{ident}.toml":
+            problems.add(relative, f"file name must be {ident}.toml")
+            continue
+        if not name or not description:
+            problems.add(relative, "missing name or description")
+            continue
+        if status not in THEME_STATUSES:
+            problems.add(relative, f"unknown status '{status}'")
+            continue
+        if len(raw) > 256 * 1024:
+            problems.add(relative, "theme manifest is too large")
+            continue
+        themes.append(
+            {
+                "id": ident,
+                "title": name,
+                "description": description,
+                "author": {"name": author or MAINTAINER["name"], "github": MAINTAINER["github"]},
+                "version": version,
+                "license": license_name,
+                "status": status,
+                "file": relative,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+            }
+        )
+    return themes
+
+
 def build(problems: Problems) -> dict:
     entries = collect(ENTRIES, True, problems)
     collect(EXAMPLES, False, problems)
@@ -277,6 +336,7 @@ def build(problems: Problems) -> dict:
         "version": CATALOG_VERSION,
         "maintainer": MAINTAINER,
         "configurations": entries,
+        "themes": collect_themes(problems),
     }
 
 

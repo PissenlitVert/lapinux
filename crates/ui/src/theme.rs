@@ -491,18 +491,13 @@ impl ThemeLibrary {
     pub fn load(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         let mut library = Self {
-            themes: vec![
-                Theme {
-                    manifest: ThemeManifest::classic(),
-                    builtin: true,
-                    path: None,
-                },
-                Theme {
-                    manifest: ThemeManifest::nx(),
-                    builtin: true,
-                    path: None,
-                },
-            ],
+            // Seul le thème classique est compilé : NX vit dans le catalogue
+            // communautaire et n'existe qu'une fois installé.
+            themes: vec![Theme {
+                manifest: ThemeManifest::classic(),
+                builtin: true,
+                path: None,
+            }],
             dir,
             error: None,
         };
@@ -1156,6 +1151,23 @@ mod tests {
         let library = ThemeLibrary::load("/tmp/lapinux-theme-test-missing");
         assert_eq!(library.active("sombre").manifest.id, CLASSIC_ID);
         assert_eq!(library.active("").manifest.id, CLASSIC_ID);
+        // NX n'est plus compilé : sans fichier installé, il retombe sur le
+        // thème classique au lieu de créer un thème fantôme.
+        assert_eq!(library.active("nx").manifest.id, CLASSIC_ID);
+    }
+
+    #[test]
+    fn nx_installe_depuis_le_catalogue_devient_actif() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = ThemeManifest::nx();
+        std::fs::write(
+            temp.path().join("nx.toml"),
+            theme_toml(&manifest),
+        )
+        .unwrap();
+        let library = ThemeLibrary::load(temp.path());
+        let nx = library.find(NX_ID).expect("thème NX installé");
+        assert!(!nx.builtin);
         assert_eq!(library.active("nx").manifest.id, NX_ID);
     }
 

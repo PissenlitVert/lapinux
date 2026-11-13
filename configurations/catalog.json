@@ -48,5 +48,22 @@
       "size": 0,
       "base": ""
     }
+  ],
+  "themes": [
+    {
+      "id": "nx",
+      "title": "NX",
+      "description": "Accueil horizontal, carrousel de jeux et dock inspirés de la Nintendo Switch. Thème expérimental, encore incomplet.",
+      "author": {
+        "name": "Pissenlit Vert",
+        "github": "PissenlitVert"
+      },
+      "version": "0.1.0",
+      "license": "CC0-1.0",
+      "status": "experimental",
+      "file": "themes/nx.toml",
+      "sha256": "a3270d2ea5611785a5d6de6a810f36ab5a65100e143a9583173ec661c8e7b2f0",
+      "size": 893
+    }
   ]
 }

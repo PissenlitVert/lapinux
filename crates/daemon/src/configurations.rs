@@ -8,7 +8,7 @@
 
 use lapinux_core::configurations::{
     self, Catalog, Configuration, ConfigurationSet, FileSpec, InstallReport,
-    InstalledConfiguration, InstalledFile,
+    InstalledConfiguration, InstalledFile, ThemeCatalogSet, ThemeEntry,
 };
 use lapinux_core::ipc::Envelope;
 use lapinux_core::model::Game;
@@ -160,6 +160,79 @@ impl super::Shared {
             fetched,
             catalog_url: url,
         }))
+    }
+
+    /// Thèmes du catalogue et ceux déjà posés dans `themes/`. La lecture
+    /// distante continue en tâche de fond : cette réponse ne l'attend pas.
+    pub fn theme_catalog(self: &Arc<Self>) -> lapinux_core::Result<Envelope> {
+        self.start_configurations_in_background();
+        let (themes, remote, fetched, url) = {
+            let state = self
+                .configurations
+                .lock()
+                .map_err(|_| lapinux_core::Error::Other("catalogue indisponible".into()))?;
+            (
+                state.catalog.themes.clone(),
+                state.remote,
+                state.fetched,
+                state.url.clone(),
+            )
+        };
+        Ok(Envelope::ok(&ThemeCatalogSet {
+            themes,
+            installed: installed_themes(&self.paths.themes_dir()),
+            remote,
+            fetched,
+            catalog_url: url,
+        }))
+    }
+
+    /// Installe un thème du catalogue : le fichier est téléchargé, son
+    /// empreinte vérifiée, son manifeste contrôlé, puis écrit dans `themes/`.
+    /// Aucun jeu n'est touché et rien ne s'active sans un choix de l'utilisateur.
+    pub fn install_theme(&self, id: &str) -> lapinux_core::Result<Envelope> {
+        let (entry, base) = {
+            let state = self
+                .configurations
+                .lock()
+                .map_err(|_| lapinux_core::Error::Other("catalogue indisponible".into()))?;
+            let entry = state
+                .catalog
+                .themes
+                .iter()
+                .find(|entry| entry.id == id)
+                .cloned()
+                .ok_or_else(|| lapinux_core::Error::Other("thème introuvable".into()))?;
+            (entry, configurations::catalog_base(&state.url))
+        };
+        if !entry.available() {
+            return Err(lapinux_core::Error::Other(
+                "ce thème est signalé cassé par son auteur".into(),
+            ));
+        }
+        let problems = entry.validate();
+        if !problems.is_empty() {
+            return Err(lapinux_core::Error::Other(format!(
+                "thème invalide : {}",
+                problems.join(" ; ")
+            )));
+        }
+        let url = configurations::theme_url(&base, &entry)
+            .ok_or_else(|| lapinux_core::Error::Other("thème sans adresse".into()))?;
+        let bytes = download(&url, 256 * 1024).map_err(lapinux_core::Error::Other)?;
+        let found = sha256_hex(&bytes);
+        if !found.eq_ignore_ascii_case(entry.sha256.trim()) {
+            return Err(lapinux_core::Error::Other(format!(
+                "empreinte du thème incorrecte : attendu {}, obtenu {found}",
+                entry.sha256
+            )));
+        }
+        let target = write_theme(&self.paths.themes_dir(), &entry, &bytes)
+            .map_err(lapinux_core::Error::Other)?;
+        Ok(Envelope::ok(&serde_json::json!({
+            "id": entry.id,
+            "path": target.display().to_string(),
+        })))
     }
 
     /// Installe une configuration sur un jeu. Tout est vérifié et sauvegardé
@@ -588,6 +661,39 @@ impl super::Shared {
 }
 
 /// Télécharge un fichier en refusant tout ce qui dépasse le plafond.
+/// Identifiants des thèmes déjà présents : le nom du fichier suffit, il est
+/// écrit depuis l'identifiant validé du catalogue.
+fn installed_themes(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
+                .then(|| path.file_stem()?.to_str().map(|stem| stem.to_string()))
+                .flatten()
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Valide un manifeste reçu puis l'écrit dans `themes/` par un temporaire
+/// renommé. Le fichier n'est jamais partiel, et un thème invalide ne remplace
+/// pas une version déjà installée.
+fn write_theme(dir: &Path, entry: &ThemeEntry, bytes: &[u8]) -> Result<PathBuf, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "thème non UTF-8".to_string())?;
+    configurations::validate_theme_manifest(text, &entry.id)?;
+    std::fs::create_dir_all(dir).map_err(|error| format!("dossier des thèmes : {error}"))?;
+    let target = dir.join(format!("{}.toml", entry.id));
+    let temporary = dir.join(format!(".{}.tmp", entry.id));
+    std::fs::write(&temporary, bytes).map_err(|error| format!("écriture du thème : {error}"))?;
+    std::fs::rename(&temporary, &target).map_err(|error| format!("thème reçu : {error}"))?;
+    Ok(target)
+}
+
 fn download(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     let response = ureq::get(url)
         .set("User-Agent", "Lapinux")
@@ -914,5 +1020,29 @@ mod tests {
         let state = State::new();
         assert!(!state.catalog.configurations.is_empty());
         assert_eq!(state.catalog.maintainer.github, "PissenlitVert");
+        // NX n'est plus compilé dans l'interface : il n'existe que par cette
+        // entrée de catalogue.
+        assert!(state.catalog.themes.iter().any(|theme| theme.id == "nx"));
+    }
+
+    #[test]
+    fn un_theme_du_catalogue_est_ecrit_apres_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = ThemeEntry {
+            id: "nx".into(),
+            ..Default::default()
+        };
+        let text = "id = \"nx\"\nlayout = \"nx\"\naccent = \"#00C8E0\"\n";
+        let target = write_theme(dir.path(), &entry, text.as_bytes()).unwrap();
+        assert_eq!(target.file_name().unwrap(), "nx.toml");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), text);
+        // Un manifeste dont l'identifiant ne correspond pas à l'entrée ne doit
+        // rien remplacer.
+        let other = ThemeEntry {
+            id: "autre".into(),
+            ..Default::default()
+        };
+        assert!(write_theme(dir.path(), &other, text.as_bytes()).is_err());
+        assert!(!dir.path().join("autre.toml").exists());
     }
 }

@@ -26,13 +26,14 @@ Maintained by **Pissenlit Vert** ([@PissenlitVert](https://github.com/PissenlitV
 5. [Actions in detail](#actions-in-detail)
 6. [Translations](#translations)
 7. [Mods and data files](#mods-and-data-files)
-8. [Testing your configuration](#testing-your-configuration)
-9. [Versions, updates and retirement](#versions-updates-and-retirement)
-10. [Safety rules](#safety-rules)
-11. [Building the catalog and CI](#building-the-catalog-and-ci)
-12. [Pull request checklist](#pull-request-checklist)
-13. [FAQ](#faq)
-14. [License](#license)
+8. [Themes](#themes)
+9. [Testing your configuration](#testing-your-configuration)
+10. [Versions, updates and retirement](#versions-updates-and-retirement)
+11. [Safety rules](#safety-rules)
+12. [Building the catalog and CI](#building-the-catalog-and-ci)
+13. [Pull request checklist](#pull-request-checklist)
+14. [FAQ](#faq)
+15. [License](#license)
 
 ---
 
@@ -284,6 +285,22 @@ packages:
   here. Lapinux does not run code from a catalog.
 
 ---
+
+## Themes
+
+A theme is a declarative TOML manifest: a palette, a layout (`classic` or
+`nx`), a rounding, a font scale and two home texts. It carries no image, no
+script and no game action. Lapinux validates it before writing it to
+`~/.config/lapinux/themes/`; the player then picks it in Settings → Appearance.
+
+Themes are published in `catalog.json` under `themes`, each with the path of
+its manifest (`themes/<id>.toml`), its SHA-256 and its size. The NX theme is
+published this way: it is experimental, is not compiled into Lapinux, and only
+exists once installed from the catalog.
+
+To add or change a theme, edit `themes/<id>.toml` (with `id`, `name`,
+`description`, `author`, `version`, `license`, `status` and the theme fields),
+then run `python3 tools/catalog.py` so the digest and size follow the file.
 
 ## Testing your configuration
 

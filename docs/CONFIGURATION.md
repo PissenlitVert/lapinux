@@ -21,7 +21,7 @@ internes, listés ensuite.
 | Chemin | Contenu |
 | --- | --- |
 | `~/.config/lapinux/config.toml` | réglages (`Config`) |
-| `~/.config/lapinux/themes/` | thèmes créés par l'utilisateur |
+| `~/.config/lapinux/themes/` | thèmes créés par l'utilisateur ou installés depuis le catalogue |
 | `~/.config/lapinux/plugins/` | plugins déclaratifs (couleurs, disposition, dock) |
 | `~/.local/share/lapinux/lapinux.redb` | base redb : jeux, sessions, historique |
 | `~/.local/share/lapinux/logs/` | `daemon.log`, `ui.log`, `games.log`, `overlay.log` |
@@ -94,7 +94,7 @@ Les sections correspondent aux réglages de l'interface.
 | `lang` | langue du bureau | langue de l'interface (`fr`, `en`) |
 | `game_language` | vide | langue des jeux (nom Steam, `french`…) ; vide = celle du client Steam, sinon du bureau |
 | `library_root` | `~/Lapinux/LapinuxLibrary` | racine des bibliothèques gérées |
-| `theme` | `sombre` | `classic`, `nx` ou l'identifiant d'un thème de `themes/` |
+| `theme` | `sombre` | `classic`, ou l'identifiant d'un thème de `themes/` (`nx` une fois installé depuis le catalogue) |
 | `active_plugins` | vide | identifiants des plugins actifs |
 | `topbar_order` | vide | ordre des sections de la barre du haut (`library`, `downloads`, `controllers`, `profile`, `boutiques`, `captures`, `news`) |
 | `animations`, `big_picture` | `true`, `false` | animations ; démarrage en plein écran façon console |

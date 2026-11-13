@@ -248,6 +248,11 @@ pub enum Req {
         appid: u32,
         id: String,
     },
+    /// Thèmes proposés par le catalogue et ceux déjà installés.
+    ThemeCatalog,
+    /// Installe un thème du catalogue : fichier vérifié, alors que le jeu
+    /// n'est pas concerné.
+    InstallTheme { id: String },
     /// Injecteurs facultatifs suivis par jeu ; les chemins sont relatifs au dossier du jeu.
     GraphicsInjectors {
         appid: u32,

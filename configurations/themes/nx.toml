@@ -1,0 +1,27 @@
+# Thème NX — accueil horizontal inspiré de la Nintendo Switch.
+# Manifeste déclaratif : aucune image, aucun script, seulement des couleurs,
+# une disposition et deux textes. Lapinux le valide avant de l'installer.
+id = "nx"
+name = "NX"
+author = "Pissenlit Vert"
+description = "Accueil horizontal, carrousel de jeux et dock inspirés de la Nintendo Switch. Thème expérimental, encore incomplet."
+layout = "nx"
+accent = "#00C8E0"
+background = "#1C1C1E"
+panel = "#2B2B2E"
+card = "#39393D"
+card_hover = "#46464B"
+card_active = "#525359"
+border = "#494A4F"
+text = "#F4F5F7"
+text_dim = "#A6A9B0"
+rounding = 12.0
+font_scale = 1.0
+home_label = "Lapinux"
+home_subtitle = "Choisissez un jeu et appuyez sur Entrée."
+
+# Métadonnées de catalogue, lues par tools/catalog.py et ignorées par
+# l'interface une fois le thème installé.
+version = "0.1.0"
+license = "CC0-1.0"
+status = "experimental"

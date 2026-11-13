@@ -1527,6 +1527,8 @@ fn log_action(request: &Req) {
         Req::RemoveConfiguration { appid, id } => {
             tracing::info!("retrait de la configuration {id} de {appid}")
         }
+        Req::ThemeCatalog => tracing::debug!("thèmes du catalogue demandés"),
+        Req::InstallTheme { id } => tracing::info!("installation du thème {id}"),
         Req::GameAchievements { appid } => {
             tracing::info!("succès du jeu {appid} demandés (session Steam)")
         }
@@ -1882,6 +1884,8 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
         }
         Req::InstallConfiguration { appid, id } => shared.install_configuration(appid, &id),
         Req::RemoveConfiguration { appid, id } => shared.remove_configuration(appid, &id),
+        Req::ThemeCatalog => shared.theme_catalog(),
+        Req::InstallTheme { id } => shared.install_theme(&id),
         Req::GraphicsInjectors { appid } => shared.graphics_injectors(appid),
         Req::InstallGraphicsInjector {
             appid,

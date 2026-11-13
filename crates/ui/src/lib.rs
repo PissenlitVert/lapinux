@@ -5344,6 +5344,11 @@ struct LapinuxApp {
     page: Page,
     /// Thèmes fournis et thèmes personnels, relus après chaque modification.
     theme_library: theme::ThemeLibrary,
+    /// Thèmes proposés par le catalogue, lus à l'ouverture de l'onglet.
+    theme_catalog: Option<lapinux_core::configurations::ThemeCatalogSet>,
+    theme_catalog_rx: Option<mpsc::Receiver<Option<lapinux_core::configurations::ThemeCatalogSet>>>,
+    theme_catalog_asked: Option<Instant>,
+    theme_install_rx: Option<(String, mpsc::Receiver<Result<(), String>>)> ,
     /// Plugins déclaratifs, actifs selon `config.general.active_plugins`.
     plugin_library: theme::PluginLibrary,
     /// Thème effectif, plugins compris.
@@ -6552,6 +6557,10 @@ impl LapinuxApp {
             paths,
             page: startup_page(&config.general, active_theme.layout),
             theme_library,
+            theme_catalog: None,
+            theme_catalog_rx: None,
+            theme_catalog_asked: None,
+            theme_install_rx: None,
             plugin_library,
             active_theme,
             theme_dirty: false,

@@ -2079,6 +2079,8 @@ impl LapinuxApp {
             },
         );
 
+        self.settings_theme_catalog_card(ui);
+
         settings_card(
             ui,
             lapinux_core::i18n::t("ui.plugins"),
@@ -3289,6 +3291,203 @@ impl LapinuxApp {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
         close
+    }
+
+    /// Thèmes publiés dans le catalogue : on les installe dans `themes/`
+    /// sans toucher aux jeux, puis l'utilisateur les active comme les autres.
+    fn settings_theme_catalog_card(&mut self, ui: &mut egui::Ui) {
+        self.poll_theme_install(ui.ctx());
+        if self.theme_catalog.is_none()
+            && self.theme_catalog_rx.is_none()
+            && self
+                .theme_catalog_asked
+                .map_or(true, |asked| asked.elapsed() > Duration::from_secs(30))
+        {
+            self.ask_theme_catalog(ui.ctx());
+        }
+        let mut install: Option<String> = None;
+        let mut refresh = false;
+        let catalog = self.theme_catalog.clone();
+        settings_card(
+            ui,
+            lapinux_core::i18n::t("settings.appearance.catalog"),
+            lapinux_core::i18n::t("settings.appearance.catalog_desc"),
+            |ui| {
+                if let Some(set) = &catalog {
+                    if set.themes.is_empty() {
+                        muted(ui, lapinux_core::i18n::t("settings.appearance.catalog_empty"));
+                    }
+                    for entry in &set.themes {
+                        let installed = set.installed.iter().any(|id| id == &entry.id);
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&entry.title)
+                                            .size(12.5)
+                                            .strong()
+                                            .color(TEXT()),
+                                    );
+                                    if entry.status == "experimental" {
+                                        ui.label(
+                                            egui::RichText::new(lapinux_core::i18n::t(
+                                                "settings.appearance.catalog_experimental",
+                                            ))
+                                            .size(9.5)
+                                            .color(WARN),
+                                        );
+                                    }
+                                    if installed {
+                                        ui.label(
+                                            egui::RichText::new(lapinux_core::i18n::t(
+                                                "settings.appearance.catalog_installed",
+                                            ))
+                                            .size(9.5)
+                                            .color(OK),
+                                        );
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new(&entry.description)
+                                        .size(10.5)
+                                        .color(TEXT_DIM()),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · {} · {}",
+                                        entry.author.name, entry.license, entry.version
+                                    ))
+                                    .size(9.5)
+                                    .color(TEXT_DIM()),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if !installed
+                                        && entry.available()
+                                        && ui
+                                            .button(lapinux_core::i18n::t(
+                                                "settings.appearance.catalog_install",
+                                            ))
+                                            .clicked()
+                                    {
+                                        install = Some(entry.id.clone());
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(6.0);
+                    }
+                    if !set.remote {
+                        muted(
+                            ui,
+                            lapinux_core::i18n::t("settings.appearance.catalog_offline"),
+                        );
+                    }
+                } else {
+                    muted(
+                        ui,
+                        lapinux_core::i18n::t("settings.appearance.catalog_loading"),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if secondary_button(
+                        ui,
+                        lapinux_core::i18n::t("settings.appearance.catalog_refresh"),
+                    )
+                    .clicked()
+                    {
+                        refresh = true;
+                    }
+                });
+            },
+        );
+        if refresh {
+            self.theme_catalog = None;
+            self.theme_catalog_asked = None;
+            self.ask_theme_catalog(ui.ctx());
+        }
+        if let Some(id) = install {
+            self.install_catalog_theme(id, ui.ctx());
+        }
+    }
+
+    fn ask_theme_catalog(&mut self, ctx: &egui::Context) {
+        if self.theme_catalog_rx.is_some() {
+            return;
+        }
+        self.theme_catalog_asked = Some(Instant::now());
+        let (tx, rx) = mpsc::channel();
+        self.theme_catalog_rx = Some(rx);
+        let client = self.client.detached();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let data = client
+                .request(&Req::ThemeCatalog)
+                .ok()
+                .and_then(|envelope| envelope.into_data().ok());
+            let _ = tx.send(data);
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_catalog_theme(&mut self, id: String, ctx: &egui::Context) {
+        if self.theme_install_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.theme_install_rx = Some((id.clone(), rx));
+        let client = self.client.detached();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = client
+                .request(&Req::InstallTheme { id })
+                .map_err(|error| error.to_string())
+                .and_then(|envelope| {
+                    if envelope.ok {
+                        Ok(())
+                    } else {
+                        Err(envelope.error.unwrap_or_else(|| {
+                            lapinux_core::i18n::t("settings.storage.unknown_error").into()
+                        }))
+                    }
+                });
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_theme_install(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.theme_catalog_rx.take() {
+            match rx.try_recv() {
+                Ok(data) => self.theme_catalog = data,
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.theme_catalog_rx = Some(rx);
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        if let Some((id, rx)) = self.theme_install_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.theme_library = theme::ThemeLibrary::load(self.paths.themes_dir());
+                    self.theme_catalog = None;
+                    self.theme_catalog_asked = None;
+                    self.notify(lapinux_core::i18n::t_args(
+                        "settings.appearance.catalog_installed_notice",
+                        &[("id", &id)],
+                    ));
+                }
+                Ok(Err(error)) => self.notify(error),
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.theme_install_rx = Some((id, rx));
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
     }
 
     /// Rapport anonyme prêt à coller : mêmes champs que la page Diagnostic,

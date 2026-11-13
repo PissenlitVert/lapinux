@@ -39,6 +39,35 @@
         },
         "description": "A configuration manifest plus the generated fields. Validate one entry with schema/configuration.schema.json."
       }
+    },
+    "themes": {
+      "type": "array",
+      "description": "Declarative interface themes. Each entry points to a TOML manifest and its SHA-256; no code is executed.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "description", "author", "version", "license", "status", "file", "sha256", "size"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9]+(?:[-_][a-z0-9]+)*$" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "description": { "type": "string", "minLength": 1 },
+          "author": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "github": { "type": "string", "pattern": "^[A-Za-z0-9-]+$" }
+            }
+          },
+          "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+          "license": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["proposed", "verified", "experimental", "broken"] },
+          "file": { "type": "string", "pattern": "^themes/[a-z0-9_-]+\\.toml$" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "size": { "type": "integer", "minimum": 1, "maximum": 262144 }
+        }
+      }
     }
   }
 }

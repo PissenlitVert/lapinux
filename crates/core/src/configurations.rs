@@ -527,6 +527,120 @@ fn percent_encode(segment: &str) -> String {
     out
 }
 
+/// Thème déclaratif proposé par le catalogue : un manifeste TOML et son
+/// empreinte SHA-256. Aucun code n'est exécuté ; l'interface lit le fichier et
+/// valide le thème comme un thème créé à la main.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ThemeEntry {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub author: Author,
+    pub version: String,
+    pub license: String,
+    /// `proposed`, `verified`, `experimental` ou `broken`.
+    pub status: String,
+    /// Chemin du manifeste TOML, relatif à la racine du catalogue.
+    pub file: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+impl ThemeEntry {
+    pub fn available(&self) -> bool {
+        self.status != "broken"
+    }
+
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.id.is_empty()
+            || !self
+                .id
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
+        {
+            problems.push("identifiant de thème invalide".to_string());
+        }
+        if self.title.trim().is_empty() {
+            problems.push("thème sans titre".to_string());
+        }
+        if relative_path(&self.file).is_err() {
+            problems.push("fichier de thème invalide".to_string());
+        }
+        if !is_sha256(&self.sha256) {
+            problems.push("empreinte de thème invalide".to_string());
+        }
+        if self.size > 256 * 1024 {
+            problems.push("thème trop gros".to_string());
+        }
+        problems
+    }
+}
+
+/// Adresse du manifeste d'un thème dans le catalogue.
+pub fn theme_url(base: &str, entry: &ThemeEntry) -> Option<String> {
+    let path = relative_path(&entry.file).ok()?;
+    Some(format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.to_string_lossy().replace('\\', "/")
+    ))
+}
+
+/// Valide un manifeste de thème reçu du réseau sans dépendre de l'interface :
+/// identifiant attendu, disposition connue et couleurs au format attendu.
+pub fn validate_theme_manifest(text: &str, expected_id: &str) -> Result<(), String> {
+    let value: toml::Value = toml::from_str(text).map_err(|error| format!("thème illisible : {error}"))?;
+    let id = value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_default();
+    if !id.eq_ignore_ascii_case(expected_id) {
+        return Err(format!("thème {expected_id} : identifiant « {id} » inattendu"));
+    }
+    let layout = value
+        .get("layout")
+        .and_then(|layout| layout.as_str())
+        .unwrap_or("classic")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(layout.as_str(), "classic" | "default" | "nx" | "switch" | "console") {
+        return Err(format!("thème {expected_id} : disposition inconnue « {layout} »"));
+    }
+    for key in [
+        "accent", "background", "panel", "card", "card_hover", "card_active", "border",
+        "text", "text_dim",
+    ] {
+        if let Some(color) = value.get(key).and_then(|color| color.as_str()) {
+            if !valid_color(color) {
+                return Err(format!("thème {expected_id} : couleur {key} invalide"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_color(value: &str) -> bool {
+    let value = value.trim();
+    let Some(hex) = value.strip_prefix('#') else {
+        return false;
+    };
+    (hex.len() == 6 || hex.len() == 8) && hex.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+/// Thèmes du catalogue, ceux déjà installés et l'état de la dernière lecture.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ThemeCatalogSet {
+    pub themes: Vec<ThemeEntry>,
+    /// Identifiants des fichiers `themes/*.toml` déjà présents.
+    pub installed: Vec<String>,
+    pub remote: bool,
+    pub fetched: i64,
+    pub catalog_url: String,
+}
+
 /// Le catalogue publié : version 2, plus les correctifs de la version 1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -535,6 +649,10 @@ pub struct Catalog {
     pub maintainer: Author,
     #[serde(default)]
     pub configurations: Vec<Configuration>,
+    /// Thèmes proposés : ils vivent dans le même catalogue que les correctifs
+    /// de jeux, mais s'installent dans `themes/` et ne touchent aucun jeu.
+    #[serde(default)]
+    pub themes: Vec<ThemeEntry>,
     /// Ancien format : des correctifs de réglages seulement.
     #[serde(default)]
     pub fixes: Vec<LegacyFix>,
@@ -556,6 +674,12 @@ impl Catalog {
             version: self.version.max(2),
             maintainer: self.maintainer.clone(),
             configurations: self.entries(),
+            themes: self
+                .themes
+                .iter()
+                .filter(|theme| theme.validate().is_empty())
+                .cloned()
+                .collect(),
             fixes: Vec::new(),
         }
     }
@@ -757,6 +881,11 @@ pub fn merged(remote: Catalog) -> Catalog {
             Some(position) if local.retired => catalog.configurations[position] = local,
             Some(_) => {}
             None => catalog.configurations.push(local),
+        }
+    }
+    for local in bundled().themes {
+        if !catalog.themes.iter().any(|entry| entry.id == local.id) {
+            catalog.themes.push(local);
         }
     }
     if catalog.maintainer.name.trim().is_empty() {
@@ -1026,5 +1155,71 @@ mod tests {
         // Sans dossier de base, rien ne peut être téléchargé.
         entry.base.clear();
         assert!(file_url("https://example.test/main", &entry, &file).is_none());
+    }
+
+    fn nx_theme() -> ThemeEntry {
+        ThemeEntry {
+            id: "nx".into(),
+            title: "NX".into(),
+            description: "Accueil horizontal".into(),
+            author: Author {
+                name: "Pissenlit Vert".into(),
+                github: "PissenlitVert".into(),
+            },
+            version: "0.1.0".into(),
+            license: "CC0-1.0".into(),
+            status: "experimental".into(),
+            file: "themes/nx.toml".into(),
+            sha256: "a".repeat(64),
+            size: 512,
+        }
+    }
+
+    #[test]
+    fn un_theme_de_catalogue_se_valide_et_se_localise() {
+        let theme = nx_theme();
+        assert!(theme.validate().is_empty(), "{:?}", theme.validate());
+        assert!(theme.available());
+        assert_eq!(
+            theme_url("https://example.test/main", &theme).as_deref(),
+            Some("https://example.test/main/themes/nx.toml")
+        );
+        let mut broken = theme.clone();
+        broken.id = "../nx".into();
+        broken.file = "../nx.toml".into();
+        broken.sha256 = "court".into();
+        broken.status = "broken".into();
+        assert!(!broken.validate().is_empty());
+        assert!(!broken.available());
+    }
+
+    #[test]
+    fn le_catalogue_lit_les_themes_et_ignore_les_invalides() {
+        let mut theme = nx_theme();
+        let json = serde_json::json!({ "version": 2, "themes": [theme] });
+        let catalog: Catalog = serde_json::from_value(json).unwrap();
+        assert_eq!(catalog.themes.len(), 1);
+        assert_eq!(catalog.normalized().themes.len(), 1);
+        theme.sha256 = "pas une empreinte".into();
+        let json = serde_json::json!({ "version": 2, "themes": [theme] });
+        let catalog: Catalog = serde_json::from_value(json).unwrap();
+        assert!(catalog.normalized().themes.is_empty());
+    }
+
+    #[test]
+    fn un_manifeste_de_theme_est_controle_avant_ecriture() {
+        let good = r##"
+            id = "nx"
+            name = "NX"
+            layout = "nx"
+            accent = "#00C8E0"
+            background = "#1C1C1E"
+        "##;
+        assert!(validate_theme_manifest(good, "nx").is_ok());
+        assert!(validate_theme_manifest(good, "autre").is_err());
+        assert!(validate_theme_manifest("id = \"nx\"\nlayout = \"mobile\"", "nx").is_err());
+        assert!(
+            validate_theme_manifest("id = \"nx\"\naccent = \"rouge\"", "nx").is_err()
+        );
     }
 }
