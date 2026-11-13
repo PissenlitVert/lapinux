@@ -383,11 +383,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        // Le serveur accepte la connexion puis se tait : c'est un daemon
-        // occupé, pas un daemon absent.
+        listener.set_nonblocking(true).unwrap();
+        // Le serveur accepte chaque connexion puis se tait : c'est un daemon
+        // occupé, pas un daemon absent. Il reste à l'écoute jusqu'au signal
+        // d'arrêt : sur une machine lente, s'arrêter après une seule
+        // acceptation faisait répondre « connexion refusée » au contrôle
+        // suivant, alors que le daemon était seulement occupé.
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
-            if let Ok((_stream, _)) = listener.accept() {
-                std::thread::sleep(Duration::from_millis(600));
+            while stop_rx.try_recv().is_err() {
+                match listener.accept() {
+                    Ok((_stream, _)) => std::thread::sleep(Duration::from_millis(600)),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
             }
         });
         let client = Client {
@@ -405,6 +416,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         // Un socket qui accepte la connexion reste vivant, même muet.
         assert!(client.daemon_alive());
+        let _ = stop_tx.send(());
         server.join().ok();
     }
 }
