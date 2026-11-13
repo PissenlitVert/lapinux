@@ -2053,7 +2053,10 @@ mod tests {
     fn missing_file_gives_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::load(&dir.path().join("absent.toml")).unwrap();
-        assert_eq!(cfg.general.lang, "fr");
+        // La langue d'une configuration neuve suit le bureau : la CI tourne en
+        // anglais, une machine française en français. La valeur attendue se
+        // déduit donc de la locale, jamais d'un "fr" codé en dur.
+        assert_eq!(cfg.general.lang, crate::i18n::system_language());
         assert_eq!(cfg.general.grid_width, 168);
     }
 
