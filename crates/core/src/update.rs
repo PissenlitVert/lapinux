@@ -217,6 +217,35 @@ mod tests {
         assert_eq!(asset.sha256(), Some("bb"));
     }
 
+    /// Forme réelle de la release v0.1.0 : le nom contient `linux` entre la
+    /// version et l'architecture, et le fichier `.sha256` partage le préfixe
+    /// de l'AppImage. Le sélecteur doit garder l'AppImage, pas le checksum.
+    #[test]
+    fn the_public_linux_asset_is_recognised() {
+        let json = r#"{
+            "tag_name": "v0.1.0",
+            "published_at": "2026-11-13T22:55:19Z",
+            "body": "Première version publique",
+            "assets": [
+                {"name": "Lapinux-0.1.0-linux-x86_64.AppImage", "browser_download_url": "https://github.com/PissenlitVert/lapinux/releases/download/v0.1.0/Lapinux-0.1.0-linux-x86_64.AppImage", "size": 20395200, "digest": "sha256:88ef80e32e742f54a044d8c8bba8950bcaaf8cee39873c8f2009a31f421c5560"},
+                {"name": "Lapinux-0.1.0-linux-x86_64.AppImage.sha256", "browser_download_url": "https://github.com/PissenlitVert/lapinux/releases/download/v0.1.0/Lapinux-0.1.0-linux-x86_64.AppImage.sha256", "size": 102, "digest": "sha256:62d33cea1728e2a2f566ab94479c33abab5ba3d2316f255a6d68a0045071ce48"}
+            ]
+        }"#;
+        let release = parse_release(json).unwrap();
+        assert_eq!(release.tag, "v0.1.0");
+        assert_eq!(release.version, "0.1.0");
+        let asset = release.asset.expect("AppImage reconnue");
+        assert_eq!(asset.name, "Lapinux-0.1.0-linux-x86_64.AppImage");
+        assert_eq!(asset.size, 20_395_200);
+        assert_eq!(
+            asset.sha256(),
+            Some("88ef80e32e742f54a044d8c8bba8950bcaaf8cee39873c8f2009a31f421c5560")
+        );
+        // Le binaire 0.1.0 ne se voit pas proposer sa propre release.
+        assert!(is_newer(&release.version, "0.0.9"));
+        assert!(!is_newer(&release.version, "0.1.0"));
+    }
+
     #[test]
     fn a_release_without_appimage_is_usable_but_not_downloadable() {
         let release = parse_release(r#"{"tag_name":"v1.0.0","assets":[]}"#).unwrap();
