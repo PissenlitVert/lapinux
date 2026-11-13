@@ -78,10 +78,20 @@ L'application interroge
 doit donc être publiée — brouillons et pré-releases sont ignorés — avec :
 
 - un tag du type `v0.2.0`, comparé numériquement à la version installée ;
-- un fichier joint terminé par `.AppImage` et mentionnant `x86_64` ou `amd64` ;
-- une empreinte SHA-256. GitHub renseigne le champ `digest` de l'asset
-  (`sha256:…`) quand le fichier envoyé en porte une ; sans elle, le
-  téléchargement fonctionne mais n'est pas vérifié.
+- un fichier joint terminé par `.AppImage` et mentionnant `x86_64` ou `amd64`.
+
+L'empreinte SHA-256 n'est pas un fichier à joindre : GitHub la calcule pour
+chaque asset et la publie dans son champ `digest` (`sha256:…`). L'application
+s'en sert pour vérifier le téléchargement ; aucun `.sha256` séparé n'est
+nécessaire. Si un asset ancien n'a pas de `digest`, le téléchargement reste
+possible mais n'est pas vérifié.
+
+### Systèmes vérifiés
+
+L'AppImage 0.1.0 a été extraite et lancée dans des conteneurs : Ubuntu 22.04 et
+24.04, Debian 12, Fedora récent et Arch Linux fonctionnent. Debian 11 et
+AlmaLinux/Rocky 9 sont refusés (glibc antérieure à 2.35). Interface graphique,
+jeux et manettes n'ont pas été testés dans ces conteneurs.
 
 ## Documentation
 
