@@ -92,12 +92,14 @@ profil temporaire.
   réussis dans le même profil isolé. Cela ne valide pas un téléchargement réel.
 - Ignorés : deux tests KWin, cinq tests Steam réseau et un banc UI ; les tests
   situés après l'échec workspace ne sont pas déclarés réussis par cette commande.
-- AppImage de test : contenu, notices et extraction vérifiés ; binaire extrait
-  refusé sur Ubuntu 20.04/22.04, Debian 11 et Fedora 41 pour des symboles GLIBC.
-  Sans `/dev/fuse`, le mode normal a échoué (127) et le mode
-  `--appimage-extract-and-run --version` a réussi. Le runtime local utilisé n'a
-  pas été authentifié indépendamment, et le build de développement contient un
-  chemin local : ne pas diffuser cette image. Voir
+- AppImage 0.1.0 : contenu, notices et extraction vérifiés. Dans des
+  conteneurs, `--version` réussit sur Ubuntu 22.04 et 24.04, Debian 12, Fedora
+  récent et Arch Linux ; il échoue sur Debian 11 (`GLIBC_2.33` et `GLIBC_2.34`
+  absents) et sur AlmaLinux/Rocky 9 (`GLIBC_2.35` absent). Le montage FUSE
+  normal réussit dans Ubuntu 22.04 avec `/dev/fuse` et `libfuse2`, sans passer
+  par `--appimage-extract-and-run`. `cli doctor` et `cli config` passent aussi
+  dans Ubuntu 24.04 et Fedora. Le runtime local utilisé n'a pas été authentifié
+  indépendamment ; l'image reste non signée. Voir
   [AUDIT-PUBLICATION.md](AUDIT-PUBLICATION.md).
 
 ## Complément : diagnostic et sécurité (13 novembre 2026)
@@ -152,9 +154,12 @@ Une AppImage distincte a ensuite été construite dans un conteneur Ubuntu 22.04
 avec le runtime officiel type 2 version `20251108`, vérifié contre son SHA-256
 publié. Elle contient les binaires, le pont natif et les notices identifiées.
 En profil isolé, `--appimage-extract-and-run --version` et un scan vide ont
-réussi ; le binaire extrait a démarré dans les conteneurs Ubuntu 22.04 et Fedora
-41, mais pas Ubuntu 20.04 ni Debian 11 (GLIBC 2.35 requise). Le montage FUSE,
-l'interface graphique et les jeux n'ont pas été vérifiés. Une recherche
+réussi. Le binaire extrait démarre dans les conteneurs Ubuntu 22.04 et 24.04,
+Debian 12, Fedora récent et Arch Linux ; il est refusé sur Debian 11
+(`GLIBC_2.33` et `GLIBC_2.34` absents) et sur AlmaLinux/Rocky 9 (`GLIBC_2.35`
+absent), ce qui fixe le plancher à GLIBC 2.35. Le montage FUSE normal a été
+vérifié dans un conteneur Ubuntu 22.04 (`/dev/fuse` et `libfuse2`) ; l'interface
+graphique, les jeux et les manettes n'ont pas été vérifiés. Une recherche
 littérale du chemin local du projet dans les trois binaires n'a rien trouvé,
 mais ne constitue pas un audit complet des données personnelles.
 
