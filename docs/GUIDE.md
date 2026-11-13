@@ -63,7 +63,8 @@ git switch master          # ce qui sera publié
 git merge test             # une fois un essai validé
 ```
 
-Ne pas publier directement depuis `test` : la release se construit depuis
+La branche `test` reste **locale** : ne pas la pousser sur GitHub. Ne pas
+publier directement depuis `test` non plus : la release se construit depuis
 `master`, avec les tests et la garde i18n au vert.
 
 ## 5. Modifier sans casser
