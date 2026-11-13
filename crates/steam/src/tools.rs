@@ -107,6 +107,9 @@ mod tests {
         }
         let dest = dir.path().join("out");
         extract_tar_gz(&archive_path, &dest).unwrap();
-        assert_eq!(std::fs::read_to_string(dest.join("hello.txt")).unwrap(), "salut");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("hello.txt")).unwrap(),
+            "salut"
+        );
     }
 }

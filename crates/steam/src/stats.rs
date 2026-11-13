@@ -115,7 +115,10 @@ fn assemble(body: &[u8]) -> Vec<SteamStat> {
 /// La racine est un nœud dont la clé est l'appid et dont les enfants portent
 /// `gamename`, `groups`, `stats` et `version`.
 fn stats_schema(bytes: &[u8]) -> HashMap<u32, StatDef> {
-    let mut cursor = Cursor { data: bytes, pos: 0 };
+    let mut cursor = Cursor {
+        data: bytes,
+        pos: 0,
+    };
     let mut stats = HashMap::new();
     let Some((_, Value::Children(app))) = cursor.node() else {
         return stats;

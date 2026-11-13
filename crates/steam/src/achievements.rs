@@ -24,9 +24,10 @@ use steamroom::client::{LoggedIn, SteamClient};
 const SCHEMA_METHOD: &str = "Player.GetGameAchievements#1";
 /// État des succès du compte, par identifiant interne.
 const USER_METHOD: &str = "Player.GetUserAchievements#1";
-/// Icônes officielles : le protocole ne publie que le nom du fichier.
-const ICON_BASE: &str =
-    "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps";
+/// Icônes officielles : le protocole ne publie que le nom du fichier. Steam
+/// les sert désormais depuis son CDN communautaire ; l'ancien chemin
+/// Cloudflare renvoie 404 pour les jeux récents comme SMS Returns.
+const ICON_BASE: &str = "https://shared.fastly.steamstatic.com/community_assets/images/apps";
 /// Langue demandée au schéma : les noms et descriptions s'affichent en français.
 const LANGUAGE: &str = "french";
 /// Un CM qui ne répond pas en un quart de minute est perdu.
@@ -146,10 +147,13 @@ async fn unlocks(
     let mut body = Vec::new();
     field_varint(1, steam_id, &mut body);
     field_varint(2, u64::from(appid), &mut body);
-    let answer = tokio::time::timeout(REPLY_TIMEOUT, client.call_service_method(USER_METHOD, &body))
-        .await
-        .map_err(|_| Error::Other("Steam n'a pas répondu".into()))?
-        .map_err(|error| Error::Other(error.to_string()))?;
+    let answer = tokio::time::timeout(
+        REPLY_TIMEOUT,
+        client.call_service_method(USER_METHOD, &body),
+    )
+    .await
+    .map_err(|_| Error::Other("Steam n'a pas répondu".into()))?
+    .map_err(|error| Error::Other(error.to_string()))?;
     Ok(parse_unlocks(&answer.body))
 }
 
@@ -302,7 +306,7 @@ mod tests {
         assert_eq!(entries[1].1.percent, Some(12.5));
         assert_eq!(
             entries[0].1.icon,
-            "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/4000/icone.jpg"
+            "https://shared.fastly.steamstatic.com/community_assets/images/apps/4000/icone.jpg"
         );
         assert!(!entries[0].1.achieved);
     }
@@ -311,7 +315,11 @@ mod tests {
     fn a_success_without_published_rarity_stays_unrated() {
         // Le champ 7 absent est le cas des vieux jeux : aucun pourcentage.
         let mut body = Vec::new();
-        message(1, &schema_entry(1, "SECRET", "Secret", true, None), &mut body);
+        message(
+            1,
+            &schema_entry(1, "SECRET", "Secret", true, None),
+            &mut body,
+        );
         let entries = parse_schema(&body, 4000);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1.percent, None);
@@ -351,7 +359,11 @@ mod tests {
     #[test]
     fn an_unlock_without_a_date_is_not_marked_achieved() {
         let mut body = Vec::new();
-        message(1, &schema_entry(1, "A", "A", false, Some("50.0")), &mut body);
+        message(
+            1,
+            &schema_entry(1, "A", "A", false, Some("50.0")),
+            &mut body,
+        );
         let entries = parse_schema(&body, 4000);
         // Succès obtenu hors ligne, pas encore daté par Steam.
         let times = parse_unlocks(&user_body(&[(1, true, 0)]));
@@ -366,7 +378,11 @@ mod tests {
         // rien.
         assert!(parse_unlocks(&[]).is_empty());
         let mut body = Vec::new();
-        message(1, &schema_entry(4, "A", "A", false, Some("50.0")), &mut body);
+        message(
+            1,
+            &schema_entry(4, "A", "A", false, Some("50.0")),
+            &mut body,
+        );
         let items = merge_unlocks(parse_schema(&body, 4000), &parse_unlocks(&[]));
         assert!(!items[0].achieved);
     }
@@ -375,10 +391,7 @@ mod tests {
     fn a_game_without_a_session_says_so() {
         let read = game_achievements(4000, &Sources::default());
         assert!(read.items.is_empty());
-        assert!(read
-            .notes
-            .iter()
-            .any(|note| note.contains("non connecté")));
+        assert!(read.notes.iter().any(|note| note.contains("non connecté")));
         assert_eq!(read.unlocked(), 0);
     }
 }

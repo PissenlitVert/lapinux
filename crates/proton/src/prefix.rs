@@ -78,9 +78,7 @@ pub fn prefix_path(game: &Game, data_dir: &Path) -> PathBuf {
         return game.library.join("steamapps").join("compatdata").join(id);
     }
     if game.library.as_os_str().is_empty() {
-        return data_dir
-            .join("prefixes")
-            .join(game.appid.to_string());
+        return data_dir.join("prefixes").join(game.appid.to_string());
     }
     let compat = game.library.join("CompatData");
     let expected = compat.join(prefix_name_for(game));
@@ -305,7 +303,8 @@ mod tests {
         let chosen = prefix_for(&game, dir.path());
         assert_eq!(
             chosen,
-            dir.path().join("LapinuxLibrary/CompatData/A Short Hike (3590371856)")
+            dir.path()
+                .join("LapinuxLibrary/CompatData/A Short Hike (3590371856)")
         );
     }
 

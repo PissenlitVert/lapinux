@@ -11,6 +11,7 @@
 //! pas là.
 
 use crate::achievements::Achievement;
+use lapinux_core::i18n::{t, t_args};
 use crate::cloud::RemoteFile;
 use crate::common::{self, Error, InstallPlan, LoginLink, Result};
 use lapinux_core::stores::{
@@ -101,9 +102,10 @@ pub fn login_link() -> LoginLink {
             "https://www.epicgames.com/id/login?redirectUrl={}",
             crate::gog::percent_encode(&redirect)
         ),
-        hint: "Après la connexion, la page affiche `{\"authorizationCode\": \"…\"}` : colle ici le \
+        hint:
+            "Après la connexion, la page affiche `{\"authorizationCode\": \"…\"}` : colle ici le \
                code — Epic ne le garde que quelques instants, garde donc cette fenêtre ouverte."
-            .into(),
+                .into(),
     }
 }
 
@@ -236,7 +238,15 @@ pub fn library(tokens: &StoreTokens) -> Result<Vec<StoreGame>> {
     // Chaque élément dit aussi s'il s'agit d'un jeu ou d'un outil.
     let mut titles: std::collections::HashMap<
         String,
-        (String, String, bool, Vec<String>, Vec<String>, Vec<String>),
+        (
+            String,
+            String,
+            bool,
+            Vec<String>,
+            Vec<String>,
+            Vec<String>,
+            Vec<String>,
+        ),
     > = std::collections::HashMap::new();
     let mut grouped: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -340,6 +350,7 @@ pub fn library(tokens: &StoreTokens) -> Result<Vec<StoreGame>> {
                             platforms,
                             catalog_credit(&item, "publisher"),
                             catalog_credit(&item, "developer"),
+                            mobile_platforms_of(&item),
                         ),
                     );
                 }
@@ -358,35 +369,53 @@ pub fn library(tokens: &StoreTokens) -> Result<Vec<StoreGame>> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let (title, cover, catalog_tool, platforms, publishers, developers) =
+        let (title, cover, catalog_tool, platforms, publishers, developers, mobile_platforms) =
             titles.get(&item).cloned().unwrap_or_else(|| {
-            // Sans fiche de catalogue, l'enregistrement de la bibliothèque
-            // porte lui-même les plateformes (`platform: ["Windows"]`).
-            let platforms = record
-                .get("platform")
-                .and_then(Value::as_array)
-                .map(|list| {
-                    let mut platforms = Vec::new();
-                    for value in list {
-                        let Some(label) = value.as_str().and_then(platform_label) else {
-                            continue;
-                        };
-                        if !platforms.contains(&label.to_string()) {
-                            platforms.push(label.to_string());
+                // Sans fiche de catalogue, l'enregistrement de la bibliothèque
+                // porte lui-même les plateformes (`platform: ["Windows"]`).
+                let platforms = record
+                    .get("platform")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        let mut platforms = Vec::new();
+                        for value in list {
+                            let Some(label) = value.as_str().and_then(platform_label) else {
+                                continue;
+                            };
+                            if !platforms.contains(&label.to_string()) {
+                                platforms.push(label.to_string());
+                            }
                         }
-                    }
-                    platforms
-                })
-                .unwrap_or_default();
-            (
-                humanize(app_name),
-                String::new(),
-                false,
-                platforms,
-                Vec::new(),
-                Vec::new(),
-            )
+                        platforms
+                    })
+                    .unwrap_or_default();
+                let mobile_platforms = record
+                    .get("platform")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        let mut platforms = Vec::new();
+                        for value in list.iter().filter_map(Value::as_str) {
+                            let Some(label) = mobile_platform_label(value) else {
+                                continue;
+                            };
+                            if !platforms.iter().any(|shown| shown == label) {
+                                platforms.push(label.to_string());
+                            }
+                        }
+                        platforms
+                    })
+                    .unwrap_or_default();
+                (
+                    humanize(app_name),
+                    String::new(),
+                    false,
+                    platforms,
+                    Vec::new(),
+                    Vec::new(),
+                    mobile_platforms,
+                )
             });
+        let mobile = !mobile_platforms.is_empty();
         if title.trim().is_empty() {
             continue;
         }
@@ -404,6 +433,8 @@ pub fn library(tokens: &StoreTokens) -> Result<Vec<StoreGame>> {
             name: title,
             cover,
             platforms,
+            mobile,
+            mobile_platforms,
             namespace: record
                 .get("namespace")
                 .and_then(Value::as_str)
@@ -475,6 +506,16 @@ pub fn library(tokens: &StoreTokens) -> Result<Vec<StoreGame>> {
                 if unique[index].tool && !entry.tool {
                     unique[index].tool = false;
                 }
+                // Une offre mobile suffit à marquer le jeu : la même fiche
+                // peut revenir par la bibliothèque PC.
+                for platform in &entry.mobile_platforms {
+                    if !unique[index].mobile_platforms.contains(platform) {
+                        unique[index].mobile_platforms.push(platform.clone());
+                    }
+                }
+                if entry.mobile {
+                    unique[index].mobile = true;
+                }
             }
             None => {
                 seen.insert(key, unique.len());
@@ -512,6 +553,44 @@ fn platforms_of(item: &Value) -> Vec<String> {
         }
     }
     platforms
+}
+
+/// Les plateformes mobiles publiées par une fiche de catalogue, dans l'ordre
+/// où Epic les donne et sans doublon.
+fn mobile_platforms_of(item: &Value) -> Vec<String> {
+    let mut platforms = Vec::new();
+    for info in item
+        .get("releaseInfo")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for value in info
+            .get("platform")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(label) = value.as_str().and_then(mobile_platform_label) else {
+                continue;
+            };
+            if !platforms.iter().any(|shown| shown == label) {
+                platforms.push(label.to_string());
+            }
+        }
+    }
+    platforms
+}
+
+/// Nom mobile Epic (`Android`, `iOS`, `iPhone`…) dans le vocabulaire des
+/// badges. Ce ne sont pas des versions de bureau : elles restent à part.
+fn mobile_platform_label(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "android" => Some("android"),
+        "ios" | "iphone" | "ipad" => Some("ios"),
+        "mobile" => Some("mobile"),
+        _ => None,
+    }
 }
 
 /// Nom de plateforme Epic (`Windows`, `Mac`, `Win32`…) dans le vocabulaire de
@@ -584,7 +663,14 @@ fn is_tool(item: &Value) -> bool {
     paths.iter().any(|path| {
         matches!(
             path.split('/').next().unwrap_or_default(),
-            "assets" | "plugins" | "engines" | "projects" | "asset-format" | "software" | "hidden" | "addons"
+            "assets"
+                | "plugins"
+                | "engines"
+                | "projects"
+                | "asset-format"
+                | "software"
+                | "hidden"
+                | "addons"
         )
     })
 }
@@ -661,7 +747,8 @@ pub fn details(
         .to_string();
     // La vitrine complète ce que le catalogue tait : présentation rédigée,
     // galerie de captures, et les noms d'éditeur que le catalogue laisse vides.
-    if let Some(showcase) = showcase(tokens, &title, namespace, locale) {
+    let showcase = showcase(tokens, &title, namespace, locale);
+    if let Some(showcase) = showcase.as_ref() {
         let text = common::plain_text(
             showcase
                 .get("description")
@@ -739,22 +826,35 @@ pub fn details(
     let (trailer, trailer_poster) = steam_app
         .and_then(|appid| steam_trailer(appid, language))
         .unwrap_or_default();
-    // La bannière : le visuel large du catalogue, sinon la première capture.
-    let banner = images(
-        &item,
-        &[
-            "DieselStoreFrontWide",
-            "OfferImageWide",
-            "DieselGameBoxWide",
-            "Thumbnail",
-        ],
-    )
-    .into_iter()
-    .next()
-    .or_else(|| screenshots.first().cloned())
-    .unwrap_or_default();
+    // L'offre possédée ne publie parfois que sa jaquette verticale ; la
+    // recherche de la vitrine donne aussi les visuels larges de la même
+    // offre. Ils ne sont retenus que si l'espace de noms correspond, pour ne
+    // pas prendre l'affiche d'un homonyme.
+    let showcase_art = showcase
+        .as_ref()
+        .filter(|showcase| showcase.get("namespace").and_then(Value::as_str) == Some(namespace));
+    let (icon, capsule, cover) = details_art(&item, showcase_art);
+    let banner = std::iter::once(&item)
+        .chain(showcase_art)
+        .find_map(|source| {
+            images(
+                source,
+                &[
+                    "DieselStoreFrontWide",
+                    "OfferImageWide",
+                    "DieselGameBoxWide",
+                ],
+            )
+            .into_iter()
+            .next()
+        })
+        .or_else(|| screenshots.first().cloned())
+        .unwrap_or_default();
     Ok(StoreDetails {
         store: Store::Epic,
+        icon,
+        capsule,
+        cover,
         summary,
         description,
         screenshots,
@@ -777,7 +877,12 @@ pub fn details(
 
 /// Identifiant d'URL de la page produit, demandé à la recherche de la
 /// boutique. `productSlug` manque à certains jeux ; `urlSlug` les couvre.
-fn product_slug(tokens: &StoreTokens, title: &str, namespace: &str, locale: &str) -> Option<String> {
+fn product_slug(
+    tokens: &StoreTokens,
+    title: &str,
+    namespace: &str,
+    locale: &str,
+) -> Option<String> {
     let (country, language) = locale_choice(locale);
     let body = serde_json::json!({
         "query": SLUG_QUERY,
@@ -789,7 +894,8 @@ fn product_slug(tokens: &StoreTokens, title: &str, namespace: &str, locale: &str
         },
     });
     let value =
-        crate::cloud::post_json(STORE_GQL, Some(&tokens.access_token), &body, Some(STORE_UA)).ok()?;
+        crate::cloud::post_json(STORE_GQL, Some(&tokens.access_token), &body, Some(STORE_UA))
+            .ok()?;
     let elements = value
         .pointer("/data/Catalog/searchStore/elements")?
         .as_array()?;
@@ -797,7 +903,10 @@ fn product_slug(tokens: &StoreTokens, title: &str, namespace: &str, locale: &str
     let mut homonym = None;
     for element in elements {
         let same_title = lapinux_core::stores::title_key(
-            element.get("title").and_then(Value::as_str).unwrap_or_default(),
+            element
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
         ) == wanted;
         if !same_title {
             continue;
@@ -899,9 +1008,8 @@ fn product_about(slug: &str, language: &str) -> Option<String> {
     if slug.trim().is_empty() {
         return None;
     }
-    let url = format!(
-        "https://store-content.ak.epicgames.com/api/{language}/content/products/{slug}"
-    );
+    let url =
+        format!("https://store-content.ak.epicgames.com/api/{language}/content/products/{slug}");
     let value = common::get_json(&url, None).ok()?;
     about_description(&value)
 }
@@ -951,15 +1059,21 @@ fn news(title: &str, language: &str) -> Vec<lapinux_core::stores::StoreNews> {
     let short_title = wanted.chars().count() < 10;
     let mut items = Vec::new();
     for post in posts {
-        let post_title = post.get("title").and_then(Value::as_str).unwrap_or_default();
+        let post_title = post
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let text = common::plain_text(&format!(
             "{post_title} {}",
-            post.get("content").and_then(Value::as_str).unwrap_or_default()
+            post.get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
         ));
         // La comparaison se fait sur la même forme que le titre : sans
         // majuscules ni ponctuation, avec un espace autour.
         let body = format!(" {} ", lapinux_core::stores::title_key(&text));
-        let in_title = format!(" {} ", lapinux_core::stores::title_key(post_title)).contains(&needle);
+        let in_title =
+            format!(" {} ", lapinux_core::stores::title_key(post_title)).contains(&needle);
         // Une simple mention au détour d'un paragraphe ne fait pas une
         // actualité du jeu : il faut le titre du billet, ou le jeu cité deux
         // fois dans le texte.
@@ -985,7 +1099,7 @@ fn news(title: &str, language: &str) -> Vec<lapinux_core::stores::StoreNews> {
             .unwrap_or_default();
         let path = post.get("url").and_then(Value::as_str).unwrap_or_default();
         items.push(lapinux_core::stores::StoreNews {
-                body: String::new(),
+            body: String::new(),
             title: post
                 .get("title")
                 .and_then(Value::as_str)
@@ -1116,22 +1230,19 @@ fn steam_trailer(appid: u32, language: &str) -> Option<(String, String)> {
 
 fn steam_trailer_from_value(value: &Value, appid: u32) -> Option<(String, String)> {
     let data = value.get(appid.to_string())?.get("data")?;
-    let movie = data
-        .get("movies")?
-        .as_array()?
-        .iter()
-        .find(|movie| {
-            movie.get("hls_h264").is_some()
-                || movie.get("dash_h264").is_some()
-                || movie.pointer("/mp4/max").is_some()
-                || movie.pointer("/webm/max").is_some()
-        })?;
+    let movie = data.get("movies")?.as_array()?.iter().find(|movie| {
+        movie.get("hls_h264").is_some()
+            || movie.get("dash_h264").is_some()
+            || movie.pointer("/mp4/max").is_some()
+            || movie.pointer("/webm/max").is_some()
+    })?;
     let trailer = movie
         .get("hls_h264")
         .or_else(|| movie.get("dash_h264"))
         .or_else(|| movie.pointer("/mp4/max"))
         .or_else(|| movie.pointer("/webm/max"))
-        .and_then(Value::as_str)?.to_string();
+        .and_then(Value::as_str)?
+        .to_string();
     let poster = movie
         .get("thumbnail")
         .and_then(Value::as_str)
@@ -1192,8 +1303,7 @@ fn steam_sheet_from_value(value: &Value, appid: u32) -> Option<SteamSheet> {
                 .collect()
         })
         .unwrap_or_default();
-    let (trailer, trailer_poster) =
-        steam_trailer_from_value(value, appid).unwrap_or_default();
+    let (trailer, trailer_poster) = steam_trailer_from_value(value, appid).unwrap_or_default();
     Some(SteamSheet {
         summary: common::plain_text(&field("short_description")),
         description,
@@ -1239,7 +1349,8 @@ fn showcase(tokens: &StoreTokens, title: &str, namespace: &str, locale: &str) ->
         },
     });
     let value =
-        crate::cloud::post_json(STORE_GQL, Some(&tokens.access_token), &body, Some(STORE_UA)).ok()?;
+        crate::cloud::post_json(STORE_GQL, Some(&tokens.access_token), &body, Some(STORE_UA))
+            .ok()?;
     let elements = value
         .pointer("/data/Catalog/searchStore/elements")?
         .as_array()?;
@@ -1247,7 +1358,10 @@ fn showcase(tokens: &StoreTokens, title: &str, namespace: &str, locale: &str) ->
     let mut homonym = None;
     for element in elements {
         let same_title = lapinux_core::stores::title_key(
-            element.get("title").and_then(Value::as_str).unwrap_or_default(),
+            element
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
         ) == wanted;
         if !same_title {
             continue;
@@ -1255,7 +1369,10 @@ fn showcase(tokens: &StoreTokens, title: &str, namespace: &str, locale: &str) ->
         // Une offre qui ne publie que son titre n'apprend rien : la fiche
         // garde alors ce que le catalogue a dit.
         let said = lapinux_core::stores::title_key(
-            element.get("description").and_then(Value::as_str).unwrap_or_default(),
+            element
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
         );
         if said.is_empty() || said == wanted {
             continue;
@@ -1268,6 +1385,29 @@ fn showcase(tokens: &StoreTokens, title: &str, namespace: &str, locale: &str) ->
         }
     }
     homonym
+}
+
+fn details_art(item: &Value, showcase: Option<&Value>) -> (String, String, String) {
+    let first = |types: &[&str]| {
+        std::iter::once(item)
+            .chain(showcase)
+            .find_map(|source| images(source, types).into_iter().next())
+            .unwrap_or_default()
+    };
+    (
+        first(&["Icon", "DieselGameBoxLogo", "OfferImageIcon"]),
+        first(&[
+            "DieselGameBoxWide",
+            "OfferImageWide",
+            "DieselStoreFrontWide",
+        ]),
+        first(&[
+            "DieselGameBoxTall",
+            "OfferImageTall",
+            "DieselStoreFrontTall",
+            "DieselGameBox",
+        ]),
+    )
 }
 
 /// Adresses des images d'un objet de boutique, dans l'ordre des types demandés
@@ -1401,25 +1541,34 @@ pub fn achievements(
             .find(|(name, _, _)| name == &key)
             .map(|(_, state, date)| (*state, *date))
             .unwrap_or((false, None));
-        let name = text(achievement, if is_unlocked {
-            "unlockedDisplayName"
-        } else {
-            "lockedDisplayName"
-        })
+        let name = text(
+            achievement,
+            if is_unlocked {
+                "unlockedDisplayName"
+            } else {
+                "lockedDisplayName"
+            },
+        )
         .or_else(|| text(achievement, "unlockedDisplayName"))
         .unwrap_or_default();
-        let description = text(achievement, if is_unlocked {
-            "unlockedDescription"
-        } else {
-            "lockedDescription"
-        })
+        let description = text(
+            achievement,
+            if is_unlocked {
+                "unlockedDescription"
+            } else {
+                "lockedDescription"
+            },
+        )
         .or_else(|| text(achievement, "lockedDescription"))
         .unwrap_or_default();
-        let icon = text(achievement, if is_unlocked {
-            "unlockedIconLink"
-        } else {
-            "lockedIconLink"
-        })
+        let icon = text(
+            achievement,
+            if is_unlocked {
+                "unlockedIconLink"
+            } else {
+                "lockedIconLink"
+            },
+        )
         .or_else(|| text(achievement, "unlockedIconLink"))
         .unwrap_or_default();
         let percent = achievement
@@ -1453,10 +1602,7 @@ fn player_state(value: &Value) -> Vec<(String, bool, Option<i64>)> {
     };
     let mut out = Vec::new();
     for record in records {
-        let Some(list) = record
-            .get("playerAchievements")
-            .and_then(Value::as_array)
-        else {
+        let Some(list) = record.get("playerAchievements").and_then(Value::as_array) else {
             continue;
         };
         for entry in list {
@@ -1474,7 +1620,11 @@ fn player_state(value: &Value) -> Vec<(String, bool, Option<i64>)> {
                 .get("unlockDate")
                 .and_then(Value::as_str)
                 .and_then(crate::cloud::parse_iso8601);
-            out.push((name.to_string(), unlocked, if unlocked { date } else { None }));
+            out.push((
+                name.to_string(),
+                unlocked,
+                if unlocked { date } else { None },
+            ));
         }
     }
     out
@@ -1503,7 +1653,20 @@ pub fn cloud_list(tokens: &StoreTokens, app_name: &str) -> Result<Vec<RemoteFile
         tokens.user_id
     );
     let value = common::get_json(&url, Some(&tokens.access_token))?;
-    Ok(files_from(&value))
+    let files = files_from(&value);
+    let announced = match value.get("files") {
+        Some(Value::Object(map)) => map.len(),
+        Some(Value::Array(items)) => items.len(),
+        _ => {
+            return Err(Error::Parse(
+                "réponse de sauvegardes Epic incomplète".into(),
+            ))
+        }
+    };
+    if announced != files.len() || files.iter().any(|file| file.name.trim().is_empty()) {
+        return Err(Error::Parse("nom de sauvegarde Epic manquant".into()));
+    }
+    Ok(files)
 }
 
 /// Télécharge un fichier de sauvegarde vers `dest`, et rend son poids.
@@ -1513,8 +1676,18 @@ pub fn cloud_download(
     file: &RemoteFile,
     dest: &std::path::Path,
 ) -> Result<u64> {
-    let bytes = if !file.read_url.trim().is_empty() {
-        crate::cloud::get_bytes(&file.read_url, None, &[])?
+    let bytes = cloud_read(tokens, app_name, file)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(dest, &bytes)?;
+    Ok(bytes.len() as u64)
+}
+
+/// Lit une sauvegarde sans écrire dans le dossier du jeu.
+pub fn cloud_read(tokens: &StoreTokens, app_name: &str, file: &RemoteFile) -> Result<Vec<u8>> {
+    if !file.read_url.trim().is_empty() {
+        crate::cloud::get_save_bytes(&file.read_url, None, &[])
     } else {
         let url = format!(
             "{DATASTORAGE}/api/v1/access/egstore/savesync/{}/{app_name}/",
@@ -1530,13 +1703,8 @@ pub fn cloud_download(
                 "Epic n'a pas publié de lien de lecture pour ce fichier".into(),
             ));
         }
-        crate::cloud::get_bytes(&listed.read_url, None, &[])?
-    };
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::cloud::get_save_bytes(&listed.read_url, None, &[])
     }
-    std::fs::write(dest, &bytes)?;
-    Ok(bytes.len() as u64)
 }
 
 /// Envoie un fichier local dans le cloud.
@@ -1592,10 +1760,7 @@ fn files_from(value: &Value) -> Vec<RemoteFile> {
             .unwrap_or(0);
         files.push(RemoteFile {
             name: name.to_string(),
-            size: entry
-                .get("size")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            size: entry.get("size").and_then(Value::as_u64).unwrap_or(0),
             modified,
             hash: entry
                 .get("hash")
@@ -1876,7 +2041,10 @@ fn catalog_platforms(tokens: &StoreTokens, namespace: &str, item: &str) -> Vec<S
         return Vec::new();
     };
     let mut platforms = Vec::new();
-    if let Some(releases) = entry.get("releaseInfo").and_then(|releases| releases.as_array()) {
+    if let Some(releases) = entry
+        .get("releaseInfo")
+        .and_then(|releases| releases.as_array())
+    {
         for release in releases {
             if let Some(list) = release.get("platform").and_then(|list| list.as_array()) {
                 for platform in list {
@@ -1927,7 +2095,8 @@ pub fn dlc_build(
         "" => catalog_app_name(tokens, namespace, catalog_item)?,
         name => name.to_string(),
     };
-    let urls = build_manifest_urls(tokens, namespace, catalog_item, &resolved, platform, "").ok()?;
+    let urls =
+        build_manifest_urls(tokens, namespace, catalog_item, &resolved, platform, "").ok()?;
     for url in urls {
         let Ok(bytes) = crate::cloud::get_bytes(&url, None, &[]) else {
             continue;
@@ -1970,7 +2139,13 @@ fn read_manifest(
     store_id: &str,
     platform: &str,
     preferred_cdn: &str,
-) -> Result<(crate::epic_manifest::Manifest, String, String, String, String)> {
+) -> Result<(
+    crate::epic_manifest::Manifest,
+    String,
+    String,
+    String,
+    String,
+)> {
     let (namespace, item) = asset_identity(tokens, store_id)?;
     // Le service des assets attend le nom d'application publié par le
     // catalogue, que certains billets ne portent pas : environ un jeu sur cinq
@@ -2012,7 +2187,13 @@ fn read_manifest(
             };
             match crate::epic_manifest::parse(&bytes) {
                 Ok(manifest) => {
-                    return Ok((manifest, url, os.to_string(), namespace.clone(), item.clone()))
+                    return Ok((
+                        manifest,
+                        url,
+                        os.to_string(),
+                        namespace.clone(),
+                        item.clone(),
+                    ))
                 }
                 Err(error) => last = Some(error),
             }
@@ -2022,15 +2203,15 @@ fn read_manifest(
     // alors clairement, au lieu du 404 du service des assets.
     let published = catalog_platforms(tokens, &namespace, &item);
     if !published.is_empty()
-        && !published.iter().any(|platform| {
-            matches!(platform.as_str(), "windows" | "macos" | "linux")
-        })
+        && !published
+            .iter()
+            .any(|platform| matches!(platform.as_str(), "windows" | "macos" | "linux"))
     {
         return Err(Error::Unavailable(
-            "ce jeu n'existe chez Epic que pour téléphone : aucun build PC à installer".into(),
+            t("downloads.store_mobile_only").into(),
         ));
     }
-    Err(last.unwrap_or_else(|| Error::Unavailable("aucun build Epic publié")))
+    Err(last.unwrap_or_else(|| Error::Unavailable(t("downloads.store_no_epic_build"))))
 }
 
 /// Identité stable d'un build Epic : version du manifeste et empreintes des
@@ -2209,7 +2390,7 @@ fn download_build(
         done += expected;
         if !progress(done, total) {
             let _ = std::fs::remove_file(&file);
-            return Err(Error::Other("téléchargement annulé".into()));
+            return Err(Error::Other(t("downloads.store_cancelled").into()));
         }
 
         // Le chunk arrive avec son en-tête CDN, souvent compressé : ses
@@ -2220,10 +2401,7 @@ fn download_build(
         let mut source = std::io::Cursor::new(data);
         let mut buffer = vec![0u8; 1024 * 1024];
         place_parts(&mut source, parts, &targets, &mut buffer).map_err(|error| match error {
-            Error::Parse(_) => Error::Parse(format!(
-                "chunk {} plus court que son manifeste",
-                manifest.chunk_path(chunk)
-            )),
+            Error::Parse(_) => Error::Parse(t_args("downloads.store_chunk_shorter", &[("chunk", &manifest.chunk_path(chunk))])),
             other => other,
         })?;
         // Le chunk a servi : il quitte le cache pour ne pas doubler le jeu.
@@ -2235,10 +2413,8 @@ fn download_build(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &target.path,
-                    std::fs::Permissions::from_mode(0o755),
-                );
+                let _ =
+                    std::fs::set_permissions(&target.path, std::fs::Permissions::from_mode(0o755));
             }
         }
         if target.size == 0 {
@@ -2263,10 +2439,8 @@ fn place_parts(
     for (index, file_offset, part_offset, part_size) in parts {
         let target = targets
             .get(*index)
-            .ok_or_else(|| Error::Other("manifeste incohérent".into()))?;
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&target.path)?;
+            .ok_or_else(|| Error::Other(t("downloads.store_manifest_incoherent").into()))?;
+        let mut out = std::fs::OpenOptions::new().write(true).open(&target.path)?;
         out.seek(SeekFrom::Start(*file_offset))?;
         source.seek(SeekFrom::Start(*part_offset))?;
         let mut left = *part_size;
@@ -2274,7 +2448,7 @@ fn place_parts(
             let want = (left as usize).min(buffer.len());
             let read = source.read(&mut buffer[..want])?;
             if read == 0 {
-                return Err(Error::Parse("chunk trop court".into()));
+                return Err(Error::Parse(t("downloads.store_chunk_too_short").into()));
             }
             out.write_all(&buffer[..read])?;
             left -= read as u64;
@@ -2324,8 +2498,7 @@ fn unix_of(text: &str) -> i64 {
     let year_of_era = year - era * 400;
     let shifted_month = if month > 2 { month - 3 } else { month + 9 };
     let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
-    let day_of_era =
-        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days = era * 146_097 + day_of_era - 719_468;
     days * 86_400 + hour * 3_600 + minute * 60 + second
 }
@@ -2368,9 +2541,7 @@ fn zero_offer(groups: Option<&Value>) -> Option<(i64, i64)> {
 pub fn free_games(locale: &str) -> Result<Vec<FreeGame>> {
     let (country, language) = locale_choice(locale);
     let language = if language == "fr" { "fr-FR" } else { language };
-    let url = format!(
-        "{FREE_GAMES}?locale={language}&country={country}&allowCountries={country}"
-    );
+    let url = format!("{FREE_GAMES}?locale={language}&country={country}&allowCountries={country}");
     let value = common::get_json(&url, None)?;
     let elements = value
         .pointer("/data/Catalog/searchStore/elements")
@@ -2382,16 +2553,20 @@ pub fn free_games(locale: &str) -> Result<Vec<FreeGame>> {
         let promotions = element.get("promotions");
         let current = zero_offer(promotions.and_then(|value| value.get("promotionalOffers")))
             .filter(|(start, end)| now >= *start && now < *end);
-        let next = zero_offer(
-            promotions.and_then(|value| value.get("upcomingPromotionalOffers")),
-        );
+        let next = zero_offer(promotions.and_then(|value| value.get("upcomingPromotionalOffers")));
         let (start, end, upcoming) = match (current, next) {
             (Some((start, end)), _) => (start, end, false),
             (None, Some((start, end))) => (start, end, true),
             (None, None) => continue,
         };
-        let namespace = element.get("namespace").and_then(Value::as_str).unwrap_or_default();
-        let offer = element.get("id").and_then(Value::as_str).unwrap_or_default();
+        let namespace = element
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let offer = element
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if namespace.is_empty() || offer.is_empty() {
             continue;
         }
@@ -2436,7 +2611,11 @@ pub fn free_games(locale: &str) -> Result<Vec<FreeGame>> {
             cover,
             url: format!(
                 "https://store.epicgames.com/{}/p/{slug}",
-                if language.starts_with("fr") { "fr" } else { "en-US" }
+                if language.starts_with("fr") {
+                    "fr"
+                } else {
+                    "en-US"
+                }
             ),
             seller: element
                 .pointer("/seller/name")
@@ -2457,6 +2636,7 @@ pub fn free_games(locale: &str) -> Result<Vec<FreeGame>> {
             platforms: vec!["pc".to_string()],
             browser_only: false,
             offers: Vec::new(),
+            owned_offers: Vec::new(),
             title,
         });
     }
@@ -2551,15 +2731,16 @@ pub fn mobile_free_games(locale: &str) -> Result<Vec<FreeGame>> {
                 let Some(content) = offer.get("content") else {
                     continue;
                 };
-                let Some(claim) = content
-                    .get("purchase")
-                    .and_then(Value::as_array)
-                    .and_then(|purchases| {
-                        purchases.iter().find(|purchase| {
-                            purchase.get("purchaseType").and_then(Value::as_str)
-                                == Some("Claim")
+                let Some(claim) =
+                    content
+                        .get("purchase")
+                        .and_then(Value::as_array)
+                        .and_then(|purchases| {
+                            purchases.iter().find(|purchase| {
+                                purchase.get("purchaseType").and_then(Value::as_str)
+                                    == Some("Claim")
+                            })
                         })
-                    })
                 else {
                     continue;
                 };
@@ -2642,6 +2823,7 @@ pub fn mobile_free_games(locale: &str) -> Result<Vec<FreeGame>> {
                     owned: false,
                     browser_only: true,
                     offers: Vec::new(),
+                    owned_offers: Vec::new(),
                 });
             }
         }
@@ -2683,9 +2865,7 @@ pub fn mark_owned(tokens: &StoreTokens, games: &mut [FreeGame]) -> Result<()> {
             .map(|offer| format!("id={offer}"))
             .collect::<Vec<_>>()
             .join("&");
-        let url = format!(
-            "{CATALOG}/catalog/api/shared/namespace/{namespace}/bulk/offers?{query}"
-        );
+        let url = format!("{CATALOG}/catalog/api/shared/namespace/{namespace}/bulk/offers?{query}");
         let Ok(value) = common::get_json(&url, Some(&tokens.access_token)) else {
             continue;
         };
@@ -2709,11 +2889,22 @@ pub fn mark_owned(tokens: &StoreTokens, games: &mut [FreeGame]) -> Result<()> {
         }
     }
     for game in games.iter_mut() {
+        if game.store != Store::Epic {
+            continue;
+        }
         // Une carte ne vaut pour acquise que si **toutes** ses plateformes le
         // sont : sinon l'offre encore libre (iOS, par exemple) ne serait plus
-        // jamais proposée.
-        let ids: Vec<&String> = std::iter::once(&game.id).chain(game.offers.iter()).collect();
-        if !ids.is_empty() && ids.iter().all(|id| held.contains(*id)) {
+        // jamais proposée. La liste des offres déjà prises, elle, permet au
+        // panier d'écarter la seule plateforme qui l'est.
+        let ids: Vec<&String> = std::iter::once(&game.id)
+            .chain(game.offers.iter())
+            .collect();
+        game.owned_offers = ids
+            .iter()
+            .filter(|id| held.contains(**id))
+            .map(|id| (*id).clone())
+            .collect();
+        if !ids.is_empty() && game.owned_offers.len() == ids.len() {
             game.owned = true;
         }
     }
@@ -2785,9 +2976,7 @@ pub fn claim_free(
                 // Epic répond « CHECKOUT » quand il attend un passage en caisse
                 // au lieu de créer le droit : la commande ne peut pas être
                 // finalisée depuis l'API, la page de l'offre le fait.
-                if value.get("quickPurchaseStatus").and_then(Value::as_str)
-                    == Some("CHECKOUT")
-                {
+                if value.get("quickPurchaseStatus").and_then(Value::as_str) == Some("CHECKOUT") {
                     ClaimOutcome {
                         id: game.id.clone(),
                         title: game.title.clone(),
@@ -2854,12 +3043,26 @@ pub fn claim_free(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_epic_games_are_flagged_for_the_library_filter() {
+        let mobile = serde_json::json!({
+            "releaseInfo": [{ "platform": ["Android", "iOS"] }]
+        });
+        assert_eq!(mobile_platforms_of(&mobile), vec!["android", "ios"]);
+        let desktop = serde_json::json!({
+            "releaseInfo": [{ "platform": ["Windows"] }]
+        });
+        assert!(mobile_platforms_of(&desktop).is_empty());
+    }
     use serde_json::json;
 
     #[test]
     fn the_login_link_asks_for_a_code() {
         let link = login_link();
-        assert!(link.url.starts_with("https://www.epicgames.com/id/login?redirectUrl="));
+        assert!(link
+            .url
+            .starts_with("https://www.epicgames.com/id/login?redirectUrl="));
         assert!(link.url.contains("clientId%3D"));
         assert!(link.url.contains("responseType%3Dcode"));
         assert!(link.hint.contains("authorizationCode"));
@@ -2872,14 +3075,57 @@ mod tests {
             "refresh_token": "refresh",
             "expires_in": 7200,
             "account_id": "abc",
-            "displayName": "Nathounette"
+            "displayName": "JoueurExemple"
         });
         let tokens = tokens_from(&value).expect("jetons");
         assert_eq!(tokens.store, Store::Epic);
-        assert_eq!(tokens.account, "Nathounette");
+        assert_eq!(tokens.account, "JoueurExemple");
         assert_eq!(tokens.user_id, "abc");
         assert_eq!(tokens.expires_at, lapinux_core::util::now_unix() + 7200);
         assert!(tokens_from(&json!({})).is_err());
+    }
+
+    #[test]
+    fn details_art_keeps_distinct_epic_formats() {
+        let item = json!({ "keyImages": [
+            { "type": "OfferImageWide", "url": "https://example.test/wide" },
+            { "type": "DieselGameBoxTall", "url": "https://example.test/tall" },
+            { "type": "Icon", "url": "https://example.test/icon" }
+        ] });
+        assert_eq!(
+            details_art(&item, None),
+            (
+                "https://example.test/icon".into(),
+                "https://example.test/wide".into(),
+                "https://example.test/tall".into()
+            )
+        );
+        assert_eq!(
+            details_art(&json!({}), None),
+            (String::new(), String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn details_art_completes_a_catalog_cover_with_the_showcase_wide() {
+        // A Short Hike : le catalogue possédé ne rend que la jaquette
+        // verticale, la vitrine rend aussi le visuel large et la capsule.
+        let item = json!({ "keyImages": [
+            { "type": "DieselStoreFrontTall", "url": "https://example.test/tall" }
+        ] });
+        let showcase = json!({ "namespace": "ns", "keyImages": [
+            { "type": "OfferImageWide", "url": "https://example.test/wide" },
+            { "type": "OfferImageTall", "url": "https://example.test/showcase-tall" },
+            { "type": "Thumbnail", "url": "https://example.test/showcase-tall" }
+        ] });
+        assert_eq!(
+            details_art(&item, Some(&showcase)),
+            (
+                String::new(),
+                "https://example.test/wide".into(),
+                "https://example.test/tall".into()
+            )
+        );
     }
 
     #[test]
@@ -2999,14 +3245,19 @@ mod tests {
         let text = explain_login_refusal(refused).to_string();
         assert!(text.contains("expiré"), "{text}");
         assert!(text.contains("quelques instants"), "{text}");
-        assert!(!text.contains("errorCode"), "le JSON brut ne s'affiche plus");
+        assert!(
+            !text.contains("errorCode"),
+            "le JSON brut ne s'affiche plus"
+        );
 
         // Les autres refus gardent leur message : ils apprennent quelque chose.
         let other = Error::Refused {
             status: 500,
             message: "service indisponible".into(),
         };
-        assert!(explain_login_refusal(other).to_string().contains("indisponible"));
+        assert!(explain_login_refusal(other)
+            .to_string()
+            .contains("indisponible"));
     }
 
     #[test]
@@ -3014,7 +3265,10 @@ mod tests {
         assert_eq!(sanitize("03/hash_guid.chunk"), "03-hash_guid.chunk");
         // Les séparateurs deviennent des tirets : plus de dossier à remonter.
         let escaped = sanitize("../../evil");
-        assert!(!escaped.contains('/') && !escaped.contains('\\'), "{escaped}");
+        assert!(
+            !escaped.contains('/') && !escaped.contains('\\'),
+            "{escaped}"
+        );
         assert_eq!(escaped, "..-..-evil");
         assert_eq!(sanitize(".."), "chunk");
     }
@@ -3024,7 +3278,10 @@ mod tests {
         // Un enregistrement sans appName est écarté : il ne nomme aucun jeu.
         let record = json!({"appName": "Sugar", "namespace": "ns", "catalogItemId": "item"});
         let app_name = record["appName"].as_str().unwrap();
-        assert_eq!(store_appid(Store::Epic, app_name), store_appid(Store::Epic, "Sugar"));
+        assert_eq!(
+            store_appid(Store::Epic, app_name),
+            store_appid(Store::Epic, "Sugar")
+        );
         assert_eq!(humanize("Sugar"), "Sugar");
     }
 
@@ -3099,9 +3356,18 @@ fn playtimes(tokens: &StoreTokens) -> std::collections::HashMap<String, u64> {
     // Trois chemins connus du service de bibliothèque : le premier accepte le
     // jeton du launcher, les autres servent de repli si Epic déplace le sien.
     let candidates = [
-        format!("{LIBRARY}/library/api/public/playtime/account/{}/all", tokens.user_id),
-        format!("{LIBRARY}/library/api/public/playtime/account/{}", tokens.user_id),
-        format!("{LIBRARY}/library/api/v1/playtime/account/{}/all", tokens.user_id),
+        format!(
+            "{LIBRARY}/library/api/public/playtime/account/{}/all",
+            tokens.user_id
+        ),
+        format!(
+            "{LIBRARY}/library/api/public/playtime/account/{}",
+            tokens.user_id
+        ),
+        format!(
+            "{LIBRARY}/library/api/v1/playtime/account/{}/all",
+            tokens.user_id
+        ),
     ];
     for url in candidates {
         match common::get_json(&url, Some(&tokens.access_token)) {
@@ -3277,3 +3543,4 @@ mod about_tests {
         assert_eq!(sheet.trailer, "https://cdn.example/master.m3u8");
     }
 }
+

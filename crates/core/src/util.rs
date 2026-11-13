@@ -3,6 +3,51 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Crée `dir` et ses ancêtres manquants en 0700 : le umask ne doit pas
+/// décider de la visibilité d'un dossier qui contient des jetons. Sous
+/// `umask 000`, `create_dir_all` donnerait 0777, et un autre compte local
+/// pourrait alors remplacer ou effacer les fichiers de session.
+fn create_private_dirs(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Publie un fichier privé sans tronquer la version précédente en cas d'échec.
+/// Le temporaire est unique, créé en 0600 dès l'ouverture et jamais suivi.
+pub fn write_private_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::{self, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+    create_private_dirs(parent)?;
+    for _ in 0..100 {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".lapinux-private-{}-{id}.tmp", std::process::id()));
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let result = (|| {
+            file.write_all(data)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, path)?;
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        return result;
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "cannot create private temporary file"))
+}
+
 /// Copie un dossier fichier par fichier, liens symboliques compris : un
 /// préfixe Proton en dépend (`dosdevices`, `pfx`), et une sauvegarde copiée
 /// sans ses liens ne serait pas restaurable.
@@ -114,10 +159,7 @@ pub fn proton_family(name: &str) -> String {
 /// remplace donc l'ancienne version numérotée.
 pub fn proton_family_key(name: &str) -> String {
     let family = proton_family(name);
-    family
-        .strip_suffix("latest")
-        .unwrap_or(&family)
-        .to_string()
+    family.strip_suffix("latest").unwrap_or(&family).to_string()
 }
 
 /// Horloge locale d'un instant : `localtime_r` tient compte du fuseau et de
@@ -157,10 +199,11 @@ pub fn format_datetime(unix: i64) -> String {
         return "—".into();
     };
     format!(
-        "{:02}/{:02}/{:04} à {:02}:{:02}",
+        "{:02}/{:02}/{:04} {} {:02}:{:02}",
         tm.tm_mday,
         tm.tm_mon + 1,
         tm.tm_year + 1900,
+        crate::i18n::t("date.at"),
         tm.tm_hour,
         tm.tm_min
     )
@@ -182,6 +225,25 @@ pub fn format_time_seconds(unix: i64) -> String {
         return "—".into();
     };
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// Date et heure locales `JJ/MM/AAAA à HH:MM:SS` : les événements d'amis se
+/// suivent à la seconde, une connexion et un lancement pouvant arriver dans la
+/// même minute.
+pub fn format_datetime_seconds(unix: i64) -> String {
+    let Some(tm) = local_tm(unix) else {
+        return "—".into();
+    };
+    format!(
+        "{:02}/{:02}/{:04} {} {:02}:{:02}:{:02}",
+        tm.tm_mday,
+        tm.tm_mon + 1,
+        tm.tm_year + 1900,
+        crate::i18n::t("date.at"),
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 /// Jour d'une partie, nommé quand il est proche : « Aujourd'hui », « Hier »,
@@ -236,6 +298,24 @@ pub fn format_duration(seconds: u64) -> String {
     } else {
         format!("{seconds} s")
     }
+}
+
+/// Une cadence encore confortable, même sous la limite ou sous le maximum
+/// observé. 60 i/s est le seuil absolu : une session à 60 ou 120 images ne doit
+/// pas s'afficher en rouge simplement parce que l'écran monte à 165 Hz. Les
+/// sessions volontairement basses (30 i/s sur une limite de 30) restent vertes
+/// grâce à la marge relative.
+pub fn fps_is_comfortable(fps: u32, reference: u32) -> bool {
+    if reference == 0 {
+        return true;
+    }
+    fps >= 60 || fps as f32 >= reference as f32 * 0.90
+}
+
+/// La cadence reste jouable, mais mérite un avertissement : en dessous de la
+/// marge confortable, on garde un plancher absolu avant le rouge.
+pub fn fps_is_playable(fps: u32, reference: u32) -> bool {
+    fps >= 45 || fps as f32 >= reference as f32 * 0.70
 }
 
 /// Durée d'allumage de la machine : les jours comptent, sinon une machine
@@ -298,6 +378,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_atomic_writes_are_private_and_do_not_follow_final_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let target = dir.path().join("tokens");
+        std::fs::write(&outside, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+        write_private_atomic(&target, b"secret").unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn private_writes_create_their_directory_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("stores/boutiques/tokens");
+        write_private_atomic(&target, b"secret").unwrap();
+        // Le umask ne doit pas ouvrir le dossier des jetons au groupe ni aux
+        // autres comptes : seul le propriétaire y accède.
+        for name in ["stores", "stores/boutiques"] {
+            let mode = std::fs::metadata(dir.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "{name} : {mode:o}");
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn a_failed_private_write_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // La destination est un dossier : le renommage échoue après l'écriture.
+        let target = dir.path().join("tokens");
+        std::fs::create_dir(&target).unwrap();
+        assert!(write_private_atomic(&target, b"secret").is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_existing_token_file_becomes_private_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tokens");
+        std::fs::write(&target, b"ancien").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_atomic(&target, b"nouveau").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"nouveau");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn concurrent_private_atomic_writes_leave_a_complete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tokens");
+        std::thread::scope(|scope| {
+            for value in 0u8..8 {
+                let target = &target;
+                scope.spawn(move || {
+                    for _ in 0..10 { write_private_atomic(target, &vec![value; 8192]).unwrap(); }
+                });
+            }
+        });
+        let bytes = std::fs::read(&target).unwrap();
+        assert_eq!(bytes.len(), 8192);
+        assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn proton_families_gather_the_same_builds() {
         assert_eq!(proton_family("GE-Proton11-7"), "geproton");
         assert_eq!(proton_family("ge-proton11-9"), "geproton");
@@ -306,7 +461,10 @@ mod tests {
         assert_eq!(proton_family_key("DW-Proton Latest"), "dwproton");
         assert_eq!(proton_family_key("dwproton-11.0-15-x86_64"), "dwproton");
         // Et ne se confond pas avec un autre build de Valve.
-        assert_ne!(proton_family_key("Proton 11.0"), proton_family_key("Proton - Experimental"));
+        assert_ne!(
+            proton_family_key("Proton 11.0"),
+            proton_family_key("Proton - Experimental")
+        );
     }
 
     #[test]

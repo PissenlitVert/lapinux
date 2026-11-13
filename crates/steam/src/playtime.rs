@@ -86,6 +86,20 @@ pub async fn owned_games(
     Ok(parse_owned(&answer.body))
 }
 
+/// Appids de la bibliothèque du compte, en un seul appel.
+///
+/// C'est la vérification légère du démarrage : elle compare cette liste au
+/// catalogue sans relire les paquets, les dates ni les fiches. Un jeu ajouté
+/// au compte depuis la dernière synchronisation apparaît ici tout de suite.
+pub fn owned_appids(account: &str, refresh_token: &str, steam_id: u64) -> Result<Vec<u32>, Error> {
+    crate::shared::block_on(async move {
+        let client = crate::shared::session(account, refresh_token).await?;
+        let group = family_group_id(&client, steam_id).await;
+        let games = owned_games(&client, steam_id, group).await?;
+        Ok(games.into_iter().map(|(appid, _)| appid).collect())
+    })
+}
+
 /// Corps de `Player.GetOwnedGames#1` : `steamid` (1), jeux gratuits joués (3)
 /// — sans quoi la réponse omet les jeux auxquels le compte a joué sans les
 /// acheter —, filtre d'appid (4) et groupe familial (9).
@@ -200,7 +214,9 @@ fn parse_badges(body: &[u8]) -> BadgeLevels {
                         badge = u32::try_from(value).unwrap_or_default();
                     }
                 }
-                levels.badge_level = levels.badge_level.or(Some(badge).filter(|level| *level > 0));
+                levels.badge_level = levels
+                    .badge_level
+                    .or(Some(badge).filter(|level| *level > 0));
             }
             _ => {}
         }

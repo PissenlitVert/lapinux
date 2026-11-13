@@ -8,8 +8,8 @@
 
 use super::Error;
 use aes::cipher::{
-    block_padding::Pkcs7, generic_array::GenericArray, BlockDecrypt, BlockDecryptMut,
-    BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit,
+    block_padding::Pkcs7, generic_array::GenericArray, BlockDecrypt, BlockDecryptMut, BlockEncrypt,
+    BlockEncryptMut, KeyInit, KeyIvInit,
 };
 use aes::Aes256;
 use cbc::{Decryptor, Encryptor};
@@ -204,8 +204,8 @@ mod tests {
         assert_eq!(
             digest,
             [
-                0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b, 0xc0, 0xb6, 0xfb,
-                0x37, 0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00
+                0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b, 0xc0, 0xb6, 0xfb, 0x37,
+                0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00
             ]
         );
     }

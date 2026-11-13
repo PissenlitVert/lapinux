@@ -158,8 +158,12 @@ fn handle_guard(
     let mut retry = false;
     for attempt in 0..super::MAX_GUARD_ATTEMPTS {
         let code = prompt(guard, retry)?;
-        let request =
-            proto::update_guard_code_request(session.client_id, session.steam_id, &code, confirmation.kind);
+        let request = proto::update_guard_code_request(
+            session.client_id,
+            session.steam_id,
+            &code,
+            confirmation.kind,
+        );
         let reply = call(
             stream,
             channel,
@@ -224,13 +228,7 @@ fn poll_tokens(
 
     loop {
         let request = proto::poll_auth_request(client_id, &request_id);
-        let reply = call(
-            stream,
-            channel,
-            config,
-            proto::AUTH_POLL_SESSION,
-            &request,
-        )?;
+        let reply = call(stream, channel, config, proto::AUTH_POLL_SESSION, &request)?;
         if reply.eresult != super::RESULT_OK as i32 {
             return Err(Error::Auth(format!(
                 "session d'authentification perdue : {} (eresult {})",
@@ -278,7 +276,9 @@ pub(super) fn begin_qr(
         )));
     }
     let response = proto::parse_begin_qr(&reply.body);
-    if response.client_id == 0 || response.request_id.is_empty() || response.challenge_url.is_empty()
+    if response.client_id == 0
+        || response.request_id.is_empty()
+        || response.challenge_url.is_empty()
     {
         return Err(Error::Protocol("QR sans session".into()));
     }
@@ -320,13 +320,7 @@ pub(super) fn poll_qr(
             return Err(Error::Auth("connexion annulée".into()));
         }
         let request = proto::poll_auth_request(client_id, &request_id);
-        let reply = call(
-            stream,
-            channel,
-            config,
-            proto::AUTH_POLL_SESSION,
-            &request,
-        )?;
+        let reply = call(stream, channel, config, proto::AUTH_POLL_SESSION, &request)?;
         if reply.eresult != super::RESULT_OK as i32 {
             return Err(Error::Auth(format!(
                 "session QR perdue : {} (eresult {})",
@@ -428,9 +422,7 @@ fn call(
                 continue;
             }
             let parsed = proto::parse_service_header(header);
-            if parsed.target_job_id != job_id
-                && parsed.target_job_name.as_deref() != Some(method)
-            {
+            if parsed.target_job_id != job_id && parsed.target_job_name.as_deref() != Some(method) {
                 continue;
             }
             return Ok(Reply {
@@ -455,16 +447,11 @@ fn encrypt_password(
     exponent_hex: &str,
     password: &str,
 ) -> Result<String, Error> {
-    let modulus = BigUint::parse_bytes(
-        modulus_hex.trim().trim_start_matches("0x").as_bytes(),
-        16,
-    )
-    .ok_or_else(|| Error::Crypto("module RSA invalide".into()))?;
-    let exponent = BigUint::parse_bytes(
-        exponent_hex.trim().trim_start_matches("0x").as_bytes(),
-        16,
-    )
-    .ok_or_else(|| Error::Crypto("exposant RSA invalide".into()))?;
+    let modulus = BigUint::parse_bytes(modulus_hex.trim().trim_start_matches("0x").as_bytes(), 16)
+        .ok_or_else(|| Error::Crypto("module RSA invalide".into()))?;
+    let exponent =
+        BigUint::parse_bytes(exponent_hex.trim().trim_start_matches("0x").as_bytes(), 16)
+            .ok_or_else(|| Error::Crypto("exposant RSA invalide".into()))?;
     let key = RsaPublicKey::new(modulus, exponent)
         .map_err(|e| Error::Crypto(format!("clé RSA du compte : {e}")))?;
     let encrypted = key

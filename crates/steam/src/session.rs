@@ -7,9 +7,8 @@
 
 use lapinux_core::paths::LapinuxPaths;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Session réutilisable d'un compte Steam.
@@ -72,22 +71,15 @@ pub fn save_to(path: &Path, session: &SavedSession) -> io::Result<()> {
     session.saved_at = Some(now_unix());
     let data = serde_json::to_vec_pretty(&session)
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(&data)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
+    let mut data = data;
+    data.push(b'\n');
+    lapinux_core::util::write_private_atomic(path, &data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn round_trip_keeps_the_token_and_guard_data() {

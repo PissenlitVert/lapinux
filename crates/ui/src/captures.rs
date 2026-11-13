@@ -13,7 +13,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use lapinux_core::config::CaptureConfig;
@@ -21,7 +23,8 @@ use lapinux_core::model::SteamCatalog;
 use lapinux_core::paths::LapinuxPaths;
 
 use super::{
-    display_font, load_texture_file, segment_rect, segmented_pill, CARD_HOVER, PANEL, TEXT, TEXT_DIM,
+    display_font, load_texture_file, segment_rect, segmented_pill, CARD_HOVER, PANEL, TEXT,
+    TEXT_DIM,
 };
 
 /// Taille d'une carte : l'image occupe toute la surface, sans cadre gris.
@@ -44,6 +47,26 @@ const SCAN: Duration = Duration::from_secs(5);
 /// Vignettes gardées en mémoire : au-delà, le cache repart de zéro plutôt que
 /// de garder toutes les captures d'une session en textures.
 const THUMBS_KEPT: usize = 96;
+
+/// Compteurs de décodages, pour le banc de mesure et les tests : ils disent
+/// combien de lectures disque/ffmpeg la page a réellement lancées.
+#[cfg(test)]
+static THUMB_DECODES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static PREVIEW_DECODES: AtomicUsize = AtomicUsize::new(0);
+
+/// Un survol de vidéo doit durer avant d'extraire ses cinq aperçus : balayer
+/// la souris sur une rangée ne doit lancer aucun ffmpeg.
+const HOVER_DELAY: f64 = 0.35;
+
+/// Après un coup de molette, on laisse la vue se poser avant de décoder les
+/// nouvelles cartes : sinon un défilement rapide traverse tout le dossier.
+const SCROLL_COOLDOWN: Duration = Duration::from_millis(180);
+
+/// Décodages de vignettes simultanés. Un défilement rapide traversant un grand
+/// dossier lançait auparavant un fil par carte visible, puis un `ffmpeg` par
+/// vidéo : trois suffisent à remplir l'écran sans saturer le disque.
+const THUMB_THREADS: usize = 3;
 
 /// Largeur de la vignette décodée, en pixels. La carte en fait 224 : le double
 /// couvre un écran HiDPI sans garder une capture entière en texture.
@@ -87,7 +110,9 @@ pub(crate) fn open_external(path: &Path) -> Result<(), String> {
         .arg(path)
         .spawn()
         .map(|_| ())
-        .map_err(|err| lapinux_core::i18n::t_args("captures.open_error", &[("error", &err.to_string())]))
+        .map_err(|err| {
+            lapinux_core::i18n::t_args("captures.open_error", &[("error", &err.to_string())])
+        })
 }
 
 /// Ce que le fichier contient.
@@ -325,6 +350,19 @@ pub(crate) struct Gallery {
     /// Dossiers de la dernière lecture : un changement dans les réglages
     /// relance la galerie sans attendre les cinq secondes habituelles.
     scanned_dirs: Option<(PathBuf, PathBuf)>,
+    /// Fils de chargement de vignettes en cours, partagés avec eux.
+    thumb_active: Arc<AtomicUsize>,
+    /// Dernier défilement observé : les décodages attendent que la vue se
+    /// stabilise au lieu de suivre chaque image de la molette.
+    last_scroll: Option<Instant>,
+    /// Accès aux vignettes, pour évincer la moins récemment vue sans vider
+    /// toute la cache.
+    thumb_clock: u64,
+    thumb_used: HashMap<PathBuf, u64>,
+    /// Entrée du pointeur sur une vidéo, pour temporiser ses aperçus.
+    hover_since: HashMap<PathBuf, f64>,
+    /// Une seule extraction d'aperçus à la fois : cinq ffmpeg suffisent.
+    preview_active: Arc<AtomicUsize>,
 }
 
 impl Gallery {
@@ -411,49 +449,71 @@ impl Gallery {
         let mut picked = None;
         let mut asked = None;
         let mut removed = None;
+        // Grille virtualisée : seules les rangées qui touchent la vue sont
+        // mises en page. Avec plusieurs centaines de captures, réserver la
+        // place des autres coûtait à chaque image sans rien afficher.
+        let spacing = 14.0;
+        let columns = (((ui.available_width() + spacing) / (CARD_W + spacing)).floor() as usize)
+            .max(1);
+        let rows = shown.len().div_ceil(columns);
+        let row_h = CARD_H + spacing;
+        let content_h = (rows as f32 * row_h - spacing).max(0.0);
+        let scrolling = ui.input(|input| input.smooth_scroll_delta.y.abs() > 0.5);
+        if scrolling {
+            self.last_scroll = Some(Instant::now());
+        }
+        let scrolling = scrolling || self.scrolling_recently();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(14.0, 14.0);
-                    for index in shown {
-                        let capture = self.entries[index].clone();
-                        let (rect, response) = ui
-                            .allocate_exact_size(egui::vec2(CARD_W, CARD_H), egui::Sense::click());
-                        // Une carte hors écran n'est pas décodée : faire
-                        // défiler la grille ne coûte que ce qui se voit.
-                        let visible = ui.is_rect_visible(rect);
-                        // Rien n'est décodé hors écran, et ce qui se voit est
-                        // décodé en fond : la grille s'affiche tout de suite.
-                        let (thumb, duration) = if visible {
-                            self.thumb(ui.ctx(), &capture)
-                        } else {
-                            (None, None)
+            .show_viewport(ui, |ui, viewport| {
+                let origin = ui.cursor().min;
+                ui.allocate_space(egui::vec2(ui.available_width(), content_h));
+                let first = ((viewport.min.y / row_h).floor().max(0.0) as usize).min(rows);
+                let last = ((viewport.max.y / row_h).ceil().max(0.0) as usize).min(rows);
+                for row in first..last {
+                    for column in 0..columns {
+                        let Some(&index) = shown.get(row * columns + column) else {
+                            break;
                         };
+                        let rect = egui::Rect::from_min_size(
+                            origin
+                                + egui::vec2(
+                                    column as f32 * (CARD_W + spacing),
+                                    row as f32 * row_h,
+                                ),
+                            egui::vec2(CARD_W, CARD_H),
+                        );
+                        let response = ui.interact(
+                            rect,
+                            egui::Id::new(("capture-card", &self.entries[index].path)),
+                            egui::Sense::click(),
+                        );
+                        let capture = self.entries[index].clone();
+                        let (thumb, duration) = self.thumb(ui.ctx(), &capture);
                         // Le nouveau nom ne porte plus l'appid : le jeu est
                         // retrouvé par son titre dans la bibliothèque quand
                         // elle le connaît encore.
-                        let appid = capture.appid.or_else(|| {
-                            games
-                                .iter()
-                                .find(|game| same_game_name(&game.name, &capture.game))
-                                .map(|game| game.appid)
-                        }).or_else(|| {
-                            catalog.and_then(|catalog| {
-                                catalog
-                                    .entries
+                        let appid = capture
+                            .appid
+                            .or_else(|| {
+                                games
                                     .iter()
-                                    .find(|entry| same_game_name(&entry.name, &capture.game))
-                                    .map(|entry| entry.appid)
+                                    .find(|game| same_game_name(&game.name, &capture.game))
+                                    .map(|game| game.appid)
                             })
-                        });
+                            .or_else(|| {
+                                catalog.and_then(|catalog| {
+                                    catalog
+                                        .entries
+                                        .iter()
+                                        .find(|entry| same_game_name(&entry.name, &capture.game))
+                                        .map(|entry| entry.appid)
+                                })
+                            });
                         let icon = self.icon(ui.ctx(), paths, appid);
                         // L'aperçu animé ne se fabrique qu'au survol : les
                         // vidéos hors écran ne lancent aucun ffmpeg.
-                        let previews = if capture.media == Media::Video
-                            && visible
-                            && response.hovered()
-                        {
+                        let previews = if capture.media == Media::Video && response.hovered() {
                             self.previews(ui.ctx(), &capture)
                         } else {
                             None
@@ -463,8 +523,10 @@ impl Gallery {
                                 return None;
                             }
                             let now = ui.ctx().input(|input| input.time);
-                            let started =
-                                *self.preview_started.entry(capture.path.clone()).or_insert(now);
+                            let started = *self
+                                .preview_started
+                                .entry(capture.path.clone())
+                                .or_insert(now);
                             if frames.len() > 1 {
                                 ui.ctx().request_repaint_after(Duration::from_millis(120));
                             }
@@ -473,15 +535,15 @@ impl Gallery {
                         });
                         if !response.hovered() {
                             self.preview_started.remove(&capture.path);
+                            self.hover_since.remove(&capture.path);
                         }
                         let trash = trash_rect(rect);
                         let folder = folder_rect(rect);
-                        let pending = self
-                            .pending_delete
-                            .as_ref()
-                            .is_some_and(|(path, at)| path == &capture.path && at.elapsed() < CONFIRM);
-                        let over_trash = visible && ui.rect_contains_pointer(trash);
-                        let over_folder = visible && ui.rect_contains_pointer(folder);
+                        let pending = self.pending_delete.as_ref().is_some_and(|(path, at)| {
+                            path == &capture.path && at.elapsed() < CONFIRM
+                        });
+                        let over_trash = ui.rect_contains_pointer(trash);
+                        let over_folder = ui.rect_contains_pointer(folder);
                         paint_card(
                             ui,
                             rect,
@@ -495,9 +557,14 @@ impl Gallery {
                             over_folder,
                             pending,
                         );
-                        let response = response
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(hint(&capture, pending));
+                        let mut response =
+                            response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        // L'infobulle n'est construite qu'au survol : sinon
+                        // chaque carte visible allouait sa chaîne à chaque
+                        // image, pour rien.
+                        if response.hovered() {
+                            response = response.on_hover_text(hint(&capture, pending));
+                        }
                         if response.clicked() {
                             let at = response.interact_pointer_pos();
                             if at.is_some_and(|at| folder.contains(at)) {
@@ -519,7 +586,19 @@ impl Gallery {
                             }
                         }
                     }
-                });
+                }
+                // Au repos, la rangée suivante se décode sans être peinte :
+                // elle est prête au premier cran de molette, sans ajouter de
+                // cartes à dessiner à chaque image.
+                if !scrolling {
+                    for column in 0..columns {
+                        let Some(&index) = shown.get(last * columns + column) else {
+                            break;
+                        };
+                        let capture = self.entries[index].clone();
+                        let _ = self.thumb(ui.ctx(), &capture);
+                    }
+                }
             });
 
         if let Some(path) = removed {
@@ -562,22 +641,53 @@ impl Gallery {
         }
         self.scanned = Some(Instant::now());
         self.entries = scan_dirs(&[&dirs.0, &dirs.1]);
-        let present: HashSet<&PathBuf> = self
-            .entries
-            .iter()
-            .map(|capture| &capture.path)
-            .collect();
+        let present: HashSet<&PathBuf> = self.entries.iter().map(|capture| &capture.path).collect();
         self.thumbs.retain(|path, _| present.contains(path));
+        self.thumb_used.retain(|path, _| present.contains(path));
         self.preview_cache.retain(|path, _| present.contains(path));
-        self.preview_started.retain(|path, _| present.contains(path));
-        if self.thumbs.len() > THUMBS_KEPT {
-            self.thumbs.clear();
-        }
+        self.preview_started
+            .retain(|path, _| present.contains(path));
+        self.hover_since.retain(|path, _| present.contains(path));
+        // La cache se règle après : les emprunts ci-dessus lisent `entries`.
+        drop(present);
+        self.trim_thumbs();
         if let Some((pending, _)) = self.pending_delete.as_ref() {
-            if !present.contains(pending) {
+            if !self.entries.iter().any(|capture| &capture.path == pending) {
                 self.pending_delete = None;
             }
         }
+    }
+
+    /// Évince les vignettes les moins récemment vues, une par une : vider
+    /// toute la cache jetait aussi les cartes encore à l'écran, qui étaient
+    /// redécodées au retour.
+    fn trim_thumbs(&mut self) {
+        while self.thumbs.len() > THUMBS_KEPT {
+            let Some(oldest) = self
+                .thumb_used
+                .iter()
+                .min_by_key(|(_, used)| **used)
+                .map(|(path, _)| path.clone())
+            else {
+                self.thumbs.clear();
+                return;
+            };
+            self.thumbs.remove(&oldest);
+            self.thumb_used.remove(&oldest);
+        }
+    }
+
+    fn touch_thumb(&mut self, path: &Path) {
+        self.thumb_clock = self.thumb_clock.wrapping_add(1);
+        let clock = self.thumb_clock;
+        self.thumb_used.insert(path.to_path_buf(), clock);
+    }
+
+    /// Vrai juste après un défilement : on n'ouvre pas de nouveau décodage
+    /// pour une carte qui serait aussitôt sortie de l'écran.
+    fn scrolling_recently(&self) -> bool {
+        self.last_scroll
+            .is_some_and(|at| at.elapsed() < SCROLL_COOLDOWN)
     }
 
     /// Vignette et durée d'une capture. Le fichier est lu, décodé et, pour une
@@ -590,6 +700,9 @@ impl Gallery {
         capture: &Capture,
     ) -> (Option<egui::TextureHandle>, Option<f64>) {
         let path = capture.path.clone();
+        if self.thumbs.contains_key(&path) {
+            self.touch_thumb(&path);
+        }
         if let Some(entry) = self.thumbs.get_mut(&path) {
             match entry {
                 ThumbEntry::Ready(thumb) => return (thumb.image.clone(), thumb.duration),
@@ -619,11 +732,29 @@ impl Gallery {
                 },
             }
         }
+        // Un défilement en cours ne doit pas lancer un décodage par carte
+        // traversée : la place reste réservée, la vignette arrive quand la
+        // vue se pose.
+        if self.scrolling_recently() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+            return (None, None);
+        }
+        let active = Arc::clone(&self.thumb_active);
+        if active.load(Ordering::Relaxed) >= THUMB_THREADS {
+            ctx.request_repaint_after(Duration::from_millis(120));
+            return (None, None);
+        }
+        active.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        THUMB_DECODES.fetch_add(1, Ordering::Relaxed);
         let (tx, receiver) = mpsc::channel();
         let thread_capture = capture.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(load_thumb(&thread_capture));
+            let loaded = load_thumb(&thread_capture);
+            active.fetch_sub(1, Ordering::Relaxed);
+            let _ = tx.send(loaded);
         });
+        self.touch_thumb(&path);
         self.thumbs.insert(path, ThumbEntry::Loading(receiver));
         ctx.request_repaint_after(Duration::from_millis(120));
         (None, None)
@@ -684,10 +815,28 @@ impl Gallery {
                 },
             }
         }
+        // Les cinq images ne partent qu'après un survol soutenu : balayer une
+        // rangée de vidéos ne doit pas lancer cinq ffmpeg par carte.
+        let now = ctx.input(|input| input.time);
+        let since = *self.hover_since.entry(path.clone()).or_insert(now);
+        if now - since < HOVER_DELAY {
+            ctx.request_repaint_after(Duration::from_millis(80));
+            return None;
+        }
+        let active = Arc::clone(&self.preview_active);
+        if active.load(Ordering::Relaxed) > 0 {
+            ctx.request_repaint_after(Duration::from_millis(150));
+            return None;
+        }
+        active.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        PREVIEW_DECODES.fetch_add(1, Ordering::Relaxed);
         let (tx, receiver) = mpsc::channel();
         let thread_path = path.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(video_preview_files(&thread_path));
+            let files = video_preview_files(&thread_path);
+            active.fetch_sub(1, Ordering::Relaxed);
+            let _ = tx.send(files);
         });
         self.preview_cache
             .insert(path, PreviewEntry::Loading(receiver));
@@ -711,21 +860,31 @@ impl Gallery {
 fn filter_group(ui: &mut egui::Ui, current: Kind, images: usize, videos: usize) -> Option<Kind> {
     let font = egui::FontId::proportional(11.5);
     let items = [
-        (Kind::All, format!("Tout · {}", images + videos)),
-        (Kind::Image, format!("Images · {images}")),
-        (Kind::Video, format!("Vidéos · {videos}")),
+        (
+            Kind::All,
+            lapinux_core::i18n::t_fmt("captures.all_count", &[(images + videos).to_string()]),
+        ),
+        (
+            Kind::Image,
+            lapinux_core::i18n::t_args("captures.images_count", &[("images", &images.to_string())]),
+        ),
+        (
+            Kind::Video,
+            lapinux_core::i18n::t_args("captures.videos_count", &[("videos", &videos.to_string())]),
+        ),
     ];
     let widths: Vec<f32> = items
         .iter()
         .map(|(_, text)| {
-            ui.fonts(|fonts| fonts.layout_no_wrap(text.clone(), font.clone(), TEXT()).size().x)
-                + 26.0
+            ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(text.clone(), font.clone(), TEXT())
+                    .size()
+                    .x
+            }) + 26.0
         })
         .collect();
-    let active: Vec<bool> = items
-        .iter()
-        .map(|(kind, _)| current == *kind)
-        .collect();
+    let active: Vec<bool> = items.iter().map(|(kind, _)| current == *kind).collect();
     let (rect, responses) = segmented_pill(ui, &widths, &active, "captures");
     let painter = ui.painter();
     let mut chosen = None;
@@ -756,7 +915,7 @@ fn empty_state(ui: &mut egui::Ui, dir: &Path) {
     ui.add_space((ui.available_height() * 0.28).max(24.0));
     ui.vertical_centered(|ui| {
         ui.label(
-            egui::RichText::new("Aucune capture pour l'instant")
+            egui::RichText::new(lapinux_core::i18n::t("captures.empty"))
                 .size(15.0)
                 .color(TEXT()),
         );
@@ -783,10 +942,7 @@ fn empty_state(ui: &mut egui::Ui, dir: &Path) {
 fn trash_rect(card: egui::Rect) -> egui::Rect {
     let margin = 8.0;
     let max = egui::pos2(card.right() - margin, card.bottom() - margin);
-    egui::Rect::from_min_max(
-        egui::pos2(max.x - TRASH, max.y - TRASH),
-        max,
-    )
+    egui::Rect::from_min_max(egui::pos2(max.x - TRASH, max.y - TRASH), max)
 }
 
 fn folder_rect(rect: egui::Rect) -> egui::Rect {
@@ -918,10 +1074,7 @@ fn media_badge_rect(thumb: egui::Rect, media: Media, duration_width: Option<f32>
     };
     let right = thumb.right() - 10.0;
     let top = thumb.top() + 10.0;
-    egui::Rect::from_min_size(
-        egui::pos2(right - width, top),
-        egui::vec2(width, 22.0),
-    )
+    egui::Rect::from_min_size(egui::pos2(right - width, top), egui::vec2(width, 22.0))
 }
 
 fn paint_media_badge(
@@ -961,45 +1114,58 @@ fn paint_media_badge(
 
 /// Dégradé haut pour le jeu, dégradé bas pour la date : l'image reste visible
 /// entre les deux.
+/// Dégradé vertical en un seul quadrilatère : les douze bandes empilées
+/// coûtaient douze formes par carte et par image, soit plus d'un millier de
+/// rectangles à l'écran. Le rendu est le même, la dégradation est simplement
+/// continue.
+fn paint_vertical_gradient(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    top: egui::Color32,
+    bottom: egui::Color32,
+) {
+    let mut mesh = egui::Mesh::default();
+    for (pos, color) in [
+        (rect.left_top(), top),
+        (rect.right_top(), top),
+        (rect.left_bottom(), bottom),
+        (rect.right_bottom(), bottom),
+    ] {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos,
+            uv: egui::epaint::WHITE_UV,
+            color,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 2, 1, 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 fn paint_thumb_scrim(painter: &egui::Painter, rect: egui::Rect) {
-    const STEPS: usize = 12;
     let top_h = 44.0_f32.min(rect.height() * 0.5);
-    for index in 0..STEPS {
-        let t = index as f32 / STEPS as f32;
-        let next = (index + 1) as f32 / STEPS as f32;
-        let alpha = (120.0 * (1.0 - t)).round() as u8;
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(rect.left(), rect.top() + top_h * t),
-                egui::pos2(rect.right(), rect.top() + top_h * next),
-            ),
-            0.0,
-            egui::Color32::from_black_alpha(alpha),
-        );
-    }
+    paint_vertical_gradient(
+        painter,
+        egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.right(), rect.top() + top_h),
+        ),
+        egui::Color32::from_black_alpha(120),
+        egui::Color32::TRANSPARENT,
+    );
     let bottom_h = 32.0_f32.min(rect.height() * 0.4);
-    for index in 0..STEPS {
-        let t = index as f32 / STEPS as f32;
-        let next = (index + 1) as f32 / STEPS as f32;
-        let alpha = (145.0 * next).round() as u8;
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(rect.left(), rect.bottom() - bottom_h + bottom_h * t),
-                egui::pos2(rect.right(), rect.bottom() - bottom_h + bottom_h * next),
-            ),
-            0.0,
-            egui::Color32::from_black_alpha(alpha),
-        );
-    }
+    paint_vertical_gradient(
+        painter,
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.bottom() - bottom_h),
+            rect.right_bottom(),
+        ),
+        egui::Color32::TRANSPARENT,
+        egui::Color32::from_black_alpha(145),
+    );
 }
 
 /// Caméscope au trait, distinct de l'appareil photo des images.
-fn paint_video_glyph(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    size: f32,
-    ink: egui::Color32,
-) {
+fn paint_video_glyph(painter: &egui::Painter, center: egui::Pos2, size: f32, ink: egui::Color32) {
     let scale = size / 18.0;
     let stroke = egui::Stroke::new(1.4_f32 * scale, ink);
     let body = egui::Rect::from_center_size(
@@ -1023,22 +1189,26 @@ fn paint_video_glyph(
 /// pris, son poids et où il se trouve.
 fn hint(capture: &Capture, pending_delete: bool) -> String {
     if pending_delete {
-        return "Cliquer à nouveau sur la corbeille supprime ce fichier.".to_string();
+        return lapinux_core::i18n::t("captures.delete_again").to_string();
     }
     let when = lapinux_core::util::format_datetime(capture.taken);
     let what = match capture.media {
         Media::Image => "Image",
-        Media::Video => "Vidéo",
+        Media::Video => lapinux_core::i18n::t("captures.video"),
     };
     let head = if capture.game.is_empty() {
         format!("{what} du {when}")
     } else {
         format!("{} · {what}\n{when}", capture.game)
     };
-    format!(
-        "{head}\n{}\n{}\nCliquer pour ouvrir",
-        lapinux_core::util::format_bytes(capture.size),
-        capture.path.display()
+    lapinux_core::i18n::t_args(
+        "captures.hover",
+        &[
+            ("head", &head),
+            ("size", &lapinux_core::util::format_bytes(capture.size)),
+            ("path", &capture.path.display().to_string()),
+            ("click", lapinux_core::i18n::t("captures.click_to_open")),
+        ],
     )
 }
 
@@ -1083,7 +1253,12 @@ fn paint_play_glyph(painter: &egui::Painter, center: egui::Pos2, ink: egui::Colo
 }
 
 /// Corbeille au trait : couvercle, anse et corps.
-fn paint_trash_glyph(painter: &egui::Painter, center: egui::Pos2, size: f32, ink: egui::Color32) {
+pub(crate) fn paint_trash_glyph(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    ink: egui::Color32,
+) {
     let scale = size / 13.0;
     let stroke = egui::Stroke::new(1.3_f32 * scale, ink);
     let lid_y = center.y - 4.2 * scale;
@@ -1163,7 +1338,12 @@ fn paint_initial_badge(painter: &egui::Painter, rect: egui::Rect, game: &str) {
 /// Coupe un texte à la largeur disponible, points de suspension compris.
 fn elide(ui: &egui::Ui, text: &str, font: &egui::FontId, max: f32) -> String {
     let width = |text: &str| {
-        ui.fonts(|fonts| fonts.layout_no_wrap(text.to_owned(), font.clone(), TEXT()).size().x)
+        ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(text.to_owned(), font.clone(), TEXT())
+                .size()
+                .x
+        })
     };
     if width(text) <= max {
         return text.to_owned();
@@ -1203,14 +1383,16 @@ struct ReadyThumb {
 /// disque, `ffprobe`, `ffmpeg` — se fait ici, jamais pendant le dessin.
 fn load_thumb(capture: &Capture) -> Thumb {
     let duration = match capture.media {
-        Media::Video => video_duration(&capture.path)
-            .filter(|seconds| seconds.is_finite() && *seconds > 0.0),
+        Media::Video => {
+            video_duration(&capture.path).filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        }
         Media::Image => None,
     };
     let source = match capture.media {
         Media::Image => std::fs::read(&capture.path).ok(),
-        Media::Video => video_still(&capture.path, duration)
-            .and_then(|still| std::fs::read(&still).ok()),
+        Media::Video => {
+            video_still(&capture.path, duration).and_then(|still| std::fs::read(&still).ok())
+        }
     };
     Thumb {
         image: source.and_then(|bytes| image::load_from_memory(&bytes).ok()),
@@ -1222,7 +1404,7 @@ fn load_thumb(capture: &Capture) -> Thumb {
 /// souvent noires (logo, fondu), le milieu montre la scène. Le nouveau nom de
 /// cache invalide les anciennes images extraites au début.
 fn video_still(path: &Path, known_duration: Option<f64>) -> Option<PathBuf> {
-    let dir = LapinuxPaths::discover().cache_dir.join("thumbs");
+    let dir = LapinuxPaths::discover().thumbs_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let out = dir.join(format!("{:016x}-middle.png", path_id(path)));
     if preview_file_ok(&out) {
@@ -1271,7 +1453,7 @@ fn extract_frame(path: &Path, at: f64, out: &Path) -> bool {
 /// Cinq images réparties dans la vidéo. Le cache est relu avant de lancer
 /// `ffmpeg` : un survol ultérieur ne redécode rien.
 fn video_preview_files(path: &Path) -> Option<Vec<PathBuf>> {
-    let dir = LapinuxPaths::discover().cache_dir.join("previews");
+    let dir = LapinuxPaths::discover().previews_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let outputs: Vec<PathBuf> = (0..PREVIEW_FRAMES)
         .map(|index| dir.join(format!("{:016x}-mid-{index}.png", path_id(path))))
@@ -1279,7 +1461,8 @@ fn video_preview_files(path: &Path) -> Option<Vec<PathBuf>> {
     if outputs.iter().all(|out| preview_file_ok(out)) {
         return Some(outputs);
     }
-    let duration = video_duration(path).filter(|duration| duration.is_finite() && *duration > 0.0)?;
+    let duration =
+        video_duration(path).filter(|duration| duration.is_finite() && *duration > 0.0)?;
     let mut frames = Vec::with_capacity(PREVIEW_FRAMES);
     for (index, at) in preview_times(duration).into_iter().enumerate() {
         let out = &outputs[index];
@@ -1405,9 +1588,7 @@ impl Viewer {
         // Un fichier sans piste vidéo (capture ratée) n'a rien à décoder :
         // le dire vaut mieux qu'une zone noire.
         if video_size(&self.path).is_none() {
-            self.error = Some(
-                "Cette capture ne contient aucune image : le fichier est illisible.".to_string(),
-            );
+            self.error = Some(lapinux_core::i18n::t("captures.broken_file").to_string());
             return;
         }
         match Player::start(&self.path) {
@@ -1427,7 +1608,7 @@ impl Viewer {
 
         ui.horizontal(|ui| {
             if ui
-                .button(egui::RichText::new("‹  Retour").size(12.0))
+                .button(egui::RichText::new(lapinux_core::i18n::t("captures.back")).size(12.0))
                 .clicked()
             {
                 closed = true;
@@ -1448,13 +1629,21 @@ impl Viewer {
                 .color(TEXT_DIM()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(egui::RichText::new("Ouvrir ailleurs").size(11.5)).clicked() {
+                if ui
+                    .button(
+                        egui::RichText::new(lapinux_core::i18n::t("captures.open_elsewhere"))
+                            .size(11.5),
+                    )
+                    .clicked()
+                {
                     if let Err(err) = open_external(&self.path) {
                         self.error = Some(err);
                     }
                 }
                 if self.media == Media::Video
-                    && ui.button(egui::RichText::new("Recommencer").size(11.5)).clicked()
+                    && ui
+                        .button(egui::RichText::new("Recommencer").size(11.5))
+                        .clicked()
                 {
                     self.start_playback(&ctx);
                 }
@@ -1462,12 +1651,12 @@ impl Viewer {
                     let (label, paused) = match self.player.as_ref() {
                         Some(player) => {
                             if player.paused {
-                                ("Lire", true)
+                                (lapinux_core::i18n::t("captures.play"), true)
                             } else {
                                 ("Pause", false)
                             }
                         }
-                        None => ("Lire", false),
+                        None => (lapinux_core::i18n::t("captures.play"), false),
                     };
                     let _ = paused;
                     if ui.button(egui::RichText::new(label).size(11.5)).clicked() {
@@ -1489,7 +1678,11 @@ impl Viewer {
         let area = ui.available_rect_before_wrap();
         let area = egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, area.max.y - 26.0));
         let painter = ui.painter();
-        painter.rect_filled(area, egui::Rounding::same(10.0), egui::Color32::from_rgb(10, 11, 13));
+        painter.rect_filled(
+            area,
+            egui::Rounding::same(10.0),
+            egui::Color32::from_rgb(10, 11, 13),
+        );
 
         let mut seek_to: Option<f64> = None;
         if let Some(player) = self.player.as_mut() {
@@ -1659,7 +1852,9 @@ impl Player {
         let ffmpeg = lapinux_core::paths::which("ffmpeg")?;
         let (source_w, source_h) = video_size(path)?;
         let width = source_w.min(VIEW_MAX_W).max(2) & !1;
-        let height = ((source_h as f32) * (width as f32 / source_w as f32)).round().max(2.0) as u32;
+        let height = ((source_h as f32) * (width as f32 / source_w as f32))
+            .round()
+            .max(2.0) as u32;
         let mut command = Command::new(ffmpeg);
         command.args(["-hide_banner", "-loglevel", "error"]);
         if offset > 0.0 {
@@ -1750,7 +1945,11 @@ impl Player {
             .map(|at| at.elapsed())
             .unwrap_or(Duration::ZERO);
         self.offset
-            + (self.started.elapsed().saturating_sub(self.paused_total + paused)).as_secs_f64()
+            + (self
+                .started
+                .elapsed()
+                .saturating_sub(self.paused_total + paused))
+            .as_secs_f64()
     }
 
     /// Vide les images arrivées depuis la dernière frame et garde la dernière.
@@ -1955,12 +2154,16 @@ mod tests {
         assert_eq!(parsed.appid, None);
         assert_eq!(parsed.game, "");
         assert_eq!(parsed.taken, 1_793_000_000);
-        assert_eq!(parsed.title(), "Hors partie");
+        assert_eq!(
+            parsed.title(),
+            lapinux_core::i18n::t("captures.out_of_game")
+        );
     }
 
     #[test]
     fn a_renamed_video_is_read_in_a_marked_folder() {
-        let root = std::env::temp_dir().join(format!("lapinux-new-captures-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("lapinux-new-captures-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(lapinux_core::captures::MARKER), b"").unwrap();
@@ -2077,5 +2280,546 @@ mod tests {
         assert!(same_game_name("A Short Hike", "A Short Hike™"));
         assert!(same_game_name("MOTORSLICE", "MotorSlice Demo"));
         assert!(!same_game_name("Melatonin", "MOTORSLICE"));
+    }
+
+    /// Les compteurs de décodages sont ceux du processus : les tests qui les
+    /// lisent se succèdent pour ne pas se compter les uns les autres.
+    static CAPTURES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CAPTURES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Petit banc commun aux tests de comportement : une galerie de `count`
+    /// photos minuscules, dans deux dossiers temporaires marqués Lapinux.
+    fn test_gallery(name: &str, count: usize) -> (Gallery, LapinuxPaths, CaptureConfig, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "lapinux-captures-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images = root.join("images");
+        let videos = root.join("videos");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::create_dir_all(&videos).unwrap();
+        std::fs::write(images.join(lapinux_core::captures::MARKER), b"").unwrap();
+        std::fs::write(videos.join(lapinux_core::captures::MARKER), b"").unwrap();
+        let pixels = image::RgbaImage::from_pixel(32, 18, image::Rgba([10, 20, 30, 255]));
+        for index in 0..count {
+            let path = images.join(format!(
+                "lapinux-440-demo-{index}-{}.png",
+                1_793_000_000 + index
+            ));
+            pixels.save(&path).unwrap();
+        }
+        let config = CaptureConfig {
+            image_dir: images.display().to_string(),
+            video_dir: videos.display().to_string(),
+            ..CaptureConfig::default()
+        };
+        (
+            Gallery::default(),
+            LapinuxPaths::discover(),
+            config,
+            images,
+            videos,
+        )
+    }
+
+    fn test_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        crate::apply_theme(&ctx);
+        crate::install_fonts(&ctx);
+        ctx
+    }
+
+    fn test_frame(
+        gallery: &mut Gallery,
+        ctx: &egui::Context,
+        paths: &LapinuxPaths,
+        config: &CaptureConfig,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    gallery.page(ui, paths, config, &[], None);
+                });
+        });
+    }
+
+    #[test]
+    fn offscreen_cards_do_not_start_thumbnail_decodes() {
+        let _guard = capture_test_guard();
+        let (mut gallery, paths, config, images, videos) = test_gallery("offscreen", 300);
+        let ctx = test_context();
+        let before = THUMB_DECODES.load(Ordering::Relaxed);
+        for frame in 0..4 {
+            test_frame(
+                &mut gallery,
+                &ctx,
+                &paths,
+                &config,
+                Vec::new(),
+                frame as f64 / 60.0,
+            );
+        }
+        let started = THUMB_DECODES.load(Ordering::Relaxed) - before;
+        // Une fenêtre 1600×900 montre une vingtaine de cartes : le reste des
+        // 300 photos ne doit pas être lu ni décodé.
+        assert!(started > 0, "les cartes visibles doivent se décoder");
+        assert!(
+            started <= 48,
+            "seules les cartes visibles se décodent (lancées : {started})"
+        );
+        let _ = std::fs::remove_dir_all(images.parent().unwrap());
+        let _ = std::fs::remove_dir_all(videos);
+    }
+
+    #[test]
+    fn scrolling_does_not_start_thumbnail_decodes() {
+        let _guard = capture_test_guard();
+        let (mut gallery, paths, config, images, videos) = test_gallery("scroll", 200);
+        let ctx = test_context();
+        // Un défilement vient d'avoir lieu : la vue n'est pas encore posée.
+        gallery.last_scroll = Some(Instant::now());
+        let before = THUMB_DECODES.load(Ordering::Relaxed);
+        test_frame(&mut gallery, &ctx, &paths, &config, Vec::new(), 0.0);
+        assert_eq!(gallery.entries.len(), 200, "la galerie lit bien le dossier");
+        assert_eq!(
+            THUMB_DECODES.load(Ordering::Relaxed),
+            before,
+            "aucun décodage ne doit partir pendant le défilement"
+        );
+        let _ = std::fs::remove_dir_all(images.parent().unwrap());
+        let _ = std::fs::remove_dir_all(videos);
+    }
+
+    #[test]
+    fn thumbnail_cache_evicts_only_the_least_recently_used() {
+        let mut gallery = Gallery::default();
+        for index in 0..(THUMBS_KEPT + 20) {
+            let path = PathBuf::from(format!("/tmp/lapinux-cache-{index}.png"));
+            let (_tx, rx) = mpsc::channel::<Thumb>();
+            gallery.thumbs.insert(path.clone(), ThumbEntry::Loading(rx));
+            gallery.touch_thumb(&path);
+        }
+        let oldest = PathBuf::from("/tmp/lapinux-cache-0.png");
+        let newest = PathBuf::from(format!("/tmp/lapinux-cache-{}.png", THUMBS_KEPT + 19));
+        gallery.trim_thumbs();
+        assert_eq!(gallery.thumbs.len(), THUMBS_KEPT);
+        assert!(!gallery.thumbs.contains_key(&oldest), "la plus ancienne part");
+        assert!(gallery.thumbs.contains_key(&newest), "la plus récente reste");
+    }
+
+    #[test]
+    fn a_brief_hover_does_not_extract_video_previews() {
+        let _guard = capture_test_guard();
+        let ctx = egui::Context::default();
+        let mut gallery = Gallery::default();
+        let capture = Capture {
+            path: PathBuf::from("/tmp/lapinux-brief-hover.mp4"),
+            media: Media::Video,
+            game: "Demo".into(),
+            appid: Some(440),
+            taken: 0,
+            size: 0,
+        };
+        let before = PREVIEW_DECODES.load(Ordering::Relaxed);
+        let previews = gallery.previews(&ctx, &capture);
+        assert!(previews.is_none());
+        assert_eq!(
+            PREVIEW_DECODES.load(Ordering::Relaxed),
+            before,
+            "un survol bref ne doit lancer aucun ffmpeg"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_card_opens_the_viewer() {
+        let _guard = capture_test_guard();
+        let (mut gallery, paths, config, images, videos) = test_gallery("click", 2);
+        let ctx = test_context();
+        let mut time = 0.0;
+        let centre = egui::pos2(140.0, 100.0);
+        test_frame(
+            &mut gallery,
+            &ctx,
+            &paths,
+            &config,
+            vec![egui::Event::PointerMoved(centre)],
+            time,
+        );
+        time += 1.0 / 60.0;
+        test_frame(
+            &mut gallery,
+            &ctx,
+            &paths,
+            &config,
+            vec![egui::Event::PointerButton {
+                pos: centre,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+            time,
+        );
+        time += 1.0 / 60.0;
+        test_frame(
+            &mut gallery,
+            &ctx,
+            &paths,
+            &config,
+            vec![egui::Event::PointerButton {
+                pos: centre,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            time,
+        );
+        assert!(
+            gallery.viewing.is_some(),
+            "un clic sur une carte doit toujours ouvrir la visionneuse"
+        );
+        let _ = std::fs::remove_dir_all(images.parent().unwrap());
+        let _ = std::fs::remove_dir_all(videos);
+    }
+
+    /// Banc de mesure de la section Captures : une bibliothèque synthétique
+    /// de 320 photos et 6 vidéos, rendue en continu à 60 i/s dans une fenêtre
+    /// 1600×900. Il relève le temps CPU par image au repos, en défilement et
+    /// au survol d'une vidéo, plus le nombre de décodages réellement lancés.
+    ///
+    /// Ignoré par défaut (il écrit des fichiers et lance ffmpeg) :
+    ///   cargo test -p lapinux-ui captures_cpu_benchmark -- --ignored --nocapture
+    #[test]
+    #[ignore = "banc de mesure : lancer explicitement avec --ignored"]
+    fn captures_cpu_benchmark() {
+        let _guard = capture_test_guard();
+        /// CPU du fil qui dessine la page : les décodages vivent dans leurs
+        /// propres fils, ils ne doivent pas gonfler la mesure du rendu.
+        fn cpu_ms() -> f64 {
+            let mut now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+            now.tv_sec as f64 * 1000.0 + now.tv_nsec as f64 / 1_000_000.0
+        }
+
+        fn synthetic_dir(name: &str) -> PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "lapinux-bench-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        fn make_images(dir: &Path, count: usize) {
+            let pixels = image::RgbaImage::from_pixel(96, 54, image::Rgba([30, 60, 90, 255]));
+            for index in 0..count {
+                let path = dir.join(format!(
+                    "lapinux-440-demo-{index}-{}.png",
+                    1_793_000_000 + index
+                ));
+                pixels.save(&path).unwrap();
+            }
+        }
+
+        /// Vidéos courtes réelles : le chemin de décodage (ffprobe, extraction
+        /// d'image, aperçus) est celui de la production.
+        fn make_videos(dir: &Path, count: usize) -> usize {
+            let Some(ffmpeg) = lapinux_core::paths::which("ffmpeg") else {
+                return 0;
+            };
+            let mut made = 0;
+            for index in 0..count {
+                let path = dir.join(format!(
+                    "lapinux-440-demo-video-{index}-{}.mp4",
+                    1_794_000_000 + index
+                ));
+                let status = std::process::Command::new(&ffmpeg)
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc2=size=160x90:rate=10:duration=2",
+                        "-pix_fmt",
+                        "yuv420p",
+                    ])
+                    .arg(&path)
+                    .status();
+                if status.map(|status| status.success()).unwrap_or(false) {
+                    made += 1;
+                }
+            }
+            made
+        }
+
+        let cache = synthetic_dir("cache");
+        // Les vignettes de vidéos et les aperçus vivent dans le cache : on
+        // les isole pour ne pas salir le cache réel de l'utilisateur.
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        let root = synthetic_dir("library");
+        let images_dir = root.join("images");
+        let videos_dir = root.join("videos");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        std::fs::create_dir_all(&videos_dir).unwrap();
+        make_images(&images_dir, 320);
+        let videos = make_videos(&videos_dir, 8);
+        for dir in [&images_dir, &videos_dir] {
+            std::fs::write(dir.join(lapinux_core::captures::MARKER), b"").unwrap();
+        }
+
+        let config = CaptureConfig {
+            video_dir: videos_dir.display().to_string(),
+            image_dir: images_dir.display().to_string(),
+            ..CaptureConfig::default()
+        };
+        let paths = LapinuxPaths::discover();
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        crate::apply_theme(&ctx);
+        crate::install_fonts(&ctx);
+
+        let mut gallery = Gallery::default();
+        let mut time = 0.0_f64;
+        let mut render = |gallery: &mut Gallery, events: Vec<egui::Event>, time: &mut f64| {
+            *time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                time: Some(*time),
+                events,
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        gallery.page(ui, &paths, &config, &[], None);
+                    });
+            });
+            // Une image toutes les ~16 ms : les fils de décodage ont le temps
+            // réel de travailler, comme dans l'application.
+            std::thread::sleep(Duration::from_millis(10));
+            out
+        };
+
+        // Préchauffe : polices, première relecture du dossier, premières
+        // vignettes visibles. Elle est hors mesure.
+        for _ in 0..20 {
+            render(&mut gallery, Vec::new(), &mut time);
+        }
+        let thumbs_before = THUMB_DECODES.load(Ordering::Relaxed);
+        let previews_before = PREVIEW_DECODES.load(Ordering::Relaxed);
+
+        fn phase(
+            name: &str,
+            frames: usize,
+            mut events: impl FnMut(usize) -> Vec<egui::Event>,
+            render: &mut impl FnMut(&mut Gallery, Vec<egui::Event>, &mut f64) -> egui::FullOutput,
+            gallery: &mut Gallery,
+            time: &mut f64,
+            thumbs: &mut usize,
+            previews: &mut usize,
+        ) {
+            let cpu_start = cpu_ms();
+            let wall_start = Instant::now();
+            let mut delay = Duration::from_secs(60);
+            for frame in 0..frames {
+                let out = render(gallery, events(frame), time);
+                if let Some(viewport) = out.viewport_output.get(&egui::ViewportId::ROOT) {
+                    delay = delay.min(viewport.repaint_delay);
+                }
+            }
+            let cpu = cpu_ms() - cpu_start;
+            let wall = wall_start.elapsed().as_secs_f64() * 1000.0;
+            let thumb_now = THUMB_DECODES.load(Ordering::Relaxed);
+            let preview_now = PREVIEW_DECODES.load(Ordering::Relaxed);
+            println!(
+                "BENCH {name:<7} images={frames:>3} cpu_ms/img={:>6.2} wall_ms/img={:>6.2} \
+                 cpu_60fps={:>5.1}% min_repaint={:>4}ms vignettes=+{} aperçus=+{}",
+                cpu / frames as f64,
+                wall / frames as f64,
+                cpu / frames as f64 / (1000.0 / 60.0) * 100.0,
+                delay.as_millis(),
+                thumb_now - *thumbs,
+                preview_now - *previews,
+            );
+            *thumbs = thumb_now;
+            *previews = preview_now;
+        }
+
+        let mut thumbs = thumbs_before;
+        let mut previews = previews_before;
+        phase(
+            "repos",
+            120,
+            |_| Vec::new(),
+            &mut render,
+            &mut gallery,
+            &mut time,
+            &mut thumbs,
+            &mut previews,
+        );
+        // Le pointeur entre dans la grille, puis la molette défile modérément
+        // (30 px par image, soit ~1800 px/s).
+        phase(
+            "défilement",
+            90,
+            |frame| {
+                if frame == 0 {
+                    return vec![egui::Event::PointerMoved(egui::pos2(800.0, 400.0))];
+                }
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -30.0),
+                    modifiers: egui::Modifiers::default(),
+                }]
+            },
+            &mut render,
+            &mut gallery,
+            &mut time,
+            &mut thumbs,
+            &mut previews,
+        );
+        // La molette s'arrête : les vignettes de la zone visible finissent de
+        // se décoder.
+        phase(
+            "arrêt",
+            45,
+            |_| Vec::new(),
+            &mut render,
+            &mut gallery,
+            &mut time,
+            &mut thumbs,
+            &mut previews,
+        );
+        // Remonte en haut.
+        for _ in 0..40 {
+            render(
+                &mut gallery,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 400.0),
+                    modifiers: egui::Modifiers::default(),
+                }],
+                &mut time,
+            );
+        }
+        // Survole longuement la première carte (une vidéo, la plus récente) :
+        // c'est le chemin des cinq aperçus ffmpeg.
+        phase(
+            "survol",
+            90,
+            |frame| {
+                if frame == 0 {
+                    vec![egui::Event::PointerMoved(egui::pos2(150.0, 100.0))]
+                } else {
+                    Vec::new()
+                }
+            },
+            &mut render,
+            &mut gallery,
+            &mut time,
+            &mut thumbs,
+            &mut previews,
+        );
+        // Balayage : la souris passe sur six cartes de la première rangée en
+        // 12 images chacune (200 ms). Aucun aperçu ne doit être lancé pour un
+        // survol aussi bref.
+        phase(
+            "balayage",
+            96,
+            |frame| {
+                let card = (frame / 12) % 6;
+                vec![egui::Event::PointerMoved(egui::pos2(
+                    30.0 + card as f32 * (CARD_W + 14.0) + CARD_W / 2.0,
+                    100.0,
+                ))]
+            },
+            &mut render,
+            &mut gallery,
+            &mut time,
+            &mut thumbs,
+            &mut previews,
+        );
+
+        let measured_entries = gallery.entries.len();
+
+        // Plancher : un panneau vide, même contexte, même cadence. Il dit
+        // quelle part du coût vient d'egui lui-même et non de la galerie.
+        let cpu_start = cpu_ms();
+        for _ in 0..60 {
+            time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |_| {});
+            });
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!(
+            "BENCH plancher images=  60 cpu_ms/img={:>6.2}",
+            (cpu_ms() - cpu_start) / 60.0
+        );
+
+        // Contrôle d'échelle : les mêmes 60 images avec seulement 40 cartes.
+        gallery.entries.truncate(40);
+        gallery.scanned = Some(Instant::now());
+        let cpu_start = cpu_ms();
+        for _ in 0..60 {
+            render(&mut gallery, Vec::new(), &mut time);
+        }
+        println!(
+            "BENCH 40-cartes images=  60 cpu_ms/img={:>6.2}",
+            (cpu_ms() - cpu_start) / 60.0
+        );
+
+        println!(
+            "BENCH entrées={measured_entries} photos=320 vidéos={videos} \
+             vignettes_total={} aperçus_total={}",
+            THUMB_DECODES.load(Ordering::Relaxed),
+            PREVIEW_DECODES.load(Ordering::Relaxed),
+        );
+        assert_eq!(measured_entries, 320 + videos);
+        assert!(
+            THUMB_DECODES.load(Ordering::Relaxed) <= 520,
+            "la galerie ne doit décoder que les cartes vues, jamais tout le dossier"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&cache);
     }
 }

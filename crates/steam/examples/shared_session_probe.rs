@@ -43,10 +43,7 @@ fn main() {
             info.account.badge_level,
             info.account.players_now
         );
-        println!(
-            "    {} contenu(s) additionnel(s) :",
-            info.update.dlc.len()
-        );
+        println!("    {} contenu(s) additionnel(s) :", info.update.dlc.len());
         for content in &info.update.dlc {
             println!(
                 "      {} · {} · {} · possédé {} · image «{}»",

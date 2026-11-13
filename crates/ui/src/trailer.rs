@@ -16,6 +16,14 @@ use std::time::{Duration, Instant};
 
 use crate::{TEXT, TEXT_DIM};
 
+/// Une vidéo de plateforme (YouTube, Vimeo) est une page web, pas un flux que
+/// GStreamer sait ouvrir directement. La fiche la confie à la fenêtre WebKit
+/// au lieu de lancer le lecteur intégré.
+pub(crate) fn is_web_page(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("youtube.com") || lower.contains("youtu.be") || lower.contains("vimeo.com")
+}
+
 /// L'hôte GStreamer, embarqué dans le binaire et écrit dans le cache.
 const HELPER: &str = include_str!("trailer_helper.py");
 /// Les commandes s'effacent après ce délai de lecture immobile.
@@ -203,29 +211,21 @@ impl Trailer {
         if closed {
             self.session = None;
             if self.error.is_none() {
-                self.error = Some("Le lecteur vidéo s'est arrêté.".into());
+                self.error = Some(lapinux_core::i18n::t("trailer.stopped").into());
             }
         }
-        let frame = self.session.as_ref().and_then(|session| {
-            session
-                .frame
-                .lock()
-                .ok()
-                .and_then(|mut slot| slot.take())
-        });
+        let frame = self
+            .session
+            .as_ref()
+            .and_then(|session| session.frame.lock().ok().and_then(|mut slot| slot.take()));
         if let Some(frame) = frame {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width, frame.height],
-                &frame.rgba,
-            );
+            let image =
+                egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
             match &mut self.texture {
                 Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
                 None => {
-                    self.texture = Some(ctx.load_texture(
-                        "trailer-frame",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ))
+                    self.texture =
+                        Some(ctx.load_texture("trailer-frame", image, egui::TextureOptions::LINEAR))
                 }
             }
             self.buffering = None;
@@ -272,23 +272,20 @@ impl Trailer {
         let pointer_moved = ctx.input(|input| {
             input.pointer.delta() != egui::Vec2::ZERO || input.pointer.any_pressed()
         });
-        let hover_chrome = pointer.is_some_and(|point| {
-            top_rect.contains(point) || controls_rect.contains(point)
-        });
+        let hover_chrome =
+            pointer.is_some_and(|point| top_rect.contains(point) || controls_rect.contains(point));
         if pointer_moved || hover_chrome {
             self.controls_at = Instant::now();
         }
-        let controls_visible = !self.playing
-            || self.controls_at.elapsed() < CONTROLS_TIMEOUT
-            || hover_chrome;
+        let controls_visible =
+            !self.playing || self.controls_at.elapsed() < CONTROLS_TIMEOUT || hover_chrome;
 
         let fresh_key = egui::Id::new(FRESH_ID);
         let fresh = ctx.memory(|memory| memory.data.get_temp::<bool>(fresh_key).is_none());
         ctx.memory_mut(|memory| memory.data.insert_temp(fresh_key, true));
 
-        let close = ctx.input_mut(|input| {
-            input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
-        });
+        let close =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let (space, left, right, mute_key) = ctx.input_mut(|input| {
             (
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Space),
@@ -308,7 +305,7 @@ impl Trailer {
         let muted = self.muted;
         let volume = self.volume;
         let name = if title.trim().is_empty() {
-            "Bande-annonce"
+            lapinux_core::i18n::t("trailer.title")
         } else {
             title.as_str()
         };
@@ -370,11 +367,7 @@ impl Trailer {
                     }
                 }
 
-                let video = ui.interact(
-                    rect,
-                    egui::Id::new("trailer-video"),
-                    egui::Sense::click(),
-                );
+                let video = ui.interact(rect, egui::Id::new("trailer-video"), egui::Sense::click());
                 let chrome_hit = controls_visible && hover_chrome;
                 if video.clicked() && !chrome_hit {
                     toggle = true;
@@ -402,13 +395,16 @@ impl Trailer {
                                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                                     ui.vertical_centered(|ui| {
                                         ui.add_space((rect.height() * 0.5 - 24.0).max(12.0));
-                                        ui.spinner();
+                                        crate::section_icons::loading(ui, 18.0);
                                         ui.add_space(8.0);
                                         let text = match buffering {
-                                            Some(percent) => {
-                                                format!("Mise en mémoire… {percent} %")
+                                            Some(percent) => lapinux_core::i18n::t_args(
+                                                "trailer.buffering",
+                                                &[("percent", &percent.to_string())],
+                                            ),
+                                            None => {
+                                                lapinux_core::i18n::t("trailer.loading").to_string()
                                             }
-                                            None => "Chargement de la bande-annonce…".to_string(),
                                         };
                                         ui.label(
                                             egui::RichText::new(text).size(11.0).color(TEXT_DIM()),
@@ -422,10 +418,12 @@ impl Trailer {
                                     ui.vertical_centered(|ui| {
                                         ui.add_space((rect.height() * 0.5 - 34.0).max(12.0));
                                         ui.label(
-                                            egui::RichText::new("Lecture impossible")
-                                                .size(16.0)
-                                                .strong()
-                                                .color(TEXT()),
+                                            egui::RichText::new(lapinux_core::i18n::t(
+                                                "ui.playback_failed",
+                                            ))
+                                            .size(16.0)
+                                            .strong()
+                                            .color(TEXT()),
                                         );
                                         ui.add_space(5.0);
                                         ui.add(
@@ -448,140 +446,125 @@ impl Trailer {
                                 ui.painter().circle_stroke(
                                     center,
                                     34.0,
-                                    egui::Stroke::new(
-                                        1.0_f32,
-                                        egui::Color32::from_white_alpha(35),
-                                    ),
+                                    egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)),
                                 );
                                 paint_play_pause(ui.painter(), center, false, 14.0);
                             }
 
                             if controls_visible {
-                                ui.scope_builder(
-                                    egui::UiBuilder::new().max_rect(top_rect),
-                                    |ui| {
-                                        ui.horizontal(|ui| {
-                                            let reserve = 52.0;
-                                            let title_width =
-                                                (ui.available_width() - reserve).max(120.0);
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(title_width, 52.0),
-                                                egui::Layout::top_down(egui::Align::Min),
-                                                |ui| {
-                                                    if !title.trim().is_empty() {
-                                                        ui.label(
-                                                            egui::RichText::new("BANDE-ANNONCE")
-                                                                .size(9.0)
-                                                                .strong()
-                                                                .color(TEXT_DIM()),
-                                                        );
-                                                        ui.add_space(2.0);
-                                                    }
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(name)
-                                                                .size(18.0)
-                                                                .strong()
-                                                                .color(TEXT()),
-                                                        )
-                                                        .truncate(),
+                                ui.scope_builder(egui::UiBuilder::new().max_rect(top_rect), |ui| {
+                                    ui.horizontal(|ui| {
+                                        let reserve = 52.0;
+                                        let title_width =
+                                            (ui.available_width() - reserve).max(120.0);
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(title_width, 52.0),
+                                            egui::Layout::top_down(egui::Align::Min),
+                                            |ui| {
+                                                if !title.trim().is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new(lapinux_core::i18n::t(
+                                                            "ui.trailer",
+                                                        ))
+                                                        .size(9.0)
+                                                        .strong()
+                                                        .color(TEXT_DIM()),
                                                     );
-                                                },
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(
-                                                    egui::Align::Center,
-                                                ),
-                                                |ui| {
-                                                    if round_button(
-                                                        ui,
-                                                        30.0,
-                                                        "Fermer (Échap)",
-                                                        |painter, center| {
-                                                            paint_close(painter, center, 8.0);
-                                                        },
-                                                    ) {
-                                                        close_from_ui = true;
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    },
-                                );
-
-                                ui.scope_builder(
-                                    egui::UiBuilder::new().max_rect(bar),
-                                    |ui| {
-                                        ui.set_width(bar.width());
-                                        let (preview, wanted) = timeline(
-                                            ui,
-                                            if duration > 0.0 {
-                                                (position / duration).clamp(0.0, 1.0) as f32
-                                            } else {
-                                                0.0
+                                                    ui.add_space(2.0);
+                                                }
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(name)
+                                                            .size(18.0)
+                                                            .strong()
+                                                            .color(TEXT()),
+                                                    )
+                                                    .truncate(),
+                                                );
                                             },
-                                            next_seek_preview.map(|value| value as f32),
-                                            duration,
                                         );
-                                        next_seek_preview = preview.map(f64::from);
-                                        if let Some(value) = wanted {
-                                            seek = Some(f64::from(value));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if round_button(
+                                                    ui,
+                                                    30.0,
+                                                    lapinux_core::i18n::t("game_sheet.close"),
+                                                    |painter, center| {
+                                                        paint_close(painter, center, 8.0);
+                                                    },
+                                                ) {
+                                                    close_from_ui = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+
+                                ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+                                    ui.set_width(bar.width());
+                                    let (preview, wanted) = timeline(
+                                        ui,
+                                        if duration > 0.0 {
+                                            (position / duration).clamp(0.0, 1.0) as f32
+                                        } else {
+                                            0.0
+                                        },
+                                        next_seek_preview.map(|value| value as f32),
+                                        duration,
+                                    );
+                                    next_seek_preview = preview.map(f64::from);
+                                    if let Some(value) = wanted {
+                                        seek = Some(f64::from(value));
+                                    }
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        if round_button(
+                                            ui,
+                                            30.0,
+                                            if playing {
+                                                "Pause"
+                                            } else {
+                                                lapinux_core::i18n::t("ui.play")
+                                            },
+                                            |painter, center| {
+                                                paint_play_pause(painter, center, playing, 10.0);
+                                            },
+                                        ) {
+                                            toggle = true;
                                         }
+                                        let shown = next_seek_preview.unwrap_or(position);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}  /  {}",
+                                                clock(shown),
+                                                clock(duration)
+                                            ))
+                                            .size(11.0)
+                                            .color(TEXT_DIM()),
+                                        );
                                         ui.add_space(4.0);
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 8.0;
-                                            if round_button(
-                                                ui,
-                                                30.0,
-                                                if playing { "Pause" } else { "Lecture" },
-                                                |painter, center| {
-                                                    paint_play_pause(
-                                                        painter, center, playing, 10.0,
-                                                    );
-                                                },
-                                            ) {
-                                                toggle = true;
-                                            }
-                                            let shown =
-                                                next_seek_preview.unwrap_or(position);
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{}  /  {}",
-                                                    clock(shown),
-                                                    clock(duration)
-                                                ))
-                                                .size(11.0)
-                                                .color(TEXT_DIM()),
-                                            );
-                                            ui.add_space(4.0);
-                                            if round_button(
-                                                ui,
-                                                28.0,
-                                                if next_muted {
-                                                    "Rétablir le son"
-                                                } else {
-                                                    "Couper le son"
-                                                },
-                                                |painter, center| {
-                                                    paint_speaker(
-                                                        painter,
-                                                        center,
-                                                        next_muted,
-                                                        10.0,
-                                                    );
-                                                },
-                                            ) {
-                                                next_muted = !next_muted;
-                                            }
-                                            if let Some(value) =
-                                                volume_bar(ui, volume, next_muted)
-                                            {
-                                                next_volume = Some(value);
-                                                next_muted = false;
-                                            }
-                                        });
-                                    },
-                                );
+                                        if round_button(
+                                            ui,
+                                            28.0,
+                                            if next_muted {
+                                                lapinux_core::i18n::t("trailer.unmute")
+                                            } else {
+                                                lapinux_core::i18n::t("ui.mute")
+                                            },
+                                            |painter, center| {
+                                                paint_speaker(painter, center, next_muted, 10.0);
+                                            },
+                                        ) {
+                                            next_muted = !next_muted;
+                                        }
+                                        if let Some(value) = volume_bar(ui, volume, next_muted) {
+                                            next_volume = Some(value);
+                                            next_muted = false;
+                                        }
+                                    });
+                                });
                             }
                         });
                 });
@@ -700,11 +683,17 @@ fn paint_play_pause(painter: &egui::Painter, center: egui::Pos2, playing: bool, 
 fn paint_close(painter: &egui::Painter, center: egui::Pos2, size: f32) {
     let stroke = egui::Stroke::new(1.6_f32, TEXT());
     painter.line_segment(
-        [center + egui::vec2(-size, -size), center + egui::vec2(size, size)],
+        [
+            center + egui::vec2(-size, -size),
+            center + egui::vec2(size, size),
+        ],
         stroke,
     );
     painter.line_segment(
-        [center + egui::vec2(size, -size), center + egui::vec2(-size, size)],
+        [
+            center + egui::vec2(size, -size),
+            center + egui::vec2(-size, size),
+        ],
         stroke,
     );
 }
@@ -848,11 +837,7 @@ fn clock(seconds: f64) -> String {
     }
 }
 
-fn spawn(
-    paths: &LapinuxPaths,
-    ctx: &egui::Context,
-    url: &str,
-) -> Result<Session, String> {
+fn spawn(paths: &LapinuxPaths, ctx: &egui::Context, url: &str) -> Result<Session, String> {
     let dir = paths.run_dir.join("trailer");
     std::fs::create_dir_all(&dir).unwrap_or(());
     let script = dir.join("player.py");
@@ -860,8 +845,9 @@ fn spawn(
         script
     } else {
         let fallback = std::env::temp_dir().join("lapinux-trailer.py");
-        std::fs::write(&fallback, HELPER)
-            .map_err(|error| format!("lecteur vidéo non installable ({error})"))?;
+        std::fs::write(&fallback, HELPER).map_err(|error| {
+            lapinux_core::i18n::t_args("trailer.not_installable", &[("error", &error.to_string())])
+        })?;
         fallback
     };
 
@@ -875,11 +861,11 @@ fn spawn(
         .map_err(|error| format!("python3 introuvable ({error})"))?;
     let Some(stdin) = child.stdin.take() else {
         let _ = child.kill();
-        return Err("entrée du lecteur indisponible".into());
+        return Err(lapinux_core::i18n::t("trailer.input_unavailable").into());
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
-        return Err("sortie du lecteur indisponible".into());
+        return Err(lapinux_core::i18n::t("trailer.player_unavailable").into());
     };
 
     let (tx, rx) = mpsc::channel();
@@ -920,7 +906,9 @@ fn spawn(
                 }
                 if width > 0
                     && height > 0
-                    && width.checked_mul(height).and_then(|size| size.checked_mul(4))
+                    && width
+                        .checked_mul(height)
+                        .and_then(|size| size.checked_mul(4))
                         == Some(length)
                 {
                     if let Ok(mut slot) = frame_slot.lock() {
@@ -994,10 +982,7 @@ mod tests {
 
     #[test]
     fn the_cinema_takes_the_area_it_is_given() {
-        let screen = egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(1360.0, 860.0),
-        );
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1360.0, 860.0));
         assert_eq!(viewer_rect(screen), screen);
     }
 
@@ -1013,10 +998,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::apply_theme(&ctx);
         crate::install_fonts(&ctx);
-        let screen = egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(1360.0, 860.0),
-        );
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1360.0, 860.0));
         let mut trailer = Trailer::default();
         trailer.visible = true;
         trailer.title = "007 First Light".into();
@@ -1046,9 +1028,9 @@ mod tests {
             }
         }
         for expected in [
-            "BANDE-ANNONCE",
+            lapinux_core::i18n::t("ui.trailer"),
             "007 First Light",
-            "Chargement de la bande-annonce…",
+            lapinux_core::i18n::t("trailer.loading"),
             "0:00  /  0:00",
         ] {
             assert!(

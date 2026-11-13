@@ -17,8 +17,11 @@ pub mod cloud;
 pub mod common;
 pub mod epic;
 pub mod epic_manifest;
+pub mod freebies;
+pub mod friends;
 pub mod gog;
 pub mod itch;
+pub mod notifications;
 
 pub use achievements::Achievement;
 pub use cloud::RemoteFile;
@@ -45,13 +48,25 @@ pub fn login_link(store: Store) -> Result<LoginLink> {
 
 /// Jeux gratuits publiés par les boutiques : les offres PC en cours et celles
 /// annoncées, puis les offres mobiles Android et iOS, que le flux PC ne
-/// publie pas. GOG et itch n'en publient pas d'équivalentes.
+/// publie pas. Steam, GOG et itch.io passent par le flux des offres à
+/// conserver : les free-to-play et les free weekends n'y entrent pas.
 pub fn free_games(locale: &str) -> Result<Vec<FreeGame>> {
-    let mut games = epic::free_games(locale)?;
+    let mut errors = Vec::new();
+    let mut games = match epic::free_games(locale) {
+        Ok(games) => games,
+        Err(error) => {
+            errors.push(format!("Epic Games : {error}"));
+            Vec::new()
+        }
+    };
     // Une offre mobile peut disparaître sans que la page PC échoue : la liste
     // PC reste alors complète, et c'est le seul effet d'une panne mobile.
     if let Ok(mobile) = epic::mobile_free_games(locale) {
         games.extend(mobile);
+    }
+    match freebies::free_games(locale) {
+        Ok(offers) => games.extend(offers),
+        Err(error) => errors.push(error.to_string()),
     }
     // Les offres de la semaine d'abord, celles sans échéance connue ensuite,
     // puis par date de fin et par titre.
@@ -62,6 +77,9 @@ pub fn free_games(locale: &str) -> Result<Vec<FreeGame>> {
             .then(left.end.cmp(&right.end))
             .then(left.title.cmp(&right.title))
     });
+    if games.is_empty() && !errors.is_empty() {
+        return Err(Error::Other(errors.join(" · ")));
+    }
     Ok(games)
 }
 
@@ -119,7 +137,9 @@ pub fn login_code(store: Store, code: &str) -> Result<StoreTokens> {
     match store {
         Store::Epic => epic::login_with_code(code),
         Store::Gog => gog::login_with_code(code),
-        _ => Err(Error::Unavailable("cette boutique ne se connecte pas par code")),
+        _ => Err(Error::Unavailable(
+            "cette boutique ne se connecte pas par code",
+        )),
     }
 }
 
@@ -127,7 +147,9 @@ pub fn login_code(store: Store, code: &str) -> Result<StoreTokens> {
 pub fn login_key(store: Store, key: &str) -> Result<StoreTokens> {
     match store {
         Store::Itch => itch::login_with_key(key),
-        _ => Err(Error::Unavailable("cette boutique ne se connecte pas par clé")),
+        _ => Err(Error::Unavailable(
+            "cette boutique ne se connecte pas par clé",
+        )),
     }
 }
 
@@ -300,6 +322,24 @@ pub fn cloud_list(
     }
 }
 
+/// Lit les octets distants sans toucher aux sauvegardes du jeu.
+pub fn cloud_read(
+    store: Store,
+    tokens: &StoreTokens,
+    store_id: &str,
+    platform: &str,
+    dir_name: &str,
+    file: &RemoteFile,
+) -> Result<Vec<u8>> {
+    let tokens = valid_tokens(store, tokens)?;
+    match store {
+        Store::Epic => epic::cloud_read(&tokens, store_id, file),
+        Store::Gog => gog::cloud_read(&tokens, store_id, platform, dir_name, file),
+        Store::Itch => Err(Error::Unavailable("itch.io n'a pas de sauvegardes cloud")),
+        Store::Steam => Err(Error::Unavailable("Steam a son propre cloud")),
+    }
+}
+
 /// Télécharge un fichier de sauvegarde vers `dest`.
 pub fn cloud_download(
     store: Store,
@@ -333,7 +373,9 @@ pub fn cloud_upload(
     let tokens = valid_tokens(store, tokens)?;
     match store {
         Store::Epic => epic::cloud_upload(&tokens, store_id, file, body),
-        Store::Gog => gog::cloud_upload(&tokens, store_id, platform, dir_name, file, body, modified),
+        Store::Gog => {
+            gog::cloud_upload(&tokens, store_id, platform, dir_name, file, body, modified)
+        }
         Store::Itch => Err(Error::Unavailable("itch.io n'a pas de sauvegardes cloud")),
         Store::Steam => Err(Error::Unavailable("Steam a son propre cloud")),
     }
@@ -366,7 +408,7 @@ mod session_tests {
     fn tokens(access: &str, refresh: &str, expires_at: i64) -> StoreTokens {
         StoreTokens {
             store: Store::Epic,
-            account: "Nathounette".into(),
+            account: "JoueurExemple".into(),
             access_token: access.into(),
             refresh_token: refresh.into(),
             expires_at,
@@ -387,11 +429,7 @@ mod session_tests {
     #[test]
     fn a_token_renewed_by_another_read_is_reused() {
         let dir = tempfile::tempdir().unwrap();
-        let fresh = tokens(
-            "new",
-            "new-refresh",
-            lapinux_core::util::now_unix() + 3_600,
-        );
+        let fresh = tokens("new", "new-refresh", lapinux_core::util::now_unix() + 3_600);
         save_tokens(dir.path(), &fresh).unwrap();
         let stale = tokens("old", "old-refresh", 0);
         let kept = valid_tokens_saved(dir.path(), Store::Epic, &stale).unwrap();

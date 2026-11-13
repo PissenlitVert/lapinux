@@ -16,19 +16,13 @@ pub const KEY_BACKSPACE: u32 = 0xff08;
 struct Functions {
     context_new: unsafe extern "C" fn(u32) -> *mut c_void,
     context_unref: unsafe extern "C" fn(*mut c_void),
-    keymap_new_from_string: unsafe extern "C" fn(
-        *mut c_void,
-        *const c_char,
-        u32,
-        u32,
-    ) -> *mut c_void,
+    keymap_new_from_string:
+        unsafe extern "C" fn(*mut c_void, *const c_char, u32, u32) -> *mut c_void,
     keymap_unref: unsafe extern "C" fn(*mut c_void),
     state_new: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     state_unref: unsafe extern "C" fn(*mut c_void),
-    state_update_mask:
-        unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, u32) -> c_int,
-    state_key_get_utf8:
-        unsafe extern "C" fn(*mut c_void, u32, *mut c_char, usize) -> c_int,
+    state_update_mask: unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, u32) -> c_int,
+    state_key_get_utf8: unsafe extern "C" fn(*mut c_void, u32, *mut c_char, usize) -> c_int,
     state_key_get_one_sym: unsafe extern "C" fn(*mut c_void, u32) -> u32,
 }
 
@@ -114,9 +108,7 @@ impl Xkb {
     /// `Modifiers`, pour que Maj et AltGr produisent les bons caractères.
     pub fn update_mask(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
         unsafe {
-            (self.functions.state_update_mask)(
-                self.state, depressed, latched, locked, 0, 0, group,
-            );
+            (self.functions.state_update_mask)(self.state, depressed, latched, locked, 0, 0, group);
         }
     }
 
@@ -157,16 +149,55 @@ impl Drop for Xkb {
 /// sur une disposition QWERTY. La disposition française demande xkbcommon.
 pub fn fallback_text(keycode: u32) -> Option<char> {
     let ch = match keycode {
-        2 => '1', 3 => '2', 4 => '3', 5 => '4', 6 => '5',
-        7 => '6', 8 => '7', 9 => '8', 10 => '9', 11 => '0',
-        12 => '-', 13 => '=', 16 => 'q', 17 => 'w', 18 => 'e',
-        19 => 'r', 20 => 't', 21 => 'y', 22 => 'u', 23 => 'i',
-        24 => 'o', 25 => 'p', 26 => '[', 27 => ']', 30 => 'a',
-        31 => 's', 32 => 'd', 33 => 'f', 34 => 'g', 35 => 'h',
-        36 => 'j', 37 => 'k', 38 => 'l', 39 => ';', 40 => '\'',
-        41 => '`', 43 => '\\', 44 => 'z', 45 => 'x', 46 => 'c',
-        47 => 'v', 48 => 'b', 49 => 'n', 50 => 'm', 51 => ',',
-        52 => '.', 53 => '/', 57 => ' ', 86 => '<',
+        2 => '1',
+        3 => '2',
+        4 => '3',
+        5 => '4',
+        6 => '5',
+        7 => '6',
+        8 => '7',
+        9 => '8',
+        10 => '9',
+        11 => '0',
+        12 => '-',
+        13 => '=',
+        16 => 'q',
+        17 => 'w',
+        18 => 'e',
+        19 => 'r',
+        20 => 't',
+        21 => 'y',
+        22 => 'u',
+        23 => 'i',
+        24 => 'o',
+        25 => 'p',
+        26 => '[',
+        27 => ']',
+        30 => 'a',
+        31 => 's',
+        32 => 'd',
+        33 => 'f',
+        34 => 'g',
+        35 => 'h',
+        36 => 'j',
+        37 => 'k',
+        38 => 'l',
+        39 => ';',
+        40 => '\'',
+        41 => '`',
+        43 => '\\',
+        44 => 'z',
+        45 => 'x',
+        46 => 'c',
+        47 => 'v',
+        48 => 'b',
+        49 => 'n',
+        50 => 'm',
+        51 => ',',
+        52 => '.',
+        53 => '/',
+        57 => ' ',
+        86 => '<',
         _ => return None,
     };
     Some(ch)

@@ -94,9 +94,8 @@ Store identifiers are the most reliable for non-Steam games.
 ├── schema/
 │   ├── configuration.schema.json
 │   └── catalog.schema.json
-├── tools/
-│   └── catalog.py                   # validator and catalog builder
-└── .github/workflows/validate.yml
+└── tools/
+    └── catalog.py                   # validator and catalog builder
 ```
 
 `configurations/<game-slug>/<variant-slug>/` is the **base folder** of an
@@ -157,7 +156,7 @@ validator; the JSON Schema in [`schema/`](schema) documents types and limits.
 | `solution` | yes | What the configuration changes, and why. |
 | `type` | yes | `graphics`, `performance`, `display`, `language`, `compatibility`, `input` or `content`. |
 | `platform` | yes | `windows` (Proton), `linux` (native) or `both`. |
-| `layers` | no | `dxvk`, `vkd3d`, `wine`, `proton`, `gamescope`, `mangohud`, `game`. Informational. |
+| `layers` | no | `dxvk`, `vkd3d`, `wine`, `proton`, `gamescope`, `game`. Informational. |
 | `language` | no | ISO code for a translation (`fr`, `pt-BR`). |
 | `author` | yes | `{ "name": "...", "github": "..." }`. The GitHub handle becomes a link in the app. |
 | `version` | yes | Semantic version. Bump it on **every** content change. |
@@ -372,9 +371,10 @@ required fields, enums, identifiers, versions, paths, file existence, SHA-256
 digests, sizes, duplicate ids and `requires`/`conflicts` self-references. It
 also validates `examples/`, without publishing them.
 
-CI runs the same check on every push and pull request
-([`.github/workflows/validate.yml`](.github/workflows/validate.yml)). A pull
-request that forgets to regenerate `catalog.json` fails.
+The catalog repository runs the same check on every push and pull request. A
+pull request that forgets to regenerate `catalog.json` fails. The entry folders
+live in that repository: the Lapinux tree only ships the schema, the validator,
+the example and the embedded `catalog.json`.
 
 The Lapinux binary embeds its own copy of `catalog.json` at build time; the
 network catalog replaces it at runtime, entry by entry. A published entry with

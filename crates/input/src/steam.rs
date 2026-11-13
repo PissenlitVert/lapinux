@@ -45,7 +45,7 @@ pub struct SteamPads {
 
 /// Vrai pour les quatre identifiants de la Steam Controller 2026.
 pub fn is_steam_2026(device: &DeviceInfo) -> bool {
-    device.vendor == 0x28de && matches!(device.product, 0x1302..=0x1305)
+    lapinux_core::model::is_steam_controller_2026(device.vendor, device.product)
 }
 
 /// Décode un rapport d'entrée Triton (`0x42` ou `0x45`).
@@ -286,8 +286,7 @@ fn raw_path(device: &DeviceInfo) -> Result<PathBuf> {
             continue;
         };
         if hid_phys == Some(phys)
-            && vendor == 0x28de
-            && matches!(product, 0x1302..=0x1305)
+            && lapinux_core::model::is_steam_controller_2026(vendor as u16, product as u16)
         {
             return Ok(PathBuf::from("/dev").join(entry.file_name()));
         }

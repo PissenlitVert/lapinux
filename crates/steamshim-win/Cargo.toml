@@ -1,0 +1,13 @@
+[package]
+name = "lapinux-steamshim-win"
+version = "0.1.0"
+edition = "2021"
+description = "Pont steam_api64.dll : capture les succes accordes par le jeu et les depose dans une file lue par le daemon Lapinux."
+
+[lib]
+name = "steam_api64"
+crate-type = ["cdylib", "rlib"]
+
+# Crate autonome : ne depend d'aucune bibliotheque Linux et se compile pour
+# x86_64-pc-windows-gnu sans mingw installe sur l'hote (conteneur podman).
+[workspace]

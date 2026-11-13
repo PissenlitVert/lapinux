@@ -35,6 +35,10 @@ const PING_APP: u32 = 220;
 /// pause au lieu de rouvrir une session à chaque requête.
 const RATE_LIMIT_HOLD: Duration = Duration::from_secs(30 * 60);
 
+/// Pause après un jeton refusé (EResult 5) : le jeton reste bon, mais Steam
+/// pénalise les logons répétés. Relancer tout de suite prolonge le refus.
+const TOKEN_REFUSED_HOLD: Duration = Duration::from_secs(90);
+
 /// Compte actuellement bloqué par Steam, avec la fin de la pause.
 struct RateLimited {
     account: String,
@@ -62,10 +66,14 @@ fn rate_limit_wait(account: &str) -> Option<u64> {
 }
 
 fn remember_rate_limit(account: &str) {
+    remember_hold(account, RATE_LIMIT_HOLD);
+}
+
+fn remember_hold(account: &str, hold: Duration) {
     if let Ok(mut slot) = rate_limit().lock() {
         *slot = Some(RateLimited {
             account: account.to_string(),
-            until: Instant::now() + RATE_LIMIT_HOLD,
+            until: Instant::now() + hold,
         });
     }
 }
@@ -156,10 +164,95 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     engine().block_on(future)
 }
 
+/// Inactivité au-delà de laquelle la session sociale peut reprendre la main.
+///
+/// Steam ne garde qu'une session par compte : une connexion ouverte pendant
+/// qu'une lecture travaille ferme celle de la lecture (et réciproquement), ce
+/// qui faisait échouer les copies de sauvegarde en pleine opération. Le pool
+/// annonce donc son usage, et la session sociale attend qu'il soit retombé.
+const POOL_IDLE: Duration = Duration::from_secs(60);
+
+/// Temps laissé à la session sociale pour rendre la main après une réclamation.
+const SESSION_HANDOFF: Duration = Duration::from_secs(3);
+
+/// Durée pendant laquelle une réclamation reste valable si le pool échoue.
+const WANT_WINDOW: Duration = Duration::from_secs(30);
+
+fn last_use() -> &'static std::sync::Mutex<Option<Instant>> {
+    static LAST: OnceLock<std::sync::Mutex<Option<Instant>>> = OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn touch() {
+    if let Ok(mut slot) = last_use().lock() {
+        *slot = Some(Instant::now());
+    }
+}
+
+/// Note un jeton refusé venu d'un autre client (la session sociale) : la pause
+/// s'applique alors à toutes les lectures.
+pub fn note_logon_refused(account: &str) {
+    remember_hold(account, TOKEN_REFUSED_HOLD);
+}
+
+/// Secondes de pause restantes pour ce compte, s'il est en pénalité. La
+/// session sociale s'y plie aussi : un logon de plus la prolongerait.
+pub fn logon_hold_seconds(account: &str) -> Option<u64> {
+    rate_limit_wait(account)
+}
+
+/// Le pool a-t-il lu quelque chose récemment ? La session sociale ne se
+/// connecte que lorsque la réponse est non : ouvrir une connexion maintenant
+/// fermerait celle d'une lecture en cours.
+/// Réclamation de la session unique par le pool, avec son échéance.
+fn wanted() -> &'static std::sync::Mutex<Option<Instant>> {
+    static WANTED: OnceLock<std::sync::Mutex<Option<Instant>>> = OnceLock::new();
+    WANTED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn claim_session() {
+    if let Ok(mut slot) = wanted().lock() {
+        *slot = Some(Instant::now() + WANT_WINDOW);
+    }
+}
+
+fn session_claimed() {
+    if let Ok(mut slot) = wanted().lock() {
+        *slot = None;
+    }
+}
+
+/// Le pool réclame-t-il la session ? La session sociale la rend alors d'elle-même
+/// au lieu d'attendre une coupure : Steam refuse sinon son logon
+/// (`mot de passe invalide`) tant qu'une autre session tient le compte.
+pub fn pool_wants_session() -> bool {
+    wanted()
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map(|until| Instant::now() < until)
+        .unwrap_or(false)
+}
+
+pub fn pool_busy() -> bool {
+    last_use()
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map(|at| at.elapsed() < POOL_IDLE)
+        .unwrap_or(false)
+}
+
 /// Session empruntée : elle tient le verrou du pool jusqu'à sa libération.
 pub struct Session {
     client: Arc<SteamClient<LoggedIn>>,
     _guard: OwnedMutexGuard<Option<Cached>>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        touch();
+    }
 }
 
 impl Deref for Session {
@@ -181,6 +274,7 @@ pub async fn session(account: &str, refresh_token: &str) -> Result<Session> {
             "Steam limite les tentatives pour ce compte ; nouvel essai dans {seconds} s"
         )));
     }
+    touch();
     let key = format!("{account}\u{0}{refresh_token}");
     let mut slot = Arc::clone(pool()).lock_owned().await;
     if install_in_progress() {
@@ -209,10 +303,29 @@ pub async fn session(account: &str, refresh_token: &str) -> Result<Session> {
                 Err(error) => {
                     if error.is_rate_limited() {
                         remember_rate_limit(account);
+                        return Err(error);
                     }
-                    return Err(error);
+                    if !error.is_token_refused() {
+                        return Err(error);
+                    }
+                    // Une seule session par compte : la présence sociale la
+                    // tient peut-être encore. On la réclame, on la laisse se
+                    // rendre, puis on retente une fois.
+                    claim_session();
+                    tokio::time::sleep(SESSION_HANDOFF).await;
+                    match crate::native::login(account, refresh_token).await {
+                        Ok(client) => client,
+                        Err(again) => {
+                            // Refus persistant : pénalité de Steam. Chaque
+                            // tentative de plus la prolonge, on laisse passer.
+                            remember_hold(account, TOKEN_REFUSED_HOLD);
+                            session_claimed();
+                            return Err(again);
+                        }
+                    }
                 }
             };
+            session_claimed();
             clear_rate_limit(account);
             let opened = Arc::new(logged);
             *slot = Some(Cached {
@@ -233,7 +346,10 @@ pub async fn session(account: &str, refresh_token: &str) -> Result<Session> {
 /// logon, et c'est le seul moyen de savoir sans attendre l'échec d'une vraie
 /// lecture.
 async fn alive(client: &SteamClient<LoggedIn>) -> bool {
-    client.pics_get_access_tokens(&[AppId(PING_APP)]).await.is_ok()
+    client
+        .pics_get_access_tokens(&[AppId(PING_APP)])
+        .await
+        .is_ok()
 }
 
 /// Vérifie le jeton sans ouvrir de connexion de plus : la session partagée est
@@ -249,4 +365,19 @@ pub fn verify_blocking(account: &str, refresh_token: &str) -> Result<()> {
 pub async fn forget() {
     let mut slot = Arc::clone(pool()).lock_owned().await;
     *slot = None;
+}
+
+/// Rend la seule session Steam à la session sociale.
+///
+/// Steam n'en autorise qu'une par compte : garder la connexion du pool ouverte
+/// alors qu'il ne lit plus empêche la présence de se reconnecter (`session
+/// fermée par Steam`, puis des trames illisibles). Fermer la connexion oisive
+/// laisse donc la place libre ; le pool en rouvrira une à sa prochaine lecture.
+/// Rend `false` si une lecture est en cours ou vient d'avoir lieu.
+pub async fn release_if_idle() -> bool {
+    if pool_busy() {
+        return false;
+    }
+    forget().await;
+    true
 }

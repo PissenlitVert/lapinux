@@ -24,5 +24,8 @@ fn main() {
         Err(error) => println!("fin : {error}"),
     }
     let distinct = seen.iter().collect::<std::collections::HashSet<_>>().len();
-    println!("{} défi(s) publié(s), {distinct} URL(s) distincte(s)", seen.len());
+    println!(
+        "{} défi(s) publié(s), {distinct} URL(s) distincte(s)",
+        seen.len()
+    );
 }

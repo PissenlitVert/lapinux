@@ -2,7 +2,6 @@
 
 use crate::caps::PerfCaps;
 use crate::gamescope::{self, GamescopeSettings};
-use crate::mangohud::{self, HudSettings};
 use crate::{Error, Result};
 use lapinux_proton::LaunchPlan as Plan;
 use std::path::PathBuf;
@@ -12,10 +11,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerfConfig {
     pub gamescope: GamescopeSettings,
-    pub hud: HudSettings,
-    /// Charge MangoHud dans le jeu. Le mode performance le laisse à `false` :
-    /// aucune couche HUD n'est alors injectée, même masquée.
-    pub inject_mangohud: bool,
+    /// Variables propres au jeu, placées après la scène et le compositeur.
+    /// None supprime une variable héritée avant le lancement.
+    pub game_env: Vec<(String, Option<String>)>,
     /// Enveloppe le jeu dans `lapinux scene` lorsque GameScope est utilisé.
     pub scene: bool,
     /// Nom affiché par la scène de lancement et de fin.
@@ -31,8 +29,7 @@ impl Default for PerfConfig {
     fn default() -> Self {
         Self {
             gamescope: GamescopeSettings::default(),
-            hud: HudSettings::default(),
-            inject_mangohud: true,
+            game_env: Vec::new(),
             scene: false,
             scene_name: String::new(),
             scene_cover: None,
@@ -45,15 +42,21 @@ pub struct PreparedLaunch {
     pub command: Command,
     pub log_path: PathBuf,
     pub gamescope: bool,
-    pub mangohud: bool,
     /// La commande passe par `lapinux scene` dans GameScope.
     pub scene: bool,
     /// Fichier que la scène pose dès que le jeu est terminé. Il permet au
     /// daemon de couper la capture et le HUD avant les quatre secondes de
     /// l'écran de fin.
     pub scene_exit_path: Option<PathBuf>,
+    /// Fichier que le daemon pose à la première image du jeu : la scène s'en
+    /// sert pour s'effacer derrière le jeu au lieu de le masquer.
+    pub scene_start_path: Option<PathBuf>,
     /// Tube des statistiques gamescope : il porte la cadence réelle du jeu.
     pub stats_path: Option<PathBuf>,
+    /// Motif pour lequel GameScope a été écarté (absent, trop ancien, option
+    /// inconnue). Le lancement direct a alors lieu, sans HUD ni scène :
+    /// l'interface peut le dire au joueur au lieu de le laisser deviner.
+    pub gamescope_warning: Option<String>,
 }
 
 pub struct Session {
@@ -70,6 +73,8 @@ pub struct Session {
     pub stats_path: Option<PathBuf>,
     /// Fichier de fin déposé par la scène, quand elle est utilisée.
     pub scene_exit_path: Option<PathBuf>,
+    /// Fichier de première image, déposé par le daemon pour la scène.
+    pub scene_start_path: Option<PathBuf>,
     pub started: Instant,
     child: std::process::Child,
 }
@@ -84,30 +89,66 @@ pub fn prepare(
     appid: u32,
     config: &PerfConfig,
     caps: &PerfCaps,
-    config_dir: &std::path::Path,
+    _config_dir: &std::path::Path,
     log_dir: &std::path::Path,
 ) -> Result<PreparedLaunch> {
-    let mut env = plan.env.clone();
+    let env = plan.env.clone();
     let mut program = plan.program.clone();
     let mut args = plan.args.clone();
     let mut use_gamescope = false;
-    let mut use_mangohud = false;
     let mut use_scene = false;
     let mut scene_exit_path: Option<PathBuf> = None;
+    let mut scene_start_path: Option<PathBuf> = None;
     let mut stats_path: Option<PathBuf> = None;
 
-    let gamescope_available = caps.gamescope.clone();
-    let hud_available = caps.mangohud.is_some();
+    if !config.game_env.is_empty() {
+        // `env` est lui-même exécuté comme enfant de la scène / GameScope :
+        // les couches restent absentes de ces processus parents.
+        let env_bin = lapinux_core::paths::which("env")
+            .ok_or_else(|| Error::Other("env executable not found".into()))?;
+        let mut wrapped = Vec::new();
+        for (key, value) in &config.game_env {
+            match value {
+                Some(_) => {}
+                None => {
+                    wrapped.push("-u".to_string());
+                    wrapped.push(key.clone());
+                }
+            }
+        }
+        wrapped.push("--".to_string());
+        for (key, value) in &config.game_env {
+            if let Some(value) = value {
+                wrapped.push(format!("{key}={value}"));
+            }
+        }
+        wrapped.push(program.to_string_lossy().to_string());
+        wrapped.extend(args);
+        args = wrapped;
+        program = env_bin;
+    }
 
+    let gamescope_available = caps.gamescope.clone();
+    let mut gamescope_warning: Option<String> = None;
+    // Le binaire est interrogé avant d'être utilisé : une version trop
+    // ancienne, ou une option qu'il ne connaît pas, ferait sortir GameScope
+    // et perdrait la partie au lancement. Le verdict est retenu par version
+    // installée, donc un seul `--version` par binaire.
+    let gamescope_available = match gamescope_available {
+        Some(bin) => match crate::gamescope_check::check(&bin).problem() {
+            Some(problem) => {
+                tracing::warn!("{problem}");
+                gamescope_warning = Some(problem);
+                None
+            }
+            None => Some(bin),
+        },
+        None => None,
+    };
     if config.gamescope.enabled {
         if let Some(gamescope_bin) = gamescope_available {
             use_gamescope = true;
             let mut settings = config.gamescope.clone();
-            // `--mangoapp` ne dessine rien hors d'une session SteamOS : il
-            // attend un processus MangoApp lancé par Steam. MangoHud tourne
-            // donc dans le jeu, à travers GameScope, où il relit son fichier
-            // de configuration à chaud.
-            settings.mangoapp = false;
             // Gamescope n'ouvre son tube que si l'autre bout existe déjà : on
             // crée le FIFO ici, le daemon le lit.
             if let Some(path) = create_fifo(log_dir, appid) {
@@ -124,12 +165,13 @@ pub fn prepare(
                     Ok(exe) => {
                         use_scene = true;
                         std::fs::create_dir_all(log_dir).ok();
-                        let exit_path = log_dir.join(format!(
-                            "scene-{appid}-{}.exit",
-                            lapinux_core::util::now_unix()
-                        ));
+                        let scene_stamp = lapinux_core::util::now_unix();
+                        let exit_path = log_dir.join(format!("scene-{appid}-{scene_stamp}.exit"));
+                        let start_path = log_dir.join(format!("scene-{appid}-{scene_stamp}.start"));
                         let _ = std::fs::remove_file(&exit_path);
+                        let _ = std::fs::remove_file(&start_path);
                         scene_exit_path = Some(exit_path.clone());
+                        scene_start_path = Some(start_path.clone());
                         let game_program = program.to_string_lossy().to_string();
                         let game_args = args.clone();
                         let scene_name = if config.scene_name.trim().is_empty() {
@@ -156,6 +198,8 @@ pub fn prepare(
                             "4".into(),
                             "--exit-file".into(),
                             exit_path.to_string_lossy().to_string(),
+                            "--start-file".into(),
+                            start_path.to_string_lossy().to_string(),
                         ];
                         if let Some(backdrop) =
                             config.scene_backdrop.as_ref().filter(|path| path.is_file())
@@ -193,31 +237,57 @@ pub fn prepare(
             scope_args.extend(args.iter().cloned());
             program = gamescope_bin;
             args = scope_args;
-        } else {
-            tracing::warn!("GameScope demandé mais introuvable : lancement direct");
-        }
-    }
-
-    // MangoHud est chargé dans le jeu, y compris masqué : `no_display` dans
-    // le fichier de configuration le cache, et l'overlay le réécrit pour
-    // l'allumer en cours de partie. Le charger seulement quand il est demandé
-    // obligerait à relancer le jeu pour l'afficher.
-    if config.inject_mangohud && hud_available {
-        let mut hud = config.hud.clone();
-        hud.screen = Some(screen_size(config));
-        match mangohud::write_config(config_dir, appid, &hud) {
-            Ok(path) => {
-                env.extend(mangohud::env(&path));
-                use_mangohud = true;
-            }
-            Err(err) => tracing::warn!("configuration MangoHud : {err}"),
+        } else if gamescope_warning.is_none() {
+            let message = "GameScope demandé mais introuvable : lancement direct".to_string();
+            tracing::warn!("{message}");
+            gamescope_warning = Some(message);
         }
     }
 
     let mut command = Command::new(&program);
     command.args(&args);
+    // Les variables du plan sont appliquées avant les protections : elles ne
+    // doivent pas réactiver une couche dans GameScope ou la scène.
     for (key, value) in &env {
         command.env(key, value);
+    }
+    // Un profil lsfg-vk éventuellement actif sur le système ne doit pas
+    // charger la couche dans GameScope ou dans la scène ; `env -u` l'enlève
+    // ensuite dans le seul arbre de processus du jeu.
+    if config
+        .game_env
+        .iter()
+        .any(|(key, _)| key == "DISABLE_LSFGVK")
+    {
+        command.env("DISABLE_LSFGVK", "1");
+    }
+    if config.game_env.iter().any(|(key, _)| key == "DISABLE_AFMF") {
+        command.env("DISABLE_AFMF", "1");
+    }
+    for key in [
+        "LD_PRELOAD",
+        "NVPRESENT_ENABLE_SMOOTH_MOTION",
+        "PROTON_USE_OPTISCALER",
+        "ENABLE_VKBASALT",
+        "VKBASALT_CONFIG_FILE",
+        "AFMF_ENABLE",
+        "AFMF_GAMESCOPE",
+        "AFMF_PERFORMANCE_MODE",
+        "AFMF_SEARCH_MODE",
+        "VK_ADD_IMPLICIT_LAYER_PATH",
+        "WINEDLLOVERRIDES",
+        "PROTON_USE_WINED3D",
+        "PROTON_DXVK_D3D8",
+        "PROTON_OLD_GL_STRING",
+        "PROTON_NO_FSYNC",
+        "PROTON_NO_ESYNC",
+        "PROTON_NO_NTSYNC",
+        "DXVK_CONFIG",
+        "VKD3D_CONFIG",
+    ] {
+        if config.game_env.iter().any(|(name, _)| name == key) {
+            command.env_remove(key);
+        }
     }
     // Le repli en rendu logiciel ne vaut que pour la fenêtre de Lapinux : les
     // variables qui forcent Mesa ne doivent pas descendre jusqu'au jeu. Sinon
@@ -239,34 +309,25 @@ pub fn prepare(
         command.current_dir(cwd);
     }
     std::fs::create_dir_all(log_dir).map_err(Error::Io)?;
-    // Un seul journal pour toutes les parties : chaque session y écrit son
-    // en-tête, au lieu de laisser un fichier de plus à chaque lancement.
-    let log_path = log_dir.join("games.log");
+    // Un journal par partie : la carte d'activité ne montre que la sortie de
+    // cette session, et supprimer la partie supprime son fichier sans toucher
+    // aux autres. L'horodatage évite qu'un même jeu écrase sa partie d'avant.
+    let log_path = log_dir.join(format!(
+        "game-{appid}-{}.log",
+        lapinux_core::util::now_unix()
+    ));
     command.stdout(Stdio::null()).stderr(Stdio::null());
 
     Ok(PreparedLaunch {
         command,
         log_path,
         gamescope: use_gamescope,
-        mangohud: use_mangohud,
         scene: use_scene,
         scene_exit_path,
+        scene_start_path,
         stats_path,
+        gamescope_warning,
     })
-}
-
-/// Taille de l'image du jeu : celle de GameScope quand il compose, sinon
-/// celle de l'écran principal. Sert à centrer le HUD verticalement.
-fn screen_size(config: &PerfConfig) -> (u32, u32) {
-    if config.gamescope.enabled && config.gamescope.width >= 320 && config.gamescope.height >= 240 {
-        return (config.gamescope.width, config.gamescope.height);
-    }
-    match lapinux_core::display::primary() {
-        Some(display) if display.width >= 320 && display.height >= 240 => {
-            (display.width, display.height)
-        }
-        _ => (1920, 1080),
-    }
 }
 
 /// Chemin du préfixe Proton inscrit dans la commande.
@@ -286,7 +347,7 @@ fn compat_data(command: &Command) -> Option<PathBuf> {
 /// Ils gardent alors le préfixe occupé, et le lancement suivant peut rester
 /// noir après le splash. L'environnement est le seul lien sûr : chaque
 /// processus Proton le porte encore, préfixe compris.
-fn reap_prefix(prefix: &std::path::Path) {
+pub fn reap_prefix(prefix: &std::path::Path) {
     use std::os::unix::ffi::OsStrExt;
 
     let mut marker = std::ffi::OsString::from("STEAM_COMPAT_DATA_PATH=");
@@ -352,7 +413,10 @@ fn reap_prefix(prefix: &std::path::Path) {
 /// serait ouvert sans lecteur : il est remplacé.
 fn create_fifo(log_dir: &std::path::Path, appid: u32) -> Option<PathBuf> {
     std::fs::create_dir_all(log_dir).ok()?;
-    let path = log_dir.join(format!("fps-{appid}-{}.fifo", lapinux_core::util::now_unix()));
+    let path = log_dir.join(format!(
+        "fps-{appid}-{}.fifo",
+        lapinux_core::util::now_unix()
+    ));
     let _ = std::fs::remove_file(&path);
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     // 0600 : le tube reste dans le dossier de l'utilisateur.
@@ -413,6 +477,7 @@ impl Session {
             log_path: prepared.log_path,
             log_start,
             scene_exit_path: prepared.scene_exit_path,
+            scene_start_path: prepared.scene_start_path,
             stats_path: prepared.stats_path,
             started: Instant::now(),
             child,
@@ -452,7 +517,45 @@ impl Session {
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
         }
+        self.reap_child();
         self.reap_leftovers();
+    }
+
+    /// Récolte le processus de session. `SIGKILL` tue mais ne récolte pas :
+    /// tant que personne n'appelle `wait`, GameScope reste zombie et son
+    /// `/proc/<pid>` survit. Les guetteurs qui attendent sa disparition
+    /// (restauration du pont Steamworks, fin de session) croient alors la
+    /// partie encore en cours, et ne font jamais leur travail.
+    fn reap_child(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "session : processus {} toujours vivant après SIGKILL, récolte abandonnée",
+                        self.pid
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "session : récolte du processus {} impossible ({error})",
+                        self.pid
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Préfixe Proton de la partie : ses processus le portent dans leur
+    /// environnement, ce qui permet de les retrouver même détachés.
+    pub fn compat_data(&self) -> Option<&std::path::Path> {
+        self.compat_data.as_deref()
     }
 
     /// Retire les processus Proton que la partie laisse dans son préfixe.
@@ -462,6 +565,15 @@ impl Session {
         if let Some(prefix) = self.compat_data.as_deref() {
             reap_prefix(prefix);
         }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Une session abandonnée (erreur après lancement, daemon en fin de
+        // vie) laisserait sinon son processus zombie jusqu'à la mort du
+        // daemon. On récolte ce qui est déjà mort, sans attendre ni tuer.
+        let _ = self.child.try_wait();
     }
 }
 
@@ -485,14 +597,49 @@ pub fn render_prepared(prepared: &PreparedLaunch) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn une_session_arretee_est_recoltee() {
+        // Sans récolte, GameScope tué reste zombie et `/proc/<pid>` demeure :
+        // le pont Steamworks n'était alors jamais restauré.
+        let dir =
+            std::env::temp_dir().join(format!("lapinux-session-recolte-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 30");
+        let prepared = PreparedLaunch {
+            command,
+            log_path: dir.join("game.log"),
+            gamescope: false,
+            scene: false,
+            scene_exit_path: None,
+            scene_start_path: None,
+            stats_path: None,
+            gamescope_warning: None,
+        };
+        let mut session = Session::spawn(1, prepared).expect("session lancée");
+        let pid = session.pid;
+        let entry = format!("/proc/{pid}");
+        assert!(std::path::Path::new(&entry).exists());
+
+        session.terminate();
+        assert!(
+            !std::path::Path::new(&entry).exists(),
+            "le processus de session est resté zombie ({entry})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Résumé lisible des couches activées, pour l'UI et les journaux.
-pub fn layers_summary(gamescope: bool, mangohud: bool) -> String {
+pub fn layers_summary(gamescope: bool) -> String {
     let mut parts = Vec::new();
     if gamescope {
         parts.push("GameScope");
-    }
-    if mangohud {
-        parts.push("MangoHud");
     }
     if parts.is_empty() {
         "lancement direct".into()

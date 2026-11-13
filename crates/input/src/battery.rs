@@ -38,8 +38,7 @@ const HIDIOCGFEATURE_64: libc::c_ulong = hid_ioc(0x07, REPORT_SIZE);
 
 const fn hid_ioc(number: u8, size: usize) -> libc::c_ulong {
     // _IOC(_IOC_WRITE | _IOC_READ, 'H', number, size)
-    ((3_u64 << 30) | ((size as u64) << 16) | ((b'H' as u64) << 8) | number as u64)
-        as libc::c_ulong
+    ((3_u64 << 30) | ((size as u64) << 16) | ((b'H' as u64) << 8) | number as u64) as libc::c_ulong
 }
 
 /// Modèle de batterie connu, utilisé pour afficher la capacité nominale.
@@ -457,14 +456,7 @@ impl BatteryWorker {
         let thread_stop = Arc::clone(&stop);
         let join = std::thread::Builder::new()
             .name("lapinux-pad-battery".into())
-            .spawn(move || {
-                run_worker(
-                    reader,
-                    thread_shared,
-                    thread_revision,
-                    thread_stop,
-                )
-            })
+            .spawn(move || run_worker(reader, thread_shared, thread_revision, thread_stop))
             .ok()?;
         Some(Self {
             shared,

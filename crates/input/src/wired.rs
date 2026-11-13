@@ -117,7 +117,7 @@ mod tests {
         write(&interface.join("bInterfaceNumber"), "3\n");
         write(
             &hid.join("uevent"),
-            "HID_ID=0003:0000054C:00000CE6\nHID_NAME=DualSense\nHID_UNIQ=44:46:48:2e:38:09\n",
+            "HID_ID=0003:0000054C:00000CE6\nHID_NAME=DualSense\nHID_UNIQ=02:00:00:00:00:01\n",
         );
         if bound {
             fs::create_dir_all(hid.join("driver")).unwrap();
@@ -129,7 +129,7 @@ mod tests {
     fn finds_the_usb_interface_by_mac() {
         let tmp = tempfile::tempdir().unwrap();
         let hid = fake_hid(tmp.path(), false);
-        let found = usb_hid_from_path(&hid, "44:46:48:2E:38:09").unwrap();
+        let found = usb_hid_from_path(&hid, "02:00:00:00:00:01").unwrap();
         assert_eq!(found.vendor, 0x054c);
         assert_eq!(found.product, 0x0ce6);
         assert_eq!(found.interface, 3);
@@ -142,6 +142,6 @@ mod tests {
     fn a_bound_hid_needs_no_handoff() {
         let tmp = tempfile::tempdir().unwrap();
         let hid = fake_hid(tmp.path(), true);
-        assert!(usb_hid_from_path(&hid, "44:46:48:2E:38:09").unwrap().bound);
+        assert!(usb_hid_from_path(&hid, "02:00:00:00:00:01").unwrap().bound);
     }
 }

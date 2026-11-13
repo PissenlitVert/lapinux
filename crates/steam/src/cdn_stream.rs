@@ -182,12 +182,7 @@ impl ChunkFetcher for StreamingFetcher {
         if let Some(expected) = expected {
             if data.len() as u64 != expected {
                 self.report_failure(server, None);
-                return Err(format!(
-                    "CDN : {} octets reçus sur {}",
-                    data.len(),
-                    expected
-                )
-                .into());
+                return Err(format!("CDN : {} octets reçus sur {}", data.len(), expected).into());
             }
         }
         self.report_success(server);
@@ -299,10 +294,7 @@ mod tests {
     }
 
     /// Plusieurs réponses servies en parallèle, chacune sur sa connexion.
-    async fn serve_many(
-        body: Vec<u8>,
-        count: usize,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
+    async fn serve_many(body: Vec<u8>, count: usize) -> (u16, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("port de test");
@@ -353,9 +345,7 @@ mod tests {
                 Arc::clone(&received),
             );
             tasks.push(tokio::spawn(async move {
-                fetcher
-                    .fetch_chunk(DepotId(7), &ChunkId([4; 20]))
-                    .await
+                fetcher.fetch_chunk(DepotId(7), &ChunkId([4; 20])).await
             }));
         }
         for task in tasks {
@@ -422,9 +412,7 @@ mod tests {
                 Arc::clone(&received),
             );
             tasks.push(tokio::spawn(async move {
-                fetcher
-                    .fetch_chunk(DepotId(7), &ChunkId([5; 20]))
-                    .await
+                fetcher.fetch_chunk(DepotId(7), &ChunkId([5; 20])).await
             }));
         }
         let mut total = 0usize;
@@ -447,5 +435,4 @@ mod tests {
             "le débit doit rester proche de 20 Mbit/s : {mbit:.2}"
         );
     }
-
 }

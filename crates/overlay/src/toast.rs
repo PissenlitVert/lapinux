@@ -12,6 +12,7 @@ use crate::render::{
     fill_round, fit_text, stroke_path, text_width, with_alpha,
 };
 use crate::shm::Mapping;
+use lapinux_core::i18n::t;
 use crate::{Error, Result};
 use ab_glyph::FontVec;
 use lapinux_core::stores::Store;
@@ -72,7 +73,7 @@ pub struct ToastOptions {
 impl Default for ToastOptions {
     fn default() -> Self {
         Self {
-            title: "Succès débloqué".into(),
+            title: t("overlay.toast_achievement").into(),
             game: String::new(),
             store: Store::Steam,
             percent: None,
@@ -132,8 +133,8 @@ fn store_mark(store: Store) -> &'static [u8] {
 /// Ramène l'icône à un carré plein : l'illustration remplit le cadre, quitte
 /// à rogner un bord, plutôt que de flotter dans une vignette.
 fn cover(icon: &Pixmap, size: u32) -> Pixmap {
-    let mut tile = Pixmap::new(size, size)
-        .unwrap_or_else(|| Pixmap::new(1, 1).expect("pixmap minimal"));
+    let mut tile =
+        Pixmap::new(size, size).unwrap_or_else(|| Pixmap::new(1, 1).expect("pixmap minimal"));
     let scale = (size as f32 / icon.width() as f32).max(size as f32 / icon.height() as f32);
     let width = icon.width() as f32 * scale;
     let height = icon.height() as f32 * scale;
@@ -142,8 +143,9 @@ fn cover(icon: &Pixmap, size: u32) -> Pixmap {
         ..Default::default()
     };
     // Le décalage est dans la transformation : le rognage reste centré.
-    let transform = Transform::from_translate((size as f32 - width) / 2.0, (size as f32 - height) / 2.0)
-        .pre_scale(scale, scale);
+    let transform =
+        Transform::from_translate((size as f32 - width) / 2.0, (size as f32 - height) / 2.0)
+            .pre_scale(scale, scale);
     tile.draw_pixmap(0, 0, icon.as_ref(), &paint, transform, None);
     tile
 }
@@ -174,8 +176,7 @@ fn trim_mark(mark: &Pixmap) -> Pixmap {
     for row in 0..ch as usize {
         let start = ((y0 as usize + row) * w as usize + x0 as usize) * 4;
         let end = start + cw as usize * 4;
-        dst[row * cw as usize * 4..(row + 1) * cw as usize * 4]
-            .copy_from_slice(&src[start..end]);
+        dst[row * cw as usize * 4..(row + 1) * cw as usize * 4].copy_from_slice(&src[start..end]);
     }
     out
 }
@@ -193,9 +194,7 @@ fn is_blank(icon: &Pixmap) -> bool {
         }
         // Les canaux sont prémultipliés : la luminance se ramène à l'opacité.
         let alpha = pixel[3] as f64 / 255.0;
-        let lum = (pixel[0] as f64 * 0.2126
-            + pixel[1] as f64 * 0.7152
-            + pixel[2] as f64 * 0.0722)
+        let lum = (pixel[0] as f64 * 0.2126 + pixel[1] as f64 * 0.7152 + pixel[2] as f64 * 0.0722)
             / alpha.max(0.01);
         sum += lum;
         squares += lum * lum;
@@ -246,13 +245,7 @@ impl ToastRenderer {
     }
 
     /// Peint une image du bandeau, à `elapsed` secondes depuis son apparition.
-    fn render(
-        &self,
-        width: u32,
-        height: u32,
-        toast: &ToastOptions,
-        elapsed: f32,
-    ) -> Pixmap {
+    fn render(&self, width: u32, height: u32, toast: &ToastOptions, elapsed: f32) -> Pixmap {
         let mut pixmap = Pixmap::new(width.max(1), height.max(1))
             .unwrap_or_else(|| Pixmap::new(320, 200).expect("pixmap minimal"));
         // L'icône tombe au centre de l'écran, puis glisse à gauche pour
@@ -260,9 +253,8 @@ impl ToastRenderer {
         let drop = ease_out(((elapsed - 0.03) / 0.34).clamp(0.0, 1.0));
         let shift = ease_out(((elapsed - 0.03 - 0.32) / 0.40).clamp(0.0, 1.0));
         let panel_in = ease_out(((elapsed - 0.03 - 0.48) / 0.26).clamp(0.0, 1.0));
-        let out = ease_out(
-            ((elapsed - 0.03 - ENTER - toast.hold.as_secs_f32()) / LEAVE).clamp(0.0, 1.0),
-        );
+        let out =
+            ease_out(((elapsed - 0.03 - ENTER - toast.hold.as_secs_f32()) / LEAVE).clamp(0.0, 1.0));
         // La sortie rejoue l'entrée : retour au centre pendant que le panneau
         // s'efface, puis remontée hors de l'écran. L'icône ne s'efface pas en
         // route, sinon la marche arrière ne se voit pas.
@@ -365,11 +357,7 @@ impl ToastRenderer {
         );
         let mut badge = PathBuilder::new();
         badge.push_circle(badge_x, badge_y, 9.5);
-        fill_path(
-            &mut pixmap,
-            badge,
-            with_alpha(accent, alpha(icon_alpha)),
-        );
+        fill_path(&mut pixmap, badge, with_alpha(accent, alpha(icon_alpha)));
         let mut check = PathBuilder::new();
         check.move_to(badge_x - 4.0, badge_y + 0.2);
         check.line_to(badge_x - 1.2, badge_y + 3.0);
@@ -493,7 +481,7 @@ impl ToastRenderer {
                 draw_text_baseline(
                     &mut pixmap,
                     &self.font,
-                    "des joueurs l'ont obtenu",
+                    t("overlay.toast_players"),
                     after,
                     percent_y,
                     17.0,
@@ -503,7 +491,7 @@ impl ToastRenderer {
             None => draw_text_baseline(
                 &mut pixmap,
                 &self.font,
-                "Nouveau succès débloqué",
+                t("overlay.toast_new_achievement"),
                 text_x,
                 percent_y,
                 17.0,
@@ -604,9 +592,12 @@ impl ToastApp {
         }
         let width = self.width.max(1);
         let height = self.height.max(1);
-        let pixmap = self
-            .renderer
-            .render(width, height, &self.toast, self.started.elapsed().as_secs_f32());
+        let pixmap = self.renderer.render(
+            width,
+            height,
+            &self.toast,
+            self.started.elapsed().as_secs_f32(),
+        );
         let stride = width as usize * 4;
         let size = stride * height as usize;
 
@@ -614,7 +605,9 @@ impl ToastApp {
             .slots
             .iter()
             .position(|slot| {
-                slot.width == width && slot.height == height && slot.released.load(Ordering::Relaxed)
+                slot.width == width
+                    && slot.height == height
+                    && slot.released.load(Ordering::Relaxed)
             })
             .or_else(|| {
                 if self.slots.len() < 2 {
@@ -830,9 +823,7 @@ pub fn run(options: ToastOptions) -> Result<()> {
         .roundtrip(&mut app)
         .map_err(|e| Error::Wayland(format!("configure : {e}")))?;
     if !app.configured {
-        return Err(Error::Wayland(
-            "aucun configure reçu du compositeur".into(),
-        ));
+        return Err(Error::Wayland("aucun configure reçu du compositeur".into()));
     }
     app.started = Instant::now();
 

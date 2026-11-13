@@ -66,8 +66,14 @@ pub fn build(options: &LaunchOptions) -> Result<LaunchPlan> {
         if let Some(umu) = &options.umu_run {
             let mut env = vec![
                 ("GAMEID".to_string(), format!("lapinux-{}", options.appid)),
-                ("PROTONPATH".to_string(), proton.path.to_string_lossy().to_string()),
-                ("WINEPREFIX".to_string(), options.prefix.to_string_lossy().to_string()),
+                (
+                    "PROTONPATH".to_string(),
+                    proton.path.to_string_lossy().to_string(),
+                ),
+                (
+                    "WINEPREFIX".to_string(),
+                    options.prefix.to_string_lossy().to_string(),
+                ),
                 ("STORE".to_string(), "none".to_string()),
                 ("UMU_RUNTIME_UPDATE".to_string(), "0".to_string()),
             ];
@@ -199,7 +205,10 @@ mod tests {
         assert_eq!(plan.args[0], "/jeux/TF2/hl2.exe");
         let env: std::collections::HashMap<_, _> = plan.env.iter().cloned().collect();
         assert_eq!(env.get("GAMEID").unwrap(), "lapinux-440");
-        assert_eq!(env.get("PROTONPATH").unwrap(), &dir.path().to_string_lossy());
+        assert_eq!(
+            env.get("PROTONPATH").unwrap(),
+            &dir.path().to_string_lossy()
+        );
         assert_eq!(env.get("WINEPREFIX").unwrap(), "/data/prefixes/440");
         assert_eq!(env.get("DXVK_HUD").unwrap(), "0");
     }
@@ -219,7 +228,10 @@ mod tests {
         assert_eq!(plan.args.len(), 3);
         assert!(plan.args[0].ends_with("/GE-Proton11-7/proton"));
         assert_eq!(plan.args[1], "run");
-        assert_eq!(plan.args[2], "/data/SteamLibrary/steamapps/common/TF2/hl2.exe");
+        assert_eq!(
+            plan.args[2],
+            "/data/SteamLibrary/steamapps/common/TF2/hl2.exe"
+        );
         let env: std::collections::HashMap<_, _> = plan.env.iter().cloned().collect();
         assert_eq!(
             env.get("STEAM_COMPAT_CLIENT_INSTALL_PATH").unwrap(),

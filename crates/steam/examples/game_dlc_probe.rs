@@ -20,7 +20,11 @@ fn main() {
         .into_data::<SteamGameInfo>()
         .expect("fiche illisible");
     let owned = info.update.dlc.iter().filter(|dlc| dlc.owned).count();
-    println!("{appid} · {} · {owned} sur {} possédés", info.name, info.update.dlc.len());
+    println!(
+        "{appid} · {} · {owned} sur {} possédés",
+        info.name,
+        info.update.dlc.len()
+    );
     for content in &info.update.dlc {
         println!(
             "  {} · {} · {} · possédé {} · {}",

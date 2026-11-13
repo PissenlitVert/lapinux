@@ -126,14 +126,7 @@ pub fn mark_managed(
         }
         return Ok(path);
     }
-    write_manifest(
-        library_root,
-        appid,
-        name,
-        installdir,
-        size_on_disk,
-        managed,
-    )
+    write_manifest(library_root, appid, name, installdir, size_on_disk, managed)
 }
 
 /// Réécrit un champ du manifeste, ou l'insère avant l'accolade fermante.
@@ -175,17 +168,9 @@ pub fn record_build(
     build_id: Option<u64>,
     managed: bool,
 ) -> Result<std::path::PathBuf, crate::Error> {
-    let path = manifest_dir(library_root, managed)
-        .join(format!("appmanifest_{appid}.acf"));
+    let path = manifest_dir(library_root, managed).join(format!("appmanifest_{appid}.acf"));
     if !path.is_file() {
-        write_manifest(
-            library_root,
-            appid,
-            name,
-            installdir,
-            size_on_disk,
-            managed,
-        )?;
+        write_manifest(library_root, appid, name, installdir, size_on_disk, managed)?;
     }
     let mut text = std::fs::read_to_string(&path)?;
     text = set_field(&text, "SizeOnDisk", &size_on_disk.to_string());
@@ -269,7 +254,8 @@ mod tests {
     fn recording_a_build_creates_a_lapinux_manifest_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         record_build(dir.path(), 620, "Portal 2", "Portal 2", 42, Some(7), false).unwrap();
-        let manifest = AppManifest::read(&dir.path().join("steamapps/appmanifest_620.acf")).unwrap();
+        let manifest =
+            AppManifest::read(&dir.path().join("steamapps/appmanifest_620.acf")).unwrap();
         assert_eq!(manifest.build_id, "7");
         assert!(manifest.lapinux_managed);
         assert!(manifest.installed());

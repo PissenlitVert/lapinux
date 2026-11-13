@@ -30,17 +30,25 @@ pub enum Error {
     Other(String),
 }
 
+/// Traduit un refus HTTP : seul 401 signifie un jeton expiré. Un 403 est un
+/// refus de permission — la présence Epic le renvoie quand le jeton du
+/// launcher n'a pas la portée nécessaire — et ne doit pas inviter à se
+/// reconnecter.
+fn status_refusal(status: u16, message: String) -> Error {
+    if status == 401 {
+        Error::Expired
+    } else {
+        Error::Refused { status, message }
+    }
+}
+
 impl From<ureq::Error> for Error {
     fn from(error: ureq::Error) -> Self {
         match error {
             ureq::Error::Status(status, response) => {
                 let message = response.into_string().unwrap_or_default();
                 let message = message.chars().take(240).collect::<String>();
-                if status == 401 || status == 403 {
-                    Error::Expired
-                } else {
-                    Error::Refused { status, message }
-                }
+                status_refusal(status, message)
             }
             ureq::Error::Transport(transport) => Error::Http(transport.to_string()),
         }
@@ -65,9 +73,17 @@ pub struct LoginLink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// Télécharger `url` dans le cache sous `file`.
-    Download { url: String, file: String, size: u64 },
-    /// Extraire `file` (zip) dans le dossier d'installation.
-    Unzip { file: String },
+    Download {
+        url: String,
+        file: String,
+        size: u64,
+    },
+    /// Extraire une archive (zip, rar, 7z ou tar) dans le dossier
+    /// d'installation.
+    Extract { file: String },
+    /// Copier un fichier publié tel quel (script, AppImage, exécutable) dans
+    /// le dossier d'installation.
+    InstallFile { file: String },
     /// Lancer l'installeur GOG (mojosetup) dans le dossier d'installation.
     RunInstaller { file: String },
     /// Extraire un installeur Windows GOG avec `innoextract`.
@@ -192,7 +208,10 @@ pub fn post_json_bearer(
             .map_err(|error| Error::Http(error.to_string()))?,
         Err(ureq::Error::Status(code, response)) => {
             let text = response.into_string().unwrap_or_default();
-            return Err(Error::Http(format!("Epic a refusé l'offre ({code}) : {}", short_reason(&text))));
+            return Err(Error::Http(format!(
+                "Epic a refusé l'offre ({code}) : {}",
+                short_reason(&text)
+            )));
         }
         Err(error) => return Err(Error::Http(error.to_string())),
     };
@@ -289,8 +308,7 @@ pub fn iso_seconds(text: &str) -> Option<i64> {
 
 /// Base64 standard : l'en-tête Basic d'Epic.
 pub fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     for chunk in input.chunks(3) {
         let b = [
@@ -337,13 +355,14 @@ pub fn download(
         request = request.set("Authorization", bearer);
     }
     let response = request.call()?;
-    let announced = response
+    let content_length = response
         .header("Content-Length")
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|size| *size > 0)
-        .unwrap_or(total_hint);
-    let part = file.with_extension("part");
-    let mut out = std::fs::File::create(&part)?;
+        .and_then(|value| value.parse::<u64>().ok());
+    let announced = content_length.filter(|size| *size > 0).unwrap_or(total_hint);
+    // Un nom unique et créé de façon exclusive évite de tronquer un autre
+    // transfert, ou de suivre un lien préexistant nommé *.part.
+    let parent = file.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let mut out = tempfile::NamedTempFile::new_in(parent)?;
     let mut reader = response.into_reader();
     let mut buffer = vec![0u8; 128 * 1024];
     let mut done = 0u64;
@@ -351,56 +370,252 @@ pub fn download(
         let read = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(error) => {
-                let _ = std::fs::remove_file(&part);
-                return Err(Error::Http(error.to_string()));
-            }
+            Err(error) => return Err(Error::Http(error.to_string())),
         };
         out.write_all(&buffer[..read])?;
         done += read as u64;
         if !progress(done, announced) {
-            let _ = std::fs::remove_file(&part);
             return Err(Error::Other("téléchargement annulé".into()));
         }
     }
+    if content_length.is_some_and(|expected| expected != done) {
+        return Err(Error::Http("téléchargement incomplet".into()));
+    }
     out.flush()?;
-    std::fs::rename(&part, file)?;
+    out.as_file().sync_all()?;
+    out.persist(file).map_err(|error| Error::Io(error.error))?;
     Ok(done)
 }
 
 /// Extrait une archive zip dans `dest`.
 pub fn unzip(file: &Path, dest: &Path) -> Result<()> {
-    let handle =
-        std::fs::File::open(file).map_err(|error| Error::Archive(error.to_string()))?;
+    let handle = std::fs::File::open(file).map_err(|error| Error::Archive(error.to_string()))?;
     let mut archive =
         zip::ZipArchive::new(handle).map_err(|error| Error::Archive(error.to_string()))?;
+    // Les répertoires sont ouverts un par un sans suivre les liens. Des
+    // descripteurs ouverts restent sûrs même si un chemin est remplacé pendant
+    // l'extraction ; un lien final ne doit jamais être écrasé non plus.
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     std::fs::create_dir_all(dest)?;
+    let root = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(dest)?;
     for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| Error::Archive(error.to_string()))?;
-        let Some(path) = entry.enclosed_name() else {
-            continue;
-        };
-        let target = dest.join(path);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&target)?;
-            continue;
+        let mut entry = archive.by_index(index).map_err(|error| Error::Archive(error.to_string()))?;
+        let path = entry.enclosed_name().ok_or_else(|| Error::Archive("chemin zip invalide".into()))?;
+        if entry.unix_mode().is_some_and(|mode| mode & libc::S_IFMT == libc::S_IFLNK) {
+            return Err(Error::Archive("lien symbolique dans l'archive refusé".into()));
         }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+        let parts: Vec<_> = path.components().filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(name), _ => None,
+        }).collect();
+        if parts.is_empty() { continue; }
+        let mut dir = root.try_clone()?;
+        let directories = if entry.is_dir() { parts.len() } else { parts.len() - 1 };
+        for part in &parts[..directories] {
+            let name = CString::new(part.as_bytes()).map_err(|_| Error::Archive("nom zip invalide".into()))?;
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+            let fd = if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+                let made = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) };
+                if made < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists { return Err(std::io::Error::last_os_error().into()); }
+                unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) }
+            } else { fd };
+            if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
+            dir = unsafe { std::fs::File::from_raw_fd(fd) };
         }
-        let mut out = std::fs::File::create(&target)?;
+        if entry.is_dir() { continue; }
+        let name = CString::new(parts[parts.len()-1].as_bytes()).map_err(|_| Error::Archive("nom zip invalide".into()))?;
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK, 0o600) };
+        if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
+        let mut out = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = out.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(Error::Archive("destination zip non régulière ou liée à un autre fichier".into()));
+        }
+        out.set_len(0)?;
         std::io::copy(&mut entry, &mut out)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = entry.unix_mode() {
-                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
-            }
-        }
+        if let Some(mode) = entry.unix_mode() { out.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?; }
     }
     Ok(())
+}
+
+/// Extrait une archive publiée par une boutique. Les jeux itch.io ne sont pas
+/// tous des zip : certains publient un rar, un 7z ou un tar. Le format est
+/// reconnu par les premiers octets, puis par l'extension ; le zip reste lu
+/// directement, les autres formats passent par un outil installé sur la
+/// machine.
+pub fn extract_archive(file: &Path, dest: &Path) -> Result<()> {
+    let kind = archive_kind(file).ok_or_else(|| {
+        Error::Archive(format!(
+            "format d'archive non reconnu : {}",
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("fichier sans nom")
+        ))
+    })?;
+    match kind {
+        ArchiveKind::Zip => unzip(file, dest),
+        ArchiveKind::Rar => extract_with_external(
+            file,
+            dest,
+            "RAR",
+            &[
+                ("unrar", &["x", "-o+", "-y"][..]),
+                ("unar", &["-f", "-o"][..]),
+                ("7z", &["x", "-y"][..]),
+            ],
+        ),
+        ArchiveKind::SevenZip => extract_with_external(
+            file,
+            dest,
+            "7z",
+            &[
+                ("7z", &["x", "-y"][..]),
+                ("7zz", &["x", "-y"][..]),
+                ("unar", &["-f", "-o"][..]),
+            ],
+        ),
+        ArchiveKind::Tar => extract_with_external(
+            file,
+            dest,
+            "tar",
+            &[("tar", &["-xf"][..]), ("bsdtar", &["-xf"][..])],
+        ),
+    }
+}
+
+/// Copie un fichier non compressé dans le dossier du jeu et le rend
+/// exécutable : itch.io publie parfois directement un script ou un AppImage.
+pub fn install_file(file: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    let name = file
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| Error::Archive("fichier publié sans nom".into()))?;
+    let target = dest.join(name);
+    std::fs::copy(file, &target)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    Zip,
+    Rar,
+    SevenZip,
+    Tar,
+}
+
+/// Reconnaît le format d'après les premiers octets, puis d'après le nom. Un
+/// `.tar.gz` commence par l'en-tête gzip : son extension est donc consultée
+/// avant de conclure qu'il s'agit d'autre chose.
+fn archive_kind(path: &Path) -> Option<ArchiveKind> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let mut magic = [0u8; 8];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut magic))
+        .unwrap_or(0);
+    if read >= 4 {
+        if magic.starts_with(b"PK\x03\x04") || magic.starts_with(b"PK\x05\x06") {
+            return Some(ArchiveKind::Zip);
+        }
+        if magic.starts_with(b"Rar!") {
+            return Some(ArchiveKind::Rar);
+        }
+        if magic.starts_with(b"7z\xbc\xaf\x27\x1c") {
+            return Some(ArchiveKind::SevenZip);
+        }
+    }
+    if name.ends_with(".zip") {
+        Some(ArchiveKind::Zip)
+    } else if name.ends_with(".rar") {
+        Some(ArchiveKind::Rar)
+    } else if name.ends_with(".7z") {
+        Some(ArchiveKind::SevenZip)
+    } else if name.ends_with(".tar")
+        || name.ends_with(".tar.gz")
+        || name.ends_with(".tgz")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".txz")
+        || name.ends_with(".tar.bz2")
+        || name.ends_with(".tbz2")
+        || name.ends_with(".tar.zst")
+    {
+        Some(ArchiveKind::Tar)
+    } else {
+        None
+    }
+}
+
+/// Essaie les outils dans l'ordre : ils ne sont pas tous installés, et aucun
+/// n'est fourni par Lapinux (contrairement à innoextract). Le premier qui
+/// réussit gagne ; sinon l'erreur nomme les outils essayés.
+fn extract_with_external(
+    file: &Path,
+    dest: &Path,
+    label: &str,
+    tools: &[(&str, &[&str])],
+) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    std::fs::create_dir_all(dest)?;
+    let mut failures = Vec::new();
+    for (tool, flags) in tools {
+        let mut command = Command::new(tool);
+        command.args(*flags);
+        // `unrar` et `unar` attendent la destination après le fichier ; `7z`
+        // la reçoit dans son option `-o`. Les deux formes se construisent ici.
+        if *tool == "unar" {
+            command.arg(dest).arg(file);
+        } else if *tool == "7z" || *tool == "7zz" {
+            command.arg(format!("-o{}", dest.display())).arg(file);
+        } else {
+            command.arg(file);
+            if *tool == "unrar" {
+                command.arg(format!("{}/", dest.display()));
+            } else {
+                command.arg("-C").arg(dest);
+            }
+        }
+        let result = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        match result {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let detail = String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                failures.push(if detail.is_empty() {
+                    format!("{tool} ({})", output.status)
+                } else {
+                    format!("{tool} : {detail}")
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("{tool} : {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Err(Error::Archive(format!(
+            "archive {label} : installe unrar, unar ou 7z pour l'extraire"
+        )))
+    } else {
+        Err(Error::Archive(format!(
+            "archive {label} : {}",
+            failures.join(" ; ")
+        )))
+    }
 }
 
 /// Lance un installeur GOG Linux (mojosetup) sans question ni licence à
@@ -447,9 +662,7 @@ pub fn run_innoextract(file: &Path, dest: &Path) -> Result<()> {
         .arg(dest)
         .arg(file)
         .status()
-        .map_err(|error| {
-            Error::Other(format!("innoextract n'a pas pu démarrer : {error}"))
-        })?;
+        .map_err(|error| Error::Other(format!("innoextract n'a pas pu démarrer : {error}")))?;
     if !status.success() {
         return Err(Error::Other("innoextract a échoué".into()));
     }
@@ -708,6 +921,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn incomplete_download_does_not_replace_existing_file() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nshort").unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("download");
+        std::fs::write(&target, b"old contents").unwrap();
+        assert!(download(&format!("http://{address}/"), None, &target, 0, &mut |_, _| true).is_err());
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"old contents");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_forbidden_answer_is_not_an_expired_session() {
+        assert!(matches!(status_refusal(401, String::new()), Error::Expired));
+        assert!(matches!(
+            status_refusal(403, String::new()),
+            Error::Refused { status: 403, .. }
+        ));
+    }
+
+    #[test]
     fn base64_matches_the_standard_alphabet() {
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
@@ -778,6 +1020,182 @@ mod tests {
     }
 
     #[test]
+    fn zip_refuses_existing_symlinks_without_writing_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("bin")).unwrap();
+        let archive = dir.path().join("a.zip");
+        let file = std::fs::File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("bin/game", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"malicious").unwrap();
+        zip.finish().unwrap();
+        assert!(unzip(&archive, &dest).is_err());
+        assert!(!outside.join("game").exists());
+    }
+
+    #[test]
+    fn zip_refuses_a_symlink_at_the_final_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("game")).unwrap();
+        let archive = dir.path().join("a.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        zip.start_file("game", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"malicious").unwrap();
+        zip.finish().unwrap();
+        assert!(unzip(&archive, &dest).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn zip_refuses_an_existing_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"untouched").unwrap();
+        std::fs::hard_link(&outside, dest.join("game")).unwrap();
+        let archive = dir.path().join("a.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        zip.start_file("game", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"malicious").unwrap();
+        zip.finish().unwrap();
+        assert!(unzip(&archive, &dest).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn zip_refuses_paths_that_escape_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a/b/out");
+        let archive = dir.path().join("a.zip");
+        // Une archive par variante : chacune doit être refusée pour elle-même,
+        // sans quoi le refus de la première masquerait les suivantes.
+        for name in ["../evade", "../../evade"] {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"malicious").unwrap();
+            zip.finish().unwrap();
+            assert!(unzip(&archive, &dest).is_err(), "{name}");
+            // Aucune remontée d'un cran (dest/..), de deux (dest/../..).
+            assert!(!dir.path().join("a/b/evade").exists(), "{name}");
+            assert!(!dir.path().join("a/evade").exists(), "{name}");
+            assert!(!dir.path().join("evade").exists(), "{name}");
+        }
+        // Un nom absolu : `ZipWriter` normalise le nom qu'on lui donne, une
+        // archive venue d'ailleurs peut en porter un. On écrit un nom de même
+        // longueur, puis on le remplace dans l'en-tête local et le répertoire
+        // central, comme le ferait un outil malveillant.
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        zip.start_file("eevade", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"malicious").unwrap();
+        zip.finish().unwrap();
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let (from, to) = (b"eevade", b"/evade");
+        let mut patched = 0;
+        let mut index = 0;
+        while index + from.len() <= bytes.len() {
+            if &bytes[index..index + from.len()] == from {
+                bytes[index..index + from.len()].copy_from_slice(to);
+                patched += 1;
+                index += from.len();
+            } else {
+                index += 1;
+            }
+        }
+        assert_eq!(patched, 2, "en-tête local et répertoire central");
+        std::fs::write(&archive, bytes).unwrap();
+        // Un nom absolu est soit refusé, soit ramené sous la destination :
+        // les composants sont reconstruits relativement au dossier ouvert,
+        // donc l'écriture ne peut pas atteindre la racine du système.
+        match unzip(&archive, &dest) {
+            Ok(()) => assert!(dest.join("evade").exists(), "écrit sous la destination"),
+            Err(_) => assert!(!dest.join("evade").exists(), "rien n'est écrit"),
+        }
+        assert!(!dir.path().join("evade").exists(), "hors de la destination");
+    }
+
+    #[test]
+    fn zip_refuses_a_regular_file_where_a_directory_is_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("bin"), b"keep").unwrap();
+        let archive = dir.path().join("a.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        zip.start_file("bin/game", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"malicious").unwrap();
+        zip.finish().unwrap();
+        assert!(unzip(&archive, &dest).is_err());
+        assert_eq!(std::fs::read(dest.join("bin")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn zip_refuses_a_symlinked_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let dest = dir.path().join("out");
+        std::os::unix::fs::symlink(&outside, &dest).unwrap();
+        let archive = dir.path().join("a.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        zip.start_file("game", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"malicious").unwrap();
+        zip.finish().unwrap();
+        assert!(unzip(&archive, &dest).is_err());
+        assert!(!outside.join("game").exists());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn zip_does_not_hand_setuid_bits_from_the_archive() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let archive = dir.path().join("a.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o4755);
+        zip.start_file("game", options).unwrap();
+        zip.write_all(b"#!/bin/sh\n").unwrap();
+        zip.finish().unwrap();
+        unzip(&archive, &dest).expect("extraction");
+        let mode = std::fs::metadata(dest.join("game")).unwrap().permissions().mode();
+        assert_eq!(mode & (libc::S_ISUID | libc::S_ISGID | libc::S_ISVTX), 0, "{mode:o}");
+    }
+
+    #[test]
+    fn archives_are_recognized_by_content_before_their_name() {
+        let root = std::env::temp_dir().join(format!(
+            "lapinux-archive-kind-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let rar = root.join("jeu.bin");
+        std::fs::write(&rar, b"Rar!\x1a\x07\x00").unwrap();
+        assert_eq!(archive_kind(&rar), Some(ArchiveKind::Rar));
+        let zip = root.join("jeu.rar");
+        std::fs::write(&zip, b"PK\x03\x04").unwrap();
+        assert_eq!(archive_kind(&zip), Some(ArchiveKind::Zip));
+        let tar = root.join("jeu.tar.gz");
+        std::fs::write(&tar, b"pas encore decompresse").unwrap();
+        assert_eq!(archive_kind(&tar), Some(ArchiveKind::Tar));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn the_manifest_names_the_store_and_its_game() {
         let root = std::env::temp_dir().join(format!(
             "lapinux-store-manifest-{}-{:?}",
@@ -795,9 +1213,7 @@ mod tests {
             42,
         )
         .expect("manifeste");
-        assert!(root
-            .join("steamapps/appmanifest_2147483649.acf")
-            .exists());
+        assert!(root.join("steamapps/appmanifest_2147483649.acf").exists());
         assert!(root
             .join("steamapps/common/Jeu test/.lapinux-store.json")
             .exists());
@@ -826,7 +1242,7 @@ mod tests {
                     file: "b".into(),
                     size: 200,
                 },
-                Step::Unzip { file: "a".into() },
+                Step::Extract { file: "a".into() },
             ],
         };
         assert_eq!(plan.download_size(), 300);

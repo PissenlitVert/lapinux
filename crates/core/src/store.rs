@@ -58,7 +58,7 @@ impl Store {
             let (_, value) = entry?;
             match serde_json::from_slice::<Game>(value.value()) {
                 Ok(game) => out.push(game),
-                Err(err) => tracing::warn!("entrée de jeu illisible : {err}"),
+                Err(err) => tracing::warn!("unreadable game entry: {err}"),
             }
         }
         out.sort_by_key(|g| g.name.to_lowercase());

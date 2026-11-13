@@ -8,12 +8,12 @@ pub mod codes;
 pub mod control;
 pub mod device;
 pub mod mapping;
-pub mod shortcut;
-pub mod nav;
 pub mod monitor;
-pub mod steam;
+pub mod nav;
 pub mod panels;
 pub mod service;
+pub mod shortcut;
+pub mod steam;
 pub mod virtual_pad;
 pub mod wired;
 
@@ -39,15 +39,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub use access::{audit, Access};
 pub use battery::{BatteryDesign, BatteryInfo, ChargeState};
 pub use bluetooth::{paired_gamepads, watch_wired_takeover};
-pub use wired::{usb_hid_for, UsbHid};
 pub use mapping::{apply_deadzone_curve, Mapper, Profile, VEvent};
 pub use monitor::{
     FaceButtons, MotionState, PadMonitor, PadState, ReportCadence, TouchPoint, TouchpadState,
 };
-pub use steam::{SteamPad, SteamPads};
 pub use nav::{nav_from_event, Nav, NavReader, NavRepeat};
 pub use service::{set_overlay_navigation, InputMsg, InputService};
+pub use steam::{SteamPad, SteamPads};
 pub use virtual_pad::VirtualPad;
+pub use wired::{usb_hid_for, UsbHid};
 
 pub fn profiles_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("profiles")
@@ -71,12 +71,8 @@ pub fn builtin_profile(name: &str) -> Option<Profile> {
         "xbox" => Some(profile),
         "nintendo" => {
             profile.swap_ab = true;
-            profile
-                .remap
-                .insert("BTN_NORTH".into(), "BTN_WEST".into());
-            profile
-                .remap
-                .insert("BTN_WEST".into(), "BTN_NORTH".into());
+            profile.remap.insert("BTN_NORTH".into(), "BTN_WEST".into());
+            profile.remap.insert("BTN_WEST".into(), "BTN_NORTH".into());
             Some(profile)
         }
         _ => None,

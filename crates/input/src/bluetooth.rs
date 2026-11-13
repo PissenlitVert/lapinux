@@ -103,7 +103,8 @@ pub fn power_off(mac: &str) -> Result<(), String> {
 pub fn wired_takeover(devices: &[DeviceInfo]) -> Vec<String> {
     let mut out = Vec::new();
     for wireless in devices {
-        if wireless.connection != DeviceLink::Bluetooth || !wireless.connected || !wireless.gamepad {
+        if wireless.connection != DeviceLink::Bluetooth || !wireless.connected || !wireless.gamepad
+        {
             continue;
         }
         let Some(mac) = wireless
@@ -174,9 +175,9 @@ pub fn watch_wired_takeover() {
                                     "{mac} branchée : Bluetooth coupé au profit du câble"
                                 );
                             }
-                            Err(err) => tracing::debug!(
-                                "bascule filaire de {mac} impossible : {err}"
-                            ),
+                            Err(err) => {
+                                tracing::debug!("bascule filaire de {mac} impossible : {err}")
+                            }
                         }
                     }
                     attempted.retain(|_, at| at.elapsed() < Duration::from_secs(600));
@@ -264,7 +265,10 @@ fn power_off_result(success: bool, stdout: &str, stderr: &str) -> Result<(), Str
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .find(|line| line.contains("Failed") || line.contains("not available"))
-        .map(|line| line.trim_start_matches("Failed to disconnect: ").to_string());
+        .map(|line| {
+            line.trim_start_matches("Failed to disconnect: ")
+                .to_string()
+        });
     Err(reason.unwrap_or_else(|| "la liaison n'a pas été coupée".to_string()))
 }
 
@@ -370,10 +374,7 @@ fn parse_paired(text: &str) -> Vec<(String, String)> {
 }
 
 fn parse_macs(text: &str) -> Vec<String> {
-    parse_paired(text)
-        .into_iter()
-        .map(|(mac, _)| mac)
-        .collect()
+    parse_paired(text).into_iter().map(|(mac, _)| mac).collect()
 }
 
 fn parse_details(mac: &str, text: &str) -> BluetoothDetails {
@@ -441,7 +442,9 @@ fn class_label(text: &str) -> Option<&'static str> {
 }
 
 fn yes(text: &str, key: &str) -> bool {
-    field(text, key).map(|value| value == "yes").unwrap_or(false)
+    field(text, key)
+        .map(|value| value == "yes")
+        .unwrap_or(false)
 }
 
 /// `0x5f (95)` → 95.
@@ -553,26 +556,26 @@ mod tests {
 
     #[test]
     fn paired_lines_keep_names_with_spaces() {
-        let text = "Device 44:46:48:2E:38:09 DualSense Wireless Controller\n\
-                    Device DC:68:EB:3E:F6:C0 Pro Controller\n\
-                    Device E4:57:68:99:D3:3E Nathan的iQOO 13\n";
+        let text = "Device 02:00:00:00:00:01 DualSense Wireless Controller\n\
+                    Device 02:00:00:00:00:02 Pro Controller\n\
+                    Device 02:00:00:00:00:03 Téléphone Exemple\n";
         let pads = parse_paired(text);
         assert_eq!(pads.len(), 3);
-        assert_eq!(pads[0].0, "44:46:48:2E:38:09");
+        assert_eq!(pads[0].0, "02:00:00:00:00:01");
         assert_eq!(pads[0].1, "DualSense Wireless Controller");
-        assert_eq!(pads[2].1, "Nathan的iQOO 13");
+        assert_eq!(pads[2].1, "Téléphone Exemple");
     }
 
     #[test]
     fn only_gaming_devices_are_kept() {
-        let duel = "Device 44:46:48:2E:38:09 (public)\n\
+        let duel = "Device 02:00:00:00:00:01 (public)\n\
                     \tName: DualSense Wireless Controller\n\
                     \tAlias: DualSense Wireless Controller\n\
                     \tClass: 0x00002508 (9480)\n\
                     \tIcon: input-gaming\n\
                     \tConnected: no\n\
                     \tModalias: usb:v054Cp0CE6d0100\n";
-        let pad = parse_info("44:46:48:2E:38:09", duel, "Manette", &[]).unwrap();
+        let pad = parse_info("02:00:00:00:00:01", duel, "Manette", &[]).unwrap();
         assert_eq!(pad.name, "DualSense Wireless Controller");
         assert_eq!(pad.vendor, 0x054c);
         assert_eq!(pad.product, 0x0ce6);
@@ -580,7 +583,7 @@ mod tests {
         assert_eq!(pad.connection, DeviceLink::Bluetooth);
 
         let headset = "Name: UGREEN HiTune\nClass: 0x00240404\nIcon: audio-headset\n";
-        assert!(parse_info("CB:F5:35:81:15:40", headset, "HiTune", &[]).is_none());
+        assert!(parse_info("02:00:00:00:00:04", headset, "HiTune", &[]).is_none());
     }
 
     #[test]
@@ -595,7 +598,7 @@ mod tests {
 
     #[test]
     fn bluetooth_details_read_the_bluez_fields() {
-        let text = "Device 44:46:48:2E:38:09 (public)\n\
+        let text = "Device 02:00:00:00:00:01 (public)\n\
                     \tName: DualSense Wireless Controller\n\
                     \tAlias: DualSense Wireless Controller\n\
                     \tClass: 0x00002508 (9480)\n\
@@ -611,8 +614,8 @@ mod tests {
                     \tUUID: Human Interface Device... (00001124-0000-1000-8000-00805f9b34fb)\n\
                     \tModalias: usb:v054Cp0CE6d0100\n\
                     \tBattery Percentage: 0x5f (95)\n";
-        let details = parse_details("44:46:48:2E:38:09", text);
-        assert_eq!(details.address, "44:46:48:2E:38:09");
+        let details = parse_details("02:00:00:00:00:01", text);
+        assert_eq!(details.address, "02:00:00:00:00:01");
         assert_eq!(details.address_type, "public");
         assert_eq!(details.name, "DualSense Wireless Controller");
         assert_eq!(details.class, "0x00002508");
@@ -639,12 +642,12 @@ mod tests {
 
     #[test]
     fn le_link_and_signal_are_decoded() {
-        let text = "Device DC:68:EB:3E:F6:C0 (random)\n\
+        let text = "Device 02:00:00:00:00:02 (random)\n\
                     \tClass: 0x00002508 (9480)\n\
                     \tUUID: Human Interface Device... (00001812-0000-1000-8000-00805f9b34fb)\n\
                     \tRSSI: -61\n\
                     \tTxPower: 0x04 (4)\n";
-        let details = parse_details("DC:68:EB:3E:F6:C0", text);
+        let details = parse_details("02:00:00:00:00:02", text);
         assert!(details.le_hid && !details.hid);
         assert_eq!(details.link_label(), "HID over GATT (LE)");
         assert_eq!(details.rssi, Some(-61));
@@ -663,7 +666,7 @@ mod tests {
         assert_eq!(
             power_off_result(
                 true,
-                "Attempting to disconnect from 44:46:48:2E:38:09\nDisconnection successful\n",
+                "Attempting to disconnect from 02:00:00:00:00:01\nDisconnection successful\n",
                 ""
             ),
             Ok(())
@@ -707,11 +710,15 @@ mod tests {
 
     #[test]
     fn a_wired_pad_takes_over_from_its_bluetooth_link() {
-        let wireless = pad("DualSense", DeviceLink::Bluetooth, Some("44:46:48:2E:38:09"));
+        let wireless = pad(
+            "DualSense",
+            DeviceLink::Bluetooth,
+            Some("02:00:00:00:00:01"),
+        );
         let wired = pad("DualSense", DeviceLink::Usb, None);
         assert_eq!(
             wired_takeover(&[wireless.clone(), wired.clone()]),
-            vec!["44:46:48:2E:38:09".to_string()]
+            vec!["02:00:00:00:00:01".to_string()]
         );
 
         // Seule, la liaison sans fil reste en place.
@@ -731,17 +738,16 @@ mod tests {
 
     #[test]
     fn connect_reports_bluez_failures_in_french() {
-        assert_eq!(
-            connect_result(true, "Connection successful\n", ""),
-            Ok(())
-        );
+        assert_eq!(connect_result(true, "Connection successful\n", ""), Ok(()));
         assert_eq!(
             connect_result(
                 false,
                 "Failed to connect: org.bluez.Error.Failed br-connection-create-socket\n",
                 ""
             ),
-            Err("manette éteinte ou hors de portée : appuie sur PS ou branche le câble".to_string())
+            Err(
+                "manette éteinte ou hors de portée : appuie sur PS ou branche le câble".to_string()
+            )
         );
         assert_eq!(
             connect_result(false, "Failed to connect: org.bluez.Error.InProgress\n", ""),
@@ -758,10 +764,10 @@ mod tests {
     fn connected_list_falls_back_when_info_has_no_state() {
         let info = "Name: Pro Controller\nClass: 0x00000508\n";
         let pad = parse_info(
-            "DC:68:EB:3E:F6:C0",
+            "02:00:00:00:00:02",
             info,
             "Pro Controller",
-            &["DC:68:EB:3E:F6:C0".to_string()],
+            &["02:00:00:00:00:02".to_string()],
         )
         .unwrap();
         assert!(pad.connected);

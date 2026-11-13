@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dépendances système
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgl1-mesa-dev libegl1-mesa-dev libgl1-mesa-dri mesa-vulkan-drivers libvulkan1 \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev \
+            libxkbcommon-dev libwayland-dev squashfs-tools imagemagick
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Garde i18n
+        run: ./scripts/check-i18n.sh
+
+      - name: Vérification du workspace
+        run: cargo check --workspace
+
+      - name: Tests du workspace
+        run: cargo test --workspace
+
+      - name: Tests UI en anglais
+        run: LAPINUX_LANG=en cargo test -p lapinux-ui --lib -- --test-threads=1
+
+      - name: Tests cœur en anglais
+        run: LAPINUX_LANG=en cargo test -p lapinux-core --lib -- --test-threads=1
+
+      - name: Contenu de l'AppImage (runtime de test, sans diffusion)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/appimage-ci
+          printf 'runtime de test\n' > target/appimage-ci/runtime
+          runtime="$PWD/target/appimage-ci/runtime"
+          output="$PWD/target/appimage-ci/Lapinux-test.AppImage"
+          checksum=$(sha256sum "$runtime" | cut -d' ' -f1)
+          LAPINUX_APPIMAGE_PROFILE=dev \
+          LAPINUX_APPIMAGE_RUNTIME="$runtime" \
+          LAPINUX_APPIMAGE_RUNTIME_SHA256="$checksum" \
+          LAPINUX_APPIMAGE_OUTPUT="$output" ./scripts/build-appimage.sh
+          unsquashfs -s -offset "$(wc -c < "$runtime")" "$output" | grep -q 'Compression gzip'
+          unsquashfs -offset "$(wc -c < "$runtime")" -d target/appimage-ci/extrait "$output"
+          test -x target/appimage-ci/extrait/usr/bin/lapinux
+          test -x target/appimage-ci/extrait/usr/bin/lapinux-probe
+          test -f target/appimage-ci/extrait/usr/bin/libsteam_api.so
+          test -x target/appimage-ci/extrait/AppRun
+          for notice in OFL-Inter.txt LICENSE-RemixIcon.txt LICENSE.SweetFX LICENSE-vkbasalt LICENSE-egui-MIT LICENSE-egui-APACHE; do
+            test -s "target/appimage-ci/extrait/usr/share/licenses/lapinux/$notice"
+          done

@@ -10,10 +10,10 @@ serde_json = "1"
 ureq = "2"
 thiserror = "1"
 tracing = "0.1"
+libc = "0.2"
+tempfile = "3"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 # Sauvegardes cloud GOG : les métadonnées de build sont en zlib et l'envoi
 # exige un corps gzippé avec son empreinte MD5.
 flate2 = "1"
 
-[dev-dependencies]
-tempfile = "3"

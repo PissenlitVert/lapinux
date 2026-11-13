@@ -1,6 +1,5 @@
 //! Copies locales des sauvegardes, dans la fiche d'un jeu : trois emplacements
-//! à recharger, la copie qui correspond à l'état du jeu et son origine, la
-//! restauration et l'export.
+//! à recharger, la copie active et son origine, la restauration et l'export.
 //!
 //! Le daemon fait le travail (copie, empreinte, rotation, journal) ; ici on ne
 //! garde qu'un petit cache par jeu, relu après chaque action.
@@ -78,7 +77,11 @@ impl Panel {
     pub fn ensure(&mut self, ctx: &egui::Context, client: &Client, appid: u32) {
         if self.snapshots.contains_key(&appid)
             || self.errors.contains_key(&appid)
-            || self.fetch.as_ref().map(|(id, _)| *id == appid).unwrap_or(false)
+            || self
+                .fetch
+                .as_ref()
+                .map(|(id, _)| *id == appid)
+                .unwrap_or(false)
         {
             return;
         }
@@ -113,7 +116,8 @@ impl Panel {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.errors.insert(*appid, "lecture interrompue".into());
+                    self.errors
+                        .insert(*appid, lapinux_core::i18n::t("ui.read_interrupted").into());
                     self.fetch = None;
                 }
             }
@@ -223,7 +227,9 @@ impl Panel {
         let busy = self.busy(appid);
         let selected = self.selected.get(&appid).cloned();
         let subtitle = if snapshots.is_empty() {
-            lapinux_core::i18n::t("saves.slots_empty").to_string().to_string()
+            lapinux_core::i18n::t("saves.slots_empty")
+                .to_string()
+                .to_string()
         } else {
             lapinux_core::i18n::t_args(
                 "saves.slots_used",
@@ -235,177 +241,196 @@ impl Panel {
         let mut arm_delete = None;
         let mut delete_now = None;
         let mut save_slot = None;
-        settings_card(ui, lapinux_core::i18n::t("saves.slots_title"), &subtitle, |ui| {
-            let width = slot_width(ui.available_width(), SLOT_GAP);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(SLOT_GAP, 0.0);
-                for index in 0..3 {
-                    let slot = index as u8 + 1;
-                    match snapshots.iter().find(|snapshot| snapshot.slot == slot) {
-                        Some(snapshot) => {
-                            let selected = selected.as_deref() == Some(snapshot.id.as_str());
-                            let armed_delete = self
-                                .delete_armed
-                                .as_ref()
-                                .map(|(id, chosen)| *id == appid && chosen == &snapshot.id)
-                                .unwrap_or(false);
-                            let reply = slot_tile(
-                                ui,
-                                width,
-                                slot,
-                                snapshot,
-                                selected,
-                                busy,
-                                armed_delete,
-                                active.as_ref().map(|copy| copy.id == snapshot.id).unwrap_or(false),
-                            );
-                            if reply.delete {
-                                if armed_delete {
-                                    delete_now = Some(snapshot.id.clone());
-                                } else {
-                                    arm_delete = Some(snapshot.id.clone());
+        settings_card(
+            ui,
+            lapinux_core::i18n::t("saves.slots_title"),
+            &subtitle,
+            |ui| {
+                let width = slot_width(ui.available_width(), SLOT_GAP);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(SLOT_GAP, 0.0);
+                    for index in 0..3 {
+                        let slot = index as u8 + 1;
+                        match snapshots.iter().find(|snapshot| snapshot.slot == slot) {
+                            Some(snapshot) => {
+                                let selected = selected.as_deref() == Some(snapshot.id.as_str());
+                                let armed_delete = self
+                                    .delete_armed
+                                    .as_ref()
+                                    .map(|(id, chosen)| *id == appid && chosen == &snapshot.id)
+                                    .unwrap_or(false);
+                                let reply = slot_tile(
+                                    ui,
+                                    width,
+                                    slot,
+                                    snapshot,
+                                    selected,
+                                    busy,
+                                    armed_delete,
+                                    active
+                                        .as_ref()
+                                        .map(|copy| copy.id == snapshot.id)
+                                        .unwrap_or(false),
+                                );
+                                if reply.delete {
+                                    if armed_delete {
+                                        delete_now = Some(snapshot.id.clone());
+                                    } else {
+                                        arm_delete = Some(snapshot.id.clone());
+                                    }
+                                } else if reply.selected {
+                                    click = Some(snapshot.id.clone());
                                 }
-                            } else if reply.selected {
-                                click = Some(snapshot.id.clone());
+                            }
+                            None => {
+                                if empty_slot(ui, width, slot, busy).clicked() && !busy {
+                                    save_slot = Some(slot);
+                                }
                             }
                         }
-                        None => {
-                            if empty_slot(ui, width, slot, busy).clicked() && !busy {
-                                save_slot = Some(slot);
-                            }
-                        }
                     }
-                }
-            });
-            ui.add_space(10.0);
-            let selected_copy = selected
-                .as_ref()
-                .and_then(|id| snapshots.iter().find(|snapshot| &snapshot.id == id))
-                .cloned();
-            let armed_delete = self
-                .delete_armed
-                .as_ref()
-                .map(|(id, chosen)| {
-                    *id == appid
-                        && selected_copy
-                            .as_ref()
-                            .map(|copy| &copy.id == chosen)
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            let place = match selected_copy.as_ref() {
-                Some(copy) if (1..=3).contains(&copy.slot) => {
-                    lapinux_core::i18n::t_args(
-                        "saves.slot",
-                        &[("slot", &copy.slot.to_string())],
-                    )
-                }
-                Some(copy) => lapinux_core::i18n::t_args(
-                    "saves.copy_of_date",
-                    &[("date", &format_datetime(copy.created))],
-                ),
-                None => String::new(),
-            };
-            let label = if selected_copy.is_none() {
-                lapinux_core::i18n::t("saves.choose_slot").to_string().to_string()
-            } else if installed && relaunch {
-                // Le jeu ne relit ses fichiers qu'au démarrage : charger le
-                // relance aussitôt, comme un chargement depuis son menu.
-                lapinux_core::i18n::t_args("saves.load_and_play", &[("place", &place)])
-            } else {
-                lapinux_core::i18n::t_args("saves.load", &[("place", &place)])
-            };
-            let ready = selected_copy.is_some() && !busy;
-            ui.horizontal(|ui| {
-                let spacing = ui.spacing().item_spacing.x;
-                let used = crate::CARD_GLYPH_SIZE * 2.0 + spacing * 2.0;
-                let width = (ui.available_width() - used).max(120.0);
-                if ui
-                    .add_enabled(
-                        ready,
-                        egui::Button::new(label)
-                            .min_size(egui::vec2(width, crate::CARD_GLYPH_SIZE)),
-                    )
-                    .clicked()
-                {
-                    if let Some(copy) = &selected_copy {
-                        load = Some(copy.id.clone());
-                    }
-                }
-                let folder = ui
-                    .add_enabled_ui(ready, |ui| {
-                        crate::card_glyph_button(
-                            ui,
-                            crate::CardGlyph::Folder,
-                            lapinux_core::i18n::t("saves.open_slot"),
-                        )
-                    })
-                    .inner;
-                if folder.clicked() {
-                    if let Some(copy) = &selected_copy {
-                        crate::open_path(Path::new(&copy.path));
-                    }
-                }
-                let glyph = if armed_delete {
-                    crate::CardGlyph::Check
-                } else {
-                    crate::CardGlyph::Trash
-                };
-                let hint = if armed_delete {
-                    lapinux_core::i18n::t("saves.confirm_delete_slot")
-                } else {
-                    lapinux_core::i18n::t("saves.delete_slot")
-                };
-                let trash = ui
-                    .add_enabled_ui(ready, |ui| crate::card_glyph_button(ui, glyph, hint))
-                    .inner;
-                if trash.clicked() {
-                    if let Some(copy) = &selected_copy {
-                        if armed_delete {
-                            delete_now = Some(copy.id.clone());
-                        } else {
-                            arm_delete = Some(copy.id.clone());
-                        }
-                    }
-                }
-            });
-            if armed_delete {
-                if let Some(copy) = &selected_copy {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(lapinux_core::i18n::t_args(
-                            "saves.confirm_delete",
-                            &[("place", &copy_place(copy))],
-                        ))
-                        .size(10.5)
-                        .color(DANGER),
+                });
+                if let Some(copy) = &active {
+                    ui.add_space(4.0);
+                    muted(
+                        ui,
+                        lapinux_core::i18n::t_args(
+                            "saves.active_copy",
+                            &[
+                                ("place", &copy_place(copy)),
+                                ("origin", &copy_origin(&events, copy)),
+                            ],
+                        ),
                     );
                 }
-            }
-            if let Some(first) = snapshots.first() {
-                if Path::new(&first.source).is_dir() {
-                    ui.add_space(4.0);
-                    if link_text(ui, lapinux_core::i18n::t("saves.open_game_folder")).clicked() {
-                        crate::open_path(Path::new(&first.source));
+                ui.add_space(10.0);
+                let selected_copy = selected
+                    .as_ref()
+                    .and_then(|id| snapshots.iter().find(|snapshot| &snapshot.id == id))
+                    .cloned();
+                let armed_delete = self
+                    .delete_armed
+                    .as_ref()
+                    .map(|(id, chosen)| {
+                        *id == appid
+                            && selected_copy
+                                .as_ref()
+                                .map(|copy| &copy.id == chosen)
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let place = match selected_copy.as_ref() {
+                    Some(copy) if (1..=3).contains(&copy.slot) => lapinux_core::i18n::t_args(
+                        "saves.slot",
+                        &[("slot", &copy.slot.to_string())],
+                    ),
+                    Some(copy) => lapinux_core::i18n::t_args(
+                        "saves.copy_of_date",
+                        &[("date", &format_datetime(copy.created))],
+                    ),
+                    None => String::new(),
+                };
+                let label = if selected_copy.is_none() {
+                    lapinux_core::i18n::t("saves.choose_slot")
+                        .to_string()
+                        .to_string()
+                } else if installed && relaunch {
+                    // Le jeu ne relit ses fichiers qu'au démarrage : charger le
+                    // relance aussitôt, comme un chargement depuis son menu.
+                    lapinux_core::i18n::t_args("saves.load_and_play", &[("place", &place)])
+                } else {
+                    lapinux_core::i18n::t_args("saves.load", &[("place", &place)])
+                };
+                let ready = selected_copy.is_some() && !busy;
+                ui.horizontal(|ui| {
+                    let spacing = ui.spacing().item_spacing.x;
+                    let used = crate::CARD_GLYPH_SIZE * 2.0 + spacing * 2.0;
+                    let width = (ui.available_width() - used).max(120.0);
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(label)
+                                .min_size(egui::vec2(width, crate::CARD_GLYPH_SIZE)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(copy) = &selected_copy {
+                            load = Some(copy.id.clone());
+                        }
+                    }
+                    let folder = ui
+                        .add_enabled_ui(ready, |ui| {
+                            crate::card_glyph_button(
+                                ui,
+                                crate::CardGlyph::Folder,
+                                lapinux_core::i18n::t("saves.open_slot"),
+                            )
+                        })
+                        .inner;
+                    if folder.clicked() {
+                        if let Some(copy) = &selected_copy {
+                            crate::open_path(Path::new(&copy.path));
+                        }
+                    }
+                    let glyph = if armed_delete {
+                        crate::CardGlyph::Check
+                    } else {
+                        crate::CardGlyph::Trash
+                    };
+                    let hint = if armed_delete {
+                        lapinux_core::i18n::t("saves.confirm_delete_slot")
+                    } else {
+                        lapinux_core::i18n::t("saves.delete_slot")
+                    };
+                    let trash = ui
+                        .add_enabled_ui(ready, |ui| crate::card_glyph_button(ui, glyph, hint))
+                        .inner;
+                    if trash.clicked() {
+                        if let Some(copy) = &selected_copy {
+                            if armed_delete {
+                                delete_now = Some(copy.id.clone());
+                            } else {
+                                arm_delete = Some(copy.id.clone());
+                            }
+                        }
+                    }
+                });
+                if armed_delete {
+                    if let Some(copy) = &selected_copy {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(lapinux_core::i18n::t_args(
+                                "saves.confirm_delete",
+                                &[("place", &copy_place(copy))],
+                            ))
+                            .size(10.5)
+                            .color(DANGER),
+                        );
                     }
                 }
-            }
-            if let Some((ok, message)) = self.slot_status.get(&appid) {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(message)
-                        .size(11.0)
-                        .color(if *ok { OK } else { DANGER }),
-                );
-            }
-            if snapshots.is_empty() && !busy {
-                ui.add_space(4.0);
-                muted(
-                    ui,
-                    lapinux_core::i18n::t("saves.none_hint"),
-                );
-            }
-        });
+                if let Some(first) = snapshots.first() {
+                    if Path::new(&first.source).is_dir() {
+                        ui.add_space(4.0);
+                        if link_text(ui, lapinux_core::i18n::t("saves.open_game_folder")).clicked()
+                        {
+                            crate::open_path(Path::new(&first.source));
+                        }
+                    }
+                }
+                if let Some((ok, message)) = self.slot_status.get(&appid) {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(message).size(11.0).color(if *ok {
+                        OK
+                    } else {
+                        DANGER
+                    }));
+                }
+                if snapshots.is_empty() && !busy {
+                    ui.add_space(4.0);
+                    muted(ui, lapinux_core::i18n::t("saves.none_hint"));
+                }
+            },
+        );
         if let Some(id) = click {
             // Un autre choix annule la suppression armée.
             self.delete_armed = None;
@@ -452,94 +477,29 @@ impl Panel {
         }
     }
 
-    /// Encart « Sauvegarde actuelle » : la copie qui correspond à l'état du
-    /// jeu, son origine (fermeture automatique, copie manuelle, emplacement
-    /// chargé) et où elle vit sur le disque.
-    pub fn latest_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        client: &Client,
-        appid: u32,
-    ) {
-        self.poll(ctx);
-        self.ensure(ctx, client, appid);
-        let snapshots = self.snapshots.get(&appid).cloned().unwrap_or_default();
-        let events = self.events.get(&appid).cloned().unwrap_or_default();
-        let active = active_copy(&snapshots, &events);
-        let now = lapinux_core::util::now_unix();
-        let subtitle = match &active {
-            Some(copy) => {
-                let place = if (1..=3).contains(&copy.slot) {
-                    lapinux_core::i18n::t_args(
-                        "saves.slot_title",
-                        &[("slot", &copy.slot.to_string())],
-                    )
-                } else {
-                    lapinux_core::i18n::t_args(
-                        "saves.copy_title",
-                        &[("date", &format_datetime(copy.created))],
-                    )
-                };
-                format!("{place} · {}", copy_origin(&events, copy))
-            }
-            None => lapinux_core::i18n::t("saves.none").to_string(),
-        };
-        settings_card(ui, lapinux_core::i18n::t("saves.current_title"), &subtitle, |ui| match &active {
-            Some(copy) => {
-                muted(
-                    ui,
-                    lapinux_core::i18n::t_args(
-                        "saves.detail",
-                        &[
-                            ("date", &format_datetime(copy.created)),
-                            ("files", &copy.files.to_string()),
-                            ("size", &format_bytes(copy.bytes)),
-                            (
-                                "when",
-                                &lapinux_core::util::format_duration(
-                                    (now - copy.created).max(0) as u64,
-                                ),
-                            ),
-                        ],
-                    ),
-                );
-                muted(
-                    ui,
-                    lapinux_core::i18n::t_args("saves.folder", &[("path", &copy.path)]),
-                );
-                if link_text(ui, lapinux_core::i18n::t("saves.open_copy_folder")).clicked() {
-                    crate::open_path(Path::new(&copy.path));
-                }
-            }
-            None => muted(
-                ui,
-                lapinux_core::i18n::t("saves.empty_hint"),
-            ),
-        });
-    }
-
-    /// Encart de la fiche. Rend le nouvel état du réglage « copie
-    /// automatique » quand la case a changé.
-    pub fn card(
+    /// Encart de la fiche : prendre une copie, exporter les copies et, au
+    /// besoin, choisir un dossier de sauvegarde quand la détection se trompe.
+    pub fn card<F>(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         client: &Client,
         appid: u32,
         installed: bool,
-        auto: bool,
-    ) -> Option<bool> {
+        folder: Option<F>,
+    ) where
+        F: FnOnce(&mut egui::Ui),
+    {
         self.poll(ctx);
         self.ensure(ctx, client, appid);
-        let mut auto = auto;
-        let mut changed = None;
         let busy = self.busy(appid);
         let snapshots = self.snapshots.get(&appid).cloned().unwrap_or_default();
         let error = self.errors.get(&appid).cloned();
         let status = self.status.get(&appid).cloned();
         let subtitle = if snapshots.is_empty() {
-            lapinux_core::i18n::t("saves.settings_subtitle").to_string().to_string()
+            lapinux_core::i18n::t("saves.settings_subtitle")
+                .to_string()
+                .to_string()
         } else {
             let bytes: u64 = snapshots.iter().map(|snapshot| snapshot.bytes).sum();
             lapinux_core::i18n::t_args(
@@ -550,109 +510,115 @@ impl Panel {
                 ],
             )
         };
-        settings_card(ui, lapinux_core::i18n::t("saves.settings_title"), &subtitle, |ui| {
-            if ui
-                .checkbox(&mut auto, lapinux_core::i18n::t("saves.copy_on_close"))
-                .changed()
-            {
-                changed = Some(auto);
-            }
-            muted(
-                ui,
-                lapinux_core::i18n::t("saves.copy_on_close_desc"),
-            );
-            if !installed {
-                ui.add_space(10.0);
-                muted(
-                    ui,
-                    lapinux_core::i18n::t("saves.not_installed"),
-                );
-            }
-            if let Some(error) = &error {
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(format!("Lecture impossible : {error}"))
+        settings_card(
+            ui,
+            lapinux_core::i18n::t("saves.settings_title"),
+            &subtitle,
+            |ui| {
+                if !installed {
+                    ui.add_space(10.0);
+                    muted(ui, lapinux_core::i18n::t("saves.not_installed"));
+                }
+                if let Some(error) = &error {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(lapinux_core::i18n::t_args(
+                            "ui.read_failed",
+                            &[("error", &error.to_string())],
+                        ))
                         .size(11.0)
                         .color(DANGER),
-                );
-            }
-            if let Some((ok, message)) = &status {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(message)
-                        .size(11.0)
-                        .color(if *ok { OK } else { DANGER }),
-                );
-            }
-            ui.add_space(10.0);
-            let width = ui.available_width();
-            if busy {
-                ui.add_enabled(
-                    false,
-                    egui::Button::new("Sauvegarde en cours…").min_size(egui::vec2(width, 28.0)),
-                );
-            } else if ui
-                .add_sized(
-                    [width, 28.0],
-                    egui::Button::new(lapinux_core::i18n::t("saves.backup_now")),
-                )
-                .on_hover_text(
-                    lapinux_core::i18n::t("saves.backup_now_desc"),
-                )
-                .clicked()
-            {
-                let worker = detached(client);
-                self.spawn_action(ctx, appid, ActionKind::Other, move || backup(&worker, appid));
-            }
-            ui.add_space(8.0);
-            let open = self.export_for == Some(appid);
-            if ui
-                .button(egui::RichText::new(if open {
-                    "Fermer l'export"
-                } else {
-                    lapinux_core::i18n::t("saves.export")
-                })
-                .size(11.0))
-                .clicked()
-            {
-                self.export_for = if open { None } else { Some(appid) };
-            }
-            if self.export_for == Some(appid) {
-                ui.add_space(6.0);
-                field_label(ui, lapinux_core::i18n::t("saves.export_folder"));
-                let mut dir = self.export_dir.clone();
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut dir)
-                            .hint_text("~/Sauvegardes")
-                            .desired_width(f32::INFINITY),
-                    )
-                    .changed()
-                {
-                    self.export_dir = dir.clone();
+                    );
                 }
-                muted(
-                    ui,
-                    lapinux_core::i18n::t("saves.export_desc"),
-                );
-                let ready = !self.export_dir.trim().is_empty();
-                ui.add_space(6.0);
+                if let Some((ok, message)) = &status {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(message).size(11.0).color(if *ok {
+                        OK
+                    } else {
+                        DANGER
+                    }));
+                }
+                ui.add_space(10.0);
+                let width = ui.available_width();
+                if busy {
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(lapinux_core::i18n::t("ui.saves_busy"))
+                            .min_size(egui::vec2(width, 28.0)),
+                    );
+                } else if ui
+                    .add_sized(
+                        [width, 28.0],
+                        egui::Button::new(lapinux_core::i18n::t("saves.backup_now")),
+                    )
+                    .on_hover_text(lapinux_core::i18n::t("saves.backup_now_desc"))
+                    .clicked()
+                {
+                    let worker = detached(client);
+                    self.spawn_action(ctx, appid, ActionKind::Other, move || {
+                        backup(&worker, appid)
+                    });
+                }
+                ui.add_space(8.0);
+                let open = self.export_for == Some(appid);
                 if ui
-                    .add_enabled(
-                        ready && !busy,
-                        egui::Button::new("Exporter").min_size(egui::vec2(ui.available_width(), 26.0)),
+                    .button(
+                        egui::RichText::new(if open {
+                            lapinux_core::i18n::t("saves.close_export")
+                        } else {
+                            lapinux_core::i18n::t("saves.export")
+                        })
+                        .size(11.0),
                     )
                     .clicked()
                 {
-                    let dest = self.export_dir.clone();
-                    let worker = detached(client);
-                    self.spawn_action(ctx, appid, ActionKind::Other, move || {
-                        export(&worker, appid, &dest)
-                    });
+                    self.export_for = if open { None } else { Some(appid) };
                 }
-            }
-        });
-        changed
+                if self.export_for == Some(appid) {
+                    ui.add_space(6.0);
+                    field_label(ui, lapinux_core::i18n::t("saves.export_folder"));
+                    let mut dir = self.export_dir.clone();
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut dir)
+                                .hint_text(lapinux_core::i18n::t("saves.export_example"))
+                                .desired_width(f32::INFINITY),
+                        )
+                        .changed()
+                    {
+                        self.export_dir = dir.clone();
+                    }
+                    muted(ui, lapinux_core::i18n::t("saves.export_desc"));
+                    let ready = !self.export_dir.trim().is_empty();
+                    ui.add_space(6.0);
+                    if ui
+                        .add_enabled(
+                            ready && !busy,
+                            egui::Button::new(lapinux_core::i18n::t("saves.export"))
+                                .min_size(egui::vec2(ui.available_width(), 26.0)),
+                        )
+                        .clicked()
+                    {
+                        let dest = self.export_dir.clone();
+                        let worker = detached(client);
+                        self.spawn_action(ctx, appid, ActionKind::Other, move || {
+                            export(&worker, appid, &dest)
+                        });
+                    }
+                }
+                if let Some(folder) = folder {
+                    ui.add_space(10.0);
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(lapinux_core::i18n::t("saves.custom_folder"))
+                            .size(11.5)
+                            .color(TEXT_DIM()),
+                    )
+                    .id_salt(("saves-folder", appid))
+                    .default_open(false)
+                    .show(ui, folder);
+                }
+            },
+        );
     }
 }
 
@@ -680,18 +646,11 @@ fn copy_place(snapshot: &SaveSnapshot) -> String {
 fn active_copy(snapshots: &[SaveSnapshot], events: &[SaveEvent]) -> Option<SaveSnapshot> {
     let latest = events
         .iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                SaveEventKind::Backup | SaveEventKind::Restore
-            )
-        })
+        .filter(|event| matches!(event.kind, SaveEventKind::Backup | SaveEventKind::Restore))
         .max_by_key(|event| event.at);
-    if let Some(copy) = latest.and_then(|event| {
-        snapshots
-            .iter()
-            .find(|copy| copy.id == event.snapshot)
-    }) {
+    if let Some(copy) =
+        latest.and_then(|event| snapshots.iter().find(|copy| copy.id == event.snapshot))
+    {
         return Some(copy.clone());
     }
     // Sans journal lisible, la plus récente reste la meilleure indication.
@@ -704,24 +663,25 @@ fn copy_origin(events: &[SaveEvent], copy: &SaveSnapshot) -> String {
     match events
         .iter()
         .filter(|event| event.snapshot == copy.id)
-        .filter(|event| {
-            matches!(
-                event.kind,
-                SaveEventKind::Backup | SaveEventKind::Restore
-            )
-        })
+        .filter(|event| matches!(event.kind, SaveEventKind::Backup | SaveEventKind::Restore))
         .max_by_key(|event| event.at)
     {
-        Some(event) if event.kind == SaveEventKind::Restore => {
-            lapinux_core::i18n::t_args(
-                "saves.origin.restored",
-                &[("date", &format_datetime(event.at))],
-            )
-        }
-        Some(event) if event.auto => lapinux_core::i18n::t("saves.origin.auto").to_string().to_string(),
-        Some(event) if event.imported => lapinux_core::i18n::t("saves.origin.imported").to_string().to_string(),
-        Some(_) => lapinux_core::i18n::t("saves.origin.manual").to_string().to_string(),
-        None => lapinux_core::i18n::t("saves.origin.local").to_string().to_string(),
+        Some(event) if event.kind == SaveEventKind::Restore => lapinux_core::i18n::t_args(
+            "saves.origin.restored",
+            &[("date", &format_datetime(event.at))],
+        ),
+        Some(event) if event.auto => lapinux_core::i18n::t("saves.origin.auto")
+            .to_string()
+            .to_string(),
+        Some(event) if event.imported => lapinux_core::i18n::t("saves.origin.imported")
+            .to_string()
+            .to_string(),
+        Some(_) => lapinux_core::i18n::t("saves.origin.manual")
+            .to_string()
+            .to_string(),
+        None => lapinux_core::i18n::t("saves.origin.local")
+            .to_string()
+            .to_string(),
     }
 }
 
@@ -780,7 +740,7 @@ fn slot_tile(
     painter.text(
         egui::pos2(inner.left(), inner.top() + 37.0),
         egui::Align2::LEFT_TOP,
-        format!("{} fichiers", snapshot.files),
+        lapinux_core::i18n::t_fmt("saves.files_count", &[snapshot.files.to_string()]),
         egui::FontId::proportional(10.5),
         TEXT_DIM(),
     );
@@ -912,7 +872,7 @@ fn envelope_message(envelope: lapinux_core::ipc::Envelope, ok: &str) -> Result<S
     if !envelope.ok {
         return Err(envelope
             .error
-            .unwrap_or_else(|| "erreur inconnue".into()));
+            .unwrap_or_else(|| lapinux_core::i18n::t("saves.unknown_error").into()));
     }
     Ok(ok.to_string())
 }
@@ -920,10 +880,7 @@ fn envelope_message(envelope: lapinux_core::ipc::Envelope, ok: &str) -> Result<S
 fn backup(client: &Client, appid: u32) -> Result<String, String> {
     let envelope = client
         .request_with_timeout(
-            &Req::BackupSaves {
-                appid,
-                slot: None,
-            },
+            &Req::BackupSaves { appid, slot: None },
             Duration::from_secs(120),
         )
         .map_err(|error| error.to_string())?;
@@ -1013,7 +970,7 @@ fn restore(client: &Client, appid: u32, id: &str, launching: bool) -> Result<Str
     if !envelope.ok {
         return Err(envelope
             .error
-            .unwrap_or_else(|| "chargement impossible".into()));
+            .unwrap_or_else(|| lapinux_core::i18n::t("saves.load_error").into()));
     }
     let files = envelope
         .data
@@ -1082,13 +1039,20 @@ mod tests {
             slot: 2,
             ..Default::default()
         };
-        assert_eq!(copy_place(&copy), "l'emplacement 2");
+        assert_eq!(
+            copy_place(&copy),
+            lapinux_core::i18n::t_args("saves.slot", &[("slot", "2")])
+        );
         let legacy = SaveSnapshot {
             slot: 0,
             created: 1_700_000_000,
             ..Default::default()
         };
-        assert!(copy_place(&legacy).starts_with("la copie du "));
+        let copy_prefix = lapinux_core::i18n::t("saves.copy_of_date")
+            .split("{date}")
+            .next()
+            .unwrap();
+        assert!(copy_place(&legacy).starts_with(copy_prefix));
     }
 
     #[test]
@@ -1115,7 +1079,8 @@ mod tests {
         }];
         let active = active_copy(&[loaded, safety], &events).unwrap();
         assert_eq!(active.id, "100");
-        assert!(copy_origin(&events, &active).starts_with("chargée dans le jeu"));
+        assert!(copy_origin(&events, &active)
+            .starts_with(lapinux_core::i18n::t("saves.restored_prefix")));
     }
 
     #[test]
@@ -1143,6 +1108,9 @@ mod tests {
             snapshot: copy.id.clone(),
             ..Default::default()
         };
-        assert_eq!(copy_origin(&[manual], &copy), lapinux_core::i18n::t("saves.origin.manual").to_string());
+        assert_eq!(
+            copy_origin(&[manual], &copy),
+            lapinux_core::i18n::t("saves.origin.manual").to_string()
+        );
     }
 }

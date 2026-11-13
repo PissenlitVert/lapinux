@@ -1,8 +1,9 @@
 //! Client Wayland minimal : surface wlr-layer-shell de type overlay.
 
 use crate::menu::{Action, Live, MenuState, Page};
-use crate::render::{panel_bounds, Renderer};
+use crate::render::{hover_at, panel_bounds, Renderer};
 use crate::shm::Mapping;
+use crate::xkb::{fallback_text, Xkb, KEY_BACKSPACE, KEY_ESCAPE, KEY_RETURN};
 use crate::{Error, Result};
 use lapinux_core::client::Client;
 use lapinux_core::ipc::Req;
@@ -10,7 +11,6 @@ use lapinux_core::model::SessionInfo;
 use lapinux_core::paths::LapinuxPaths;
 use lapinux_core::social::SteamFriendsState;
 use lapinux_input::{Nav, NavReader};
-use crate::xkb::{fallback_text, Xkb, KEY_BACKSPACE, KEY_ESCAPE, KEY_RETURN};
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::OpenOptionsExt;
@@ -54,6 +54,18 @@ pub struct OverlayOptions {
     /// Écran Wayland cible (`DP-2`). Sans lui, le compositeur choisit la
     /// sortie par défaut, qui n'est pas forcément celle du jeu.
     pub output: Option<String>,
+    /// Échecs renvoyés par le fil qui interroge le daemon. L'overlay les
+    /// applique entre deux images, sans bloquer le menu.
+    pub results: Option<std::sync::mpsc::Receiver<ActionFailed>>,
+}
+
+/// Action que le daemon a refusée, renvoyée au panneau après coup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionFailed {
+    /// Forme filaire de l'action, par exemple `invite:7656119…`.
+    pub action: String,
+    /// Message d'erreur du daemon, affiché tel quel sur la page d'amis.
+    pub error: String,
 }
 
 impl Default for OverlayOptions {
@@ -68,6 +80,7 @@ impl Default for OverlayOptions {
             nav_fifo: None,
             hud_only: false,
             output: None,
+            results: None,
         }
     }
 }
@@ -112,7 +125,11 @@ fn watch_session(
         let recording = client
             .request_with_timeout(&Req::RecordingStatus, Duration::from_secs(2))
             .ok()
-            .and_then(|envelope| envelope.into_data::<Option<lapinux_core::model::RecordingState>>().ok())
+            .and_then(|envelope| {
+                envelope
+                    .into_data::<Option<lapinux_core::model::RecordingState>>()
+                    .ok()
+            })
             .flatten();
         // La charge de la machine voyage à part : le panneau n'en a pas
         // besoin, la plaque de performance si.
@@ -135,10 +152,7 @@ fn watch_session(
         // Le volume réel du flux du jeu : le curseur part de la valeur
         // effective, pas d'un 100 % arbitraire.
         let volume = client
-            .request_with_timeout(
-                &Req::GameVolume { volume: None },
-                Duration::from_secs(2),
-            )
+            .request_with_timeout(&Req::GameVolume { volume: None }, Duration::from_secs(2))
             .ok()
             .and_then(|envelope| envelope.data.get("volume").and_then(|value| value.as_f64()))
             .map(|value| (value as f32).clamp(0.0, 1.0));
@@ -167,7 +181,6 @@ fn watch_session(
                 session_secs: Some((lapinux_core::util::now_unix() - info.started).max(0) as u64),
                 dlss: info.dlss,
                 series: info.fps_series,
-                hud_live: info.hud_live,
                 gamescope: info.gamescope,
                 recording,
                 volume,
@@ -216,8 +229,12 @@ struct App {
     /// Wayland ne donnent que des codes et aucun texte (AZERTY compris).
     xkb: Option<Xkb>,
     pointer_pos: (f32, f32),
+    /// Le survol disparaît dès qu'une autre méthode de navigation prend le relais.
+    pointer_hover: bool,
     /// Bouton gauche maintenu : le curseur de cadence se règle au glissement.
     dragging_fps: bool,
+    /// Bouton gauche maintenu sur le rail de génération d'images.
+    dragging_afmf: bool,
     dragging_scale: bool,
     dragging_record_scale: bool,
     dragging_volume: bool,
@@ -241,6 +258,8 @@ struct App {
     configured: bool,
     slots: Vec<Slot>,
     on_action: Box<dyn FnMut(Action)>,
+    /// Réponses d'échec du daemon, lues par la boucle Wayland.
+    results: Option<std::sync::mpsc::Receiver<ActionFailed>>,
     deadline: Option<Instant>,
     exit: bool,
 }
@@ -272,6 +291,15 @@ impl App {
 
     fn dispatch_action(&mut self, action: Option<Action>) {
         if let Some(action) = action {
+            // Une invitation est marquée avant de partir : le clic suivant
+            // sur le bouton ne produit pas un second message Steam.
+            if let Action::InviteFriend(steam_id) = &action {
+                if !self.menu.mark_invite_sent(*steam_id) {
+                    return;
+                }
+                (self.on_action)(Action::InviteFriend(*steam_id));
+                return;
+            }
             if matches!(action, Action::Resume | Action::QuitGame) {
                 self.closing = true;
                 // « Quitter » ne doit pas couper l'animation : le daemon
@@ -321,6 +349,8 @@ impl App {
     /// Navigation à la manette : l'overlay lit les périphériques directement,
     /// le service d'entrée du daemon relâchant son grab tant qu'il est ouvert.
     fn on_nav(&mut self, nav: Nav) {
+        self.pointer_hover = false;
+        self.menu.hover = None;
         match nav {
             Nav::Up => self.menu.prev(),
             Nav::Down => self.menu.next(),
@@ -348,6 +378,8 @@ impl App {
     }
 
     fn on_keycode(&mut self, keycode: u32) {
+        self.pointer_hover = false;
+        self.menu.hover = None;
         // Dans une conversation, le clavier écrit. Entrée envoie, Échap
         // revient à la liste et Retour arrière corrige le dernier caractère.
         if self.menu.page == Page::Invite && self.menu.chat_open() {
@@ -415,14 +447,6 @@ impl App {
             self.menu.close();
             return;
         }
-        // Carré « Amis » du pied du menu principal.
-        if self.menu.page == Page::Menu
-            && self.menu.friends_button_at(panel_x, panel_y, panel_h, x, y)
-        {
-            self.menu.set_page(Page::Invite);
-            self.menu.pulse = 1.0;
-            return;
-        }
         let local_y = y - panel_y;
         match self.menu.page {
             Page::Menu => {
@@ -442,30 +466,28 @@ impl App {
                 }
             }
             Page::Performance => {
-                if let Some(position) =
-                    self.menu
-                        .position_cell_at(panel_x, panel_y, panel_w, x, y)
-                {
-                    self.menu.place_hud(position);
-                    self.menu.perf_selected = 6;
-                    let action = self.menu.hud_action();
-                    self.dispatch_action(Some(action));
-                } else if let Some(mangohud) =
-                    self.menu.engine_at(panel_x, panel_y, panel_w, x, y)
-                {
-                    self.menu.perf_selected = 2;
-                    let action = self.menu.set_engine(mangohud);
-                    self.dispatch_action(action);
-                } else if let Some(row) = self.menu.hit_perf_row(local_y) {
+                if let Some(row) = self.menu.hit_perf_row(local_y) {
                     self.menu.perf_selected = row;
                     self.menu.pulse = 1.0;
                     if row == 1 {
-                        if let Some(index) = self.menu.fps_index_at(x, panel_x, panel_w) {
-                            self.dragging_fps = true;
-                            let action = self.menu.set_fps_index(index);
-                            self.dispatch_action(action);
-                            return;
-                        }
+                        // Un clic n'importe où sur la ligne déplace le
+                        // curseur, même un peu hors de la piste : viser une
+                        // piste fine au pixel près est illusoire.
+                        let index = self.menu.fps_index_near(x, panel_x, panel_w);
+                        self.dragging_fps = true;
+                        let action = self.menu.set_fps_index(index);
+                        self.dispatch_action(action);
+                        return;
+                    }
+                    if row == 2 {
+                        // Le rail se règle comme la piste de cadence : le clic
+                        // choisit le cran le plus proche, les flèches des
+                        // extrémités coupent ou montent à ×4.
+                        let index = self.menu.afmf_index_near(x, panel_x, panel_w);
+                        self.dragging_afmf = true;
+                        let action = self.menu.set_afmf_index(index);
+                        self.dispatch_action(action);
+                        return;
                     }
                     if row == 10 {
                         if let Some(value) = self.menu.scale_at(x, panel_x, panel_w) {
@@ -491,16 +513,29 @@ impl App {
                 // La conversation ouverte garde le clavier et la molette ;
                 // seul le bouton Retour, traité plus haut, en sort.
                 if self.menu.chat_open() {
+                    if let Some(steam_id) = self
+                        .menu
+                        .chat_invite_button_at(x, y, panel_x, panel_y, panel_w)
+                    {
+                        self.menu.pulse = 1.0;
+                        self.dispatch_action(Some(Action::InviteFriend(steam_id)));
+                    }
                     return;
                 }
-                if let Some(index) = self.menu.invite_scroll_index_at(
-                    panel_x,
-                    panel_y,
-                    panel_w,
-                    panel_h,
-                    x,
-                    y,
-                ) {
+                // Le bouton « Inviter » de la fiche passe avant l'ouverture
+                // de la conversation : un clic dessus n'ouvre pas le chat.
+                if let Some(steam_id) = self
+                    .menu
+                    .invite_button_at(x, y, panel_x, panel_y, panel_w, panel_h)
+                {
+                    self.menu.pulse = 1.0;
+                    self.dispatch_action(Some(Action::InviteFriend(steam_id)));
+                    return;
+                }
+                if let Some(index) = self
+                    .menu
+                    .invite_scroll_index_at(panel_x, panel_y, panel_w, panel_h, x, y)
+                {
                     self.menu.invite_selected = index;
                     self.menu.pulse = 1.0;
                     return;
@@ -513,9 +548,10 @@ impl App {
                 }
             }
             Page::Recordings => {
-                if let Some(position) = self.menu.record_position_cell_at(
-                    panel_x, panel_y, panel_w, x, y,
-                ) {
+                if let Some(position) = self
+                    .menu
+                    .record_position_cell_at(panel_x, panel_y, panel_w, x, y)
+                {
                     self.menu.record_position = position;
                     self.menu.recording_selected = 3;
                     let action = self.menu.record_badge_action();
@@ -543,6 +579,17 @@ impl App {
             return Ok(());
         }
         self.ensure_renderer()?;
+        self.menu.hover = if self.pointer_hover {
+            hover_at(
+                self.width,
+                self.height,
+                &self.menu,
+                self.pointer_pos.0,
+                self.pointer_pos.1,
+            )
+        } else {
+            None
+        };
         let pixmap = match &self.renderer {
             Some(renderer) => renderer.render(&self.menu),
             None => return Ok(()),
@@ -556,7 +603,9 @@ impl App {
             .slots
             .iter()
             .position(|slot| {
-                slot.width == width && slot.height == height && slot.released.load(Ordering::Relaxed)
+                slot.width == width
+                    && slot.height == height
+                    && slot.released.load(Ordering::Relaxed)
             })
             .or_else(|| {
                 if self.slots.len() < 3 {
@@ -753,6 +802,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for App {
             } => {
                 app.pointer_serial = serial;
                 app.pointer_pos = (surface_x as f32, surface_y as f32);
+                app.pointer_hover = true;
+                let _ = app.draw(conn);
                 // Sans cette déclaration, le compositeur peut garder le
                 // curseur masqué que le jeu avait installé en plein écran.
                 app.apply_cursor();
@@ -764,18 +815,32 @@ impl Dispatch<wl_pointer::WlPointer, ()> for App {
                 ..
             } => {
                 app.pointer_pos = (surface_x as f32, surface_y as f32);
-                let (panel_x, _, panel_w, _) =
-                    panel_bounds(app.width, app.height, &app.menu);
+                app.pointer_hover = true;
+                let hovered = hover_at(
+                    app.width,
+                    app.height,
+                    &app.menu,
+                    app.pointer_pos.0,
+                    app.pointer_pos.1,
+                );
+                if hovered != app.menu.hover {
+                    let _ = app.draw(conn);
+                }
+                let (panel_x, _, panel_w, _) = panel_bounds(app.width, app.height, &app.menu);
                 if app.dragging_fps && app.menu.page == Page::Performance {
-                    if let Some(index) =
-                        app.menu
-                            .fps_index_at(surface_x as f32, panel_x, panel_w)
-                    {
-                        if index != app.menu.fps_index() {
-                            let action = app.menu.set_fps_index(index);
-                            app.dispatch_action(action);
-                            app.draw_if_pointer_due(conn);
-                        }
+                    let index = app.menu.fps_index_near(surface_x as f32, panel_x, panel_w);
+                    if index != app.menu.fps_index() {
+                        let action = app.menu.set_fps_index(index);
+                        app.dispatch_action(action);
+                        app.draw_if_pointer_due(conn);
+                    }
+                }
+                if app.dragging_afmf && app.menu.page == Page::Performance {
+                    let index = app.menu.afmf_index_near(surface_x as f32, panel_x, panel_w);
+                    if index != app.menu.afmf_index() {
+                        let action = app.menu.set_afmf_index(index);
+                        app.dispatch_action(action);
+                        app.draw_if_pointer_due(conn);
                     }
                 }
                 if app.dragging_scale && app.menu.page == Page::Performance {
@@ -808,6 +873,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for App {
                     }
                 }
             }
+            wl_pointer::Event::Leave { .. } => {
+                app.pointer_hover = false;
+                if app.menu.hover.take().is_some() {
+                    let _ = app.draw(conn);
+                }
+            }
             wl_pointer::Event::Axis { axis, value, .. } => {
                 if app.menu.page == Page::Invite
                     && matches!(axis, WEnum::Value(wl_pointer::Axis::VerticalScroll))
@@ -836,9 +907,23 @@ impl Dispatch<wl_pointer::WlPointer, ()> for App {
                             let was_volume = app.dragging_volume;
                             let was_dragging = was_volume
                                 || app.dragging_fps
+                                || app.dragging_afmf
                                 || app.dragging_scale
                                 || app.dragging_record_scale;
+                            // Le dernier pas d'un glissement peut avoir été
+                            // perdu par la file d'actions : la valeur finale
+                            // repart une fois. Le daemon la reçoit en double au
+                            // pire, ce qui ne change rien à son état.
+                            if app.dragging_fps {
+                                app.dispatch_action(Some(Action::SetFpsCap(app.menu.fps_cap)));
+                            }
+                            if app.dragging_afmf {
+                                if let Some(value) = app.menu.afmf_multiplier {
+                                    app.dispatch_action(Some(Action::AfmfMultiplier(value)));
+                                }
+                            }
                             app.dragging_fps = false;
+                            app.dragging_afmf = false;
                             app.dragging_scale = false;
                             app.dragging_record_scale = false;
                             app.dragging_volume = false;
@@ -1065,7 +1150,9 @@ pub fn run(
         pointer: None,
         xkb: None,
         pointer_pos: (0.0, 0.0),
+        pointer_hover: false,
         dragging_fps: false,
+        dragging_afmf: false,
         dragging_scale: false,
         dragging_record_scale: false,
         dragging_volume: false,
@@ -1081,6 +1168,7 @@ pub fn run(
         configured: false,
         slots: Vec::new(),
         on_action: Box::new(on_action),
+        results: options.results,
         deadline: options.duration.map(|d| Instant::now() + d),
         exit: false,
     };
@@ -1104,7 +1192,11 @@ pub fn run(
     // le seul lecteur des périphériques. Sans tube (démonstration), l'overlay
     // lit encore les manettes lui-même.
     let hud_only = options.hud_only;
-    let nav_path = if hud_only { None } else { options.nav_fifo.clone() };
+    let nav_path = if hud_only {
+        None
+    } else {
+        options.nav_fifo.clone()
+    };
     let mut nav_fifo: Option<std::fs::File> = None;
     let mut nav_retry = Instant::now();
     if let Some(path) = nav_path.as_deref() {
@@ -1175,9 +1267,7 @@ pub fn run(
         .roundtrip(&mut app)
         .map_err(|e| Error::Wayland(format!("configure : {e}")))?;
     if !app.configured {
-        return Err(Error::Wayland(
-            "aucun configure reçu du compositeur".into(),
-        ));
+        return Err(Error::Wayland("aucun configure reçu du compositeur".into()));
     }
 
     // Le daemon ferme l'overlay en douceur : SIGTERM déclenche la sortie
@@ -1304,7 +1394,8 @@ pub fn run(
             if moved {
                 app.draw(&conn)?;
             }
-        }        let snapshot = live.lock().map(|guard| guard.clone()).ok();
+        }
+        let snapshot = live.lock().map(|guard| guard.clone()).ok();
         if let Some(snapshot) = snapshot {
             if app.menu.set_live(snapshot) {
                 app.draw(&conn)?;
@@ -1317,6 +1408,19 @@ pub fn run(
             if app.menu.set_invite(friends_state) {
                 app.draw(&conn)?;
             }
+        }
+        // Le daemon peut refuser une action après coup : l'invitation est
+        // alors réarmée et le message d'échec s'affiche sur la page d'amis.
+        let mut failed = false;
+        if let Some(results) = app.results.as_ref() {
+            while let Ok(outcome) = results.try_recv() {
+                failed |= app
+                    .menu
+                    .apply_action_failure(&outcome.action, &outcome.error);
+            }
+        }
+        if failed {
+            app.draw(&conn)?;
         }
         // Les réglages changés dans le panneau rapide arrivent par la session,
         // sans relancer la partie. La plaque seule reprend tout le HUD ; le
@@ -1338,7 +1442,9 @@ pub fn run(
         let measured = system.lock().ok().and_then(|slot| slot.clone());
         if app.menu.system != measured {
             app.menu.system = measured;
-            app.draw(&conn)?;
+            if hud_only && app.menu.perf_hud {
+                app.draw(&conn)?;
+            }
         }
         // La plaque seule ne s'anime pas : `tick` ferait entrer le panneau.
         if !hud_only && app.menu.tick(0.016) {

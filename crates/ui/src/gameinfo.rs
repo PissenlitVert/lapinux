@@ -29,7 +29,9 @@ const LOAD_BUDGET: Duration = Duration::from_secs(90);
 /// relançait une lecture à chaque image, et l'interface harcelait le daemon
 /// alors que Steam venait déjà de refuser.
 const RETRY_AFTER_ERROR: Duration = Duration::from_secs(10);
-const TIMEOUT_ERROR: &str = "Steam n'a pas répondu : les détails du jeu n'ont pas pu être lus.";
+fn timeout_error() -> &'static str {
+    lapinux_core::i18n::t("gameinfo.steam_timeout")
+}
 /// Succès les plus rares listés avec leur pourcentage mondial.
 const RARE_ROWS: usize = 6;
 /// Longueur maximale d'un texte replié (conditions, configuration) : la
@@ -144,7 +146,7 @@ fn centered_description_text(ui: &mut egui::Ui, inner: f32, text: &str) {
 
 /// Titre Markdown : les dièses ouvrent le titre, ils ne doivent pas rester
 /// dans le texte. Un dièse au milieu d'une phrase n'est pas un titre.
-fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+pub(crate) fn markdown_heading(line: &str) -> Option<(usize, &str)> {
     let line = line.trim();
     let level = line.bytes().take_while(|byte| *byte == b'#').count();
     if !(1..=6).contains(&level) {
@@ -160,7 +162,7 @@ fn markdown_heading(line: &str) -> Option<(usize, &str)> {
 
 /// Taille d'un titre Markdown : le corps reste à 11 points, les titres
 /// prennent la place qui les distingue sans casser la colonne de lecture.
-fn heading_size(level: usize) -> f32 {
+pub(crate) fn heading_size(level: usize) -> f32 {
     match level {
         1 => 17.0,
         2 => 15.5,
@@ -207,7 +209,12 @@ fn centered_description_paragraph(ui: &mut egui::Ui, inner: f32, text: &str, siz
         return;
     }
     let line_height = ui
-        .fonts(|fonts| fonts.layout_no_wrap("X".into(), font.clone(), TEXT()).size().y)
+        .fonts(|fonts| {
+            fonts
+                .layout_no_wrap("X".into(), font.clone(), TEXT())
+                .size()
+                .y
+        })
         .max(1.0);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(inner, line_height * lines.len() as f32),
@@ -231,7 +238,7 @@ const DESCRIPTION_TEXT_WIDTH: f32 = 860.0;
 /// La série des captures d'un jeu, dans l'ordre où la fiche les montre.
 fn captures(urls: &[String]) -> Vec<Photo> {
     urls.iter()
-        .map(|url| Photo::new(url, "Capture du jeu"))
+        .map(|url| Photo::new(url, lapinux_core::i18n::t("game_sheet.capture_alt")))
         .collect()
 }
 
@@ -275,8 +282,11 @@ impl SheetContent {
         let mut requirements: Vec<(String, String)> = Vec::new();
         for (title, text) in [
             ("Configuration minimale", &store.requirements_min),
-            ("Configuration recommandée", &store.requirements_recommended),
-            ("Mentions légales", &store.legal_notice),
+            (
+                lapinux_core::i18n::t("gameinfo.recommended_config"),
+                &store.requirements_recommended,
+            ),
+            (lapinux_core::i18n::t("gameinfo.legal"), &store.legal_notice),
             ("DRM", &store.drm_notice),
         ] {
             let text = text.trim();
@@ -308,6 +318,10 @@ impl SheetContent {
             return Self::default();
         };
         let description = details.description.trim().to_string();
+        // Epic publie sa présentation en Markdown : ses visuels arrivent sous
+        // la forme `![légende](adresse)`. Ils doivent être peints dans
+        // « À propos », à leur place, et non rester des liens bruts.
+        let (description_blocks, description_images) = markdown_description_media(&description);
         let summary = details.summary.trim().to_string();
         let short_description = if summary.is_empty() {
             // Ancienne copie de la fiche sans accroche séparée : la première
@@ -325,10 +339,10 @@ impl SheetContent {
             name: String::new(),
             short_description,
             description,
-            description_blocks: Vec::new(),
+            description_blocks,
             header_image: details.banner.clone(),
             screenshots: details.screenshots.clone(),
-            description_images: Vec::new(),
+            description_images,
             // Une boutique ne publie ni configuration ni mentions : la fiche
             // garde les mêmes encarts, sans ces replis-là.
             requirements: Vec::new(),
@@ -338,7 +352,56 @@ impl SheetContent {
             trailer_poster: details.trailer_poster.clone(),
         }
     }
+}
 
+/// Découpe une présentation Markdown en texte et visuels, dans l'ordre de la
+/// page. Sans visuel, la présentation garde son rendu historique : tout le
+/// texte est peint d'un bloc.
+fn markdown_description_media(description: &str) -> (Vec<DescriptionBlock>, Vec<String>) {
+    let mut blocks = Vec::new();
+    let mut images = Vec::new();
+    let mut rest = description;
+    let mut found = false;
+    while let Some(start) = rest.find("![") {
+        let after_label = &rest[start + 2..];
+        let Some(label_end) = after_label.find("](") else {
+            break;
+        };
+        let url_start = start + 2 + label_end + 2;
+        let after_url = &rest[url_start..];
+        let Some(url_end) = after_url.find(')') else {
+            break;
+        };
+        // Markdown accepte un titre après l'adresse : seule l'adresse est
+        // téléchargée.
+        let url = after_url[..url_end]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(['<', '>']);
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            break;
+        }
+        push_description_text(&mut blocks, &rest[..start]);
+        blocks.push(DescriptionBlock::Media(url.to_string()));
+        if !images.iter().any(|seen| seen == url) {
+            images.push(url.to_string());
+        }
+        found = true;
+        rest = &rest[url_start + url_end + 1..];
+    }
+    if !found {
+        return (Vec::new(), Vec::new());
+    }
+    push_description_text(&mut blocks, rest);
+    (blocks, images)
+}
+
+fn push_description_text(blocks: &mut Vec<DescriptionBlock>, text: &str) {
+    let text = text.trim();
+    if !text.is_empty() {
+        blocks.push(DescriptionBlock::Text(text.to_string()));
+    }
 }
 
 impl Shelf {
@@ -418,11 +481,10 @@ impl Shelf {
                 keyboard_step += i32::from(right);
             }
         });
-        let mut close = ctx.input_mut(|input| {
-            input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
-        });
-        let index = (gallery.index.min(total - 1) as i32 + keyboard_step)
-            .rem_euclid(total as i32) as usize;
+        let mut close =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let index =
+            (gallery.index.min(total - 1) as i32 + keyboard_step).rem_euclid(total as i32) as usize;
         let photo = gallery.photos[index].clone();
         let urls: Vec<String> = gallery
             .photos
@@ -469,11 +531,8 @@ impl Shelf {
                 // La surface opaque absorbe les clics : sans elle, un clic
                 // dans le noir atteindrait la fiche ou la bibliothèque
                 // derrière la visionneuse.
-                let _surface = ui.interact(
-                    screen,
-                    ui.id().with("photo-surface"),
-                    egui::Sense::click(),
-                );
+                let _surface =
+                    ui.interact(screen, ui.id().with("photo-surface"), egui::Sense::click());
 
                 ui.scope_builder(egui::UiBuilder::new().max_rect(top_rect), |ui| {
                     ui.horizontal(|ui| {
@@ -491,29 +550,24 @@ impl Shelf {
                                 );
                                 ui.add_space(1.0);
                                 ui.label(
-                                    egui::RichText::new(&subtitle)
-                                        .size(11.0)
-                                        .color(TEXT_DIM()),
+                                    egui::RichText::new(&subtitle).size(11.0).color(TEXT_DIM()),
                                 );
                             },
                         );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let button = egui::Button::new(
-                                    egui::RichText::new("×").size(20.0).color(TEXT_DIM()),
-                                )
-                                .frame(false)
-                                .min_size(egui::vec2(30.0, 30.0));
-                                if ui
-                                    .add(button)
-                                    .on_hover_text("Fermer (Échap)")
-                                    .clicked()
-                                {
-                                    close = true;
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let button = egui::Button::new(
+                                egui::RichText::new("×").size(20.0).color(TEXT_DIM()),
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(30.0, 30.0));
+                            if ui
+                                .add(button)
+                                .on_hover_text(lapinux_core::i18n::t("game_sheet.close"))
+                                .clicked()
+                            {
+                                close = true;
+                            }
+                        });
                     });
                 });
 
@@ -579,7 +633,7 @@ impl Shelf {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         let response = response.on_hover_text(if delta < 0 {
-                            "Image précédente (←)"
+                            lapinux_core::i18n::t("gameinfo.previous_image")
                         } else {
                             "Image suivante (→)"
                         });
@@ -613,8 +667,7 @@ impl Shelf {
                         let inner = rect.shrink(2.0);
                         match texture {
                             Some(texture) => {
-                                ui.painter()
-                                    .rect_filled(inner, 3.0, egui::Color32::BLACK);
+                                ui.painter().rect_filled(inner, 3.0, egui::Color32::BLACK);
                                 paint_fit(ui, inner, texture);
                             }
                             None => {
@@ -633,7 +686,13 @@ impl Shelf {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         if response
-                            .on_hover_text(format!("Image {} sur {total}", slot + 1))
+                            .on_hover_text(lapinux_core::i18n::t_args(
+                                "game_sheet.image_of",
+                                &[
+                                    ("index", &(slot + 1).to_string()),
+                                    ("total", &total.to_string()),
+                                ],
+                            ))
                             .clicked()
                         {
                             chosen = Some(slot);
@@ -647,8 +706,8 @@ impl Shelf {
         }
         // La vignette cliquée prend la main sur les flèches, puis la galerie
         // garde la nouvelle image pour l'image suivante.
-        let next = chosen
-            .unwrap_or_else(|| (index as i32 + click_step).rem_euclid(total as i32) as usize);
+        let next =
+            chosen.unwrap_or_else(|| (index as i32 + click_step).rem_euclid(total as i32) as usize);
         self.photo = Some(Gallery {
             photos: gallery.photos,
             index: next,
@@ -716,9 +775,13 @@ impl Shelf {
     /// est refermée : une lecture lancée ne doit pas rester en suspens.
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.news_art.poll(ctx);
-        if self.loading && self.started.is_some_and(|started| started.elapsed() > LOAD_BUDGET) {
+        if self.loading
+            && self
+                .started
+                .is_some_and(|started| started.elapsed() > LOAD_BUDGET)
+        {
             self.loading = false;
-            self.error = Some(TIMEOUT_ERROR.to_string());
+            self.error = Some(timeout_error().to_string());
             self.failed_at = Some(Instant::now());
         }
         let Some(rx) = &self.rx else {
@@ -763,13 +826,17 @@ impl Shelf {
         let ctx = ui.ctx().clone();
         self.ensure(&ctx, client, appid);
         let mut reload = false;
-        egui::CollapsingHeader::new(egui::RichText::new("Détails Steam").size(12.5).strong())
-            .id_salt(("game-info-steam", appid))
-            .default_open(true)
-            .show(ui, |ui| {
-                reload = status_row(ui, self.data.as_ref(), self.error.as_deref(), self.loading);
-                body(ui, self.data.as_ref(), appid);
-            });
+        egui::CollapsingHeader::new(
+            egui::RichText::new(lapinux_core::i18n::t("gameinfo.steam_details"))
+                .size(12.5)
+                .strong(),
+        )
+        .id_salt(("game-info-steam", appid))
+        .default_open(true)
+        .show(ui, |ui| {
+            reload = status_row(ui, self.data.as_ref(), self.error.as_deref(), self.loading);
+            body(ui, self.data.as_ref(), appid);
+        });
         if reload {
             self.reload(&ctx, client, appid);
         }
@@ -820,18 +887,18 @@ impl Shelf {
                         ui.vertical(|ui| {
                             ui.set_width(inner);
                             ui.set_height(96.0);
-                            centered_title(ui, inner, "Actualités", 12.5);
+                            centered_title(ui, inner, lapinux_core::i18n::t("gameinfo.news"), 12.5);
                             let rest = ui.available_rect_before_wrap();
                             match bunny {
                                 Some(bunny) => crate::launch::waiting_in(
                                     ui,
                                     rest,
                                     bunny,
-                                    "Lecture des actualités…",
+                                    lapinux_core::i18n::t("gameinfo.reading_news"),
                                 ),
                                 None => {
                                     ui.add_space(18.0);
-                                    muted(ui, "Lecture des actualités…");
+                                    muted(ui, lapinux_core::i18n::t("gameinfo.reading_news"));
                                 }
                             }
                         });
@@ -861,7 +928,8 @@ impl Shelf {
                     " · 1 annonce".to_string()
                 };
                 {
-                    let title_width = crate::text_size(ui, "Actualités", 12.5).x;
+                    let title_width =
+                        crate::text_size(ui, lapinux_core::i18n::t("gameinfo.news"), 12.5).x;
                     let count_width = crate::text_size(ui, &count, 10.5).x;
                     let info_width = if from_steam { 12.0 } else { 0.0 };
                     let gaps = if from_steam { 8.0 } else { 4.0 };
@@ -871,7 +939,11 @@ impl Shelf {
                             ((inner - title_width - count_width - info_width - gaps) / 2.0)
                                 .max(0.0),
                         );
-                        ui.label(egui::RichText::new("Actualités").size(12.5).strong());
+                        ui.label(
+                            egui::RichText::new(lapinux_core::i18n::t("gameinfo.news"))
+                                .size(12.5)
+                                .strong(),
+                        );
                         ui.label(egui::RichText::new(&count).size(10.5).color(TEXT_DIM()));
                         if from_steam {
                             news_source_info(ui);
@@ -915,7 +987,15 @@ impl Shelf {
                 }
                 if total > 3 {
                     ui.add_space(NEWS_GAP);
-                    if crate::link_text(ui, &format!("Voir les {total} annonces")).clicked() {
+                    if crate::link_text(
+                        ui,
+                        &lapinux_core::i18n::t_args(
+                            "game_sheet.see_all_news",
+                            &[("total", &total.to_string())],
+                        ),
+                    )
+                    .clicked()
+                    {
                         self.news_open = Some(NewsFeed {
                             items: news.clone(),
                             at: 0,
@@ -972,7 +1052,13 @@ impl Shelf {
             // La carte existe aussi quand la lecture échoue : la fiche garde
             // ses trois encarts, et l'encart dit pourquoi il est vide.
             if waiting {
-                self.waiting_card(ui, width, height, bunny, "Lecture des détails du jeu…");
+                self.waiting_card(
+                    ui,
+                    width,
+                    height,
+                    bunny,
+                    lapinux_core::i18n::t("gameinfo.reading_game"),
+                );
             } else if let Some(error) = error {
                 self.waiting_card(ui, width, height, None, error);
             }
@@ -983,7 +1069,13 @@ impl Shelf {
         if summary.is_empty() && shots.is_empty() {
             // Un jeu sans présentation garde son encart : la carte dit
             // « Aucun résumé » plutôt que de disparaître de la ligne.
-            self.empty_card(ui, width, height, "Résumé", "Aucun résumé");
+            self.empty_card(
+                ui,
+                width,
+                height,
+                lapinux_core::i18n::t("gameinfo.summary"),
+                lapinux_core::i18n::t("gameinfo.no_summary"),
+            );
             return;
         }
         self.news_art.ensure(ui.ctx(), &shots);
@@ -1002,7 +1094,7 @@ impl Shelf {
                     ui.set_height(card);
                     ui.spacing_mut().item_spacing.y = 6.0;
                     let top = ui.cursor().top();
-                    centered_title(ui, inner, "Résumé", 12.5);
+                    centered_title(ui, inner, lapinux_core::i18n::t("gameinfo.summary"), 12.5);
                     // La place des vignettes se réserve avant de couper le
                     // texte : les captures tiennent toujours sous lui.
                     let thumb = ((inner - 16.0) / 3.0).max(40.0);
@@ -1046,12 +1138,9 @@ impl Shelf {
                                 egui::Sense::click(),
                             );
                             match self.news_art.get(url) {
-                                Some(texture) => crate::paint_cover(
-                                    ui,
-                                    rect,
-                                    texture,
-                                    egui::Rounding::same(6.0),
-                                ),
+                                Some(texture) => {
+                                    crate::paint_cover(ui, rect, texture, egui::Rounding::same(6.0))
+                                }
                                 None => {
                                     ui.painter().rect_filled(
                                         rect,
@@ -1064,7 +1153,7 @@ impl Shelf {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
                             if response
-                                .on_hover_text("Ouvrir la capture en grand")
+                                .on_hover_text(lapinux_core::i18n::t("game_sheet.open_capture"))
                                 .clicked()
                             {
                                 let index = shots.iter().position(|shot| shot == url).unwrap_or(0);
@@ -1122,7 +1211,7 @@ impl Shelf {
                     ui.set_width(inner);
                     ui.set_height(card);
                     ui.spacing_mut().item_spacing.y = 6.0;
-                    centered_title(ui, inner, "Résumé", 12.5);
+                    centered_title(ui, inner, lapinux_core::i18n::t("gameinfo.summary"), 12.5);
                     // La place qui reste porte le lapin, **au centre** de
                     // l'encart : c'est lui qui dit que la lecture travaille,
                     // et l'attente se lit sans chercher un coin de la carte.
@@ -1154,7 +1243,7 @@ impl Shelf {
             ui,
             content.as_ref(),
             &target,
-            "Voir la bande-annonce sur Steam",
+            lapinux_core::i18n::t("game_sheet.trailer_on_steam"),
             width,
         );
     }
@@ -1243,11 +1332,15 @@ impl Shelf {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                     let hint = if trailer {
-                        "Lire la bande-annonce dans Lapinux"
+                        if crate::trailer::is_web_page(&content.trailer) {
+                            lapinux_core::i18n::t("game_sheet.trailer_browser")
+                        } else {
+                            lapinux_core::i18n::t("game_sheet.trailer_local")
+                        }
                     } else if content.name.is_empty() {
                         hint
                     } else {
-                        "Ouvrir la capture en grand"
+                        lapinux_core::i18n::t("game_sheet.open_capture")
                     };
                     let response = response.on_hover_text(hint);
                     // Une bande-annonce se joue dans le lecteur intégré ;
@@ -1261,8 +1354,7 @@ impl Shelf {
                             ui.ctx()
                                 .open_url(egui::OpenUrl::new_tab(target.to_string()));
                         } else {
-                            let index =
-                                urls.iter().position(|seen| seen == &poster).unwrap_or(0);
+                            let index = urls.iter().position(|seen| seen == &poster).unwrap_or(0);
                             self.show_photo(captures(&urls), index);
                         }
                     }
@@ -1270,25 +1362,28 @@ impl Shelf {
                         return;
                     }
                     ui.add_space(2.0);
-                    centered_title(ui, inner, "Captures", 12.5);
+                    centered_title(ui, inner, lapinux_core::i18n::t("page.captures"), 12.5);
                     for url in &shots {
                         let height = (inner * 9.0 / 16.0).clamp(80.0, 170.0);
-                        let (rect, response) = ui
-                            .allocate_exact_size(egui::vec2(inner, height), egui::Sense::click());
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(inner, height), egui::Sense::click());
                         match self.news_art.get(url) {
                             Some(texture) => {
                                 crate::paint_cover(ui, rect, texture, egui::Rounding::same(8.0))
                             }
                             None => {
-                                ui.painter()
-                                    .rect_filled(rect, egui::Rounding::same(8.0), CARD_HOVER());
+                                ui.painter().rect_filled(
+                                    rect,
+                                    egui::Rounding::same(8.0),
+                                    CARD_HOVER(),
+                                );
                             }
                         }
                         if response.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         if response
-                            .on_hover_text("Ouvrir la capture en grand")
+                            .on_hover_text(lapinux_core::i18n::t("game_sheet.open_capture"))
                             .clicked()
                         {
                             let index = urls.iter().position(|seen| seen == url).unwrap_or(0);
@@ -1322,13 +1417,7 @@ impl Shelf {
     }
 
     /// Peint un visuel de description, avec ses proportions naturelles.
-    fn description_media(
-        &mut self,
-        ui: &mut egui::Ui,
-        url: &str,
-        images: &[String],
-        inner: f32,
-    ) {
+    fn description_media(&mut self, ui: &mut egui::Ui, url: &str, images: &[String], inner: f32) {
         let animated = self.news_art.is_animated(url) || animated_description_image(url);
         let texture = self.news_art.animated(ui.ctx(), url).cloned();
         let natural = texture
@@ -1346,15 +1435,11 @@ impl Shelf {
         // Aucun rognage : une affiche AVIF large ou un petit GIF garde ses
         // proportions. Le plafond de hauteur évite qu'une image verticale
         // prenne toute la fiche.
-        let scale = (inner / natural_width)
-            .min(240.0 / natural_height)
-            .min(1.0);
+        let scale = (inner / natural_width).min(240.0 / natural_height).min(1.0);
         let width = natural_width * scale;
         let height = natural_height * scale;
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(inner, height.max(24.0)),
-            egui::Sense::click(),
-        );
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(inner, height.max(24.0)), egui::Sense::click());
         let image_rect = egui::Rect::from_center_size(
             rect.center(),
             egui::vec2(width.max(24.0), height.max(24.0)),
@@ -1369,7 +1454,10 @@ impl Shelf {
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        if response.on_hover_text("Ouvrir l'image en grand").clicked() {
+        if response
+            .on_hover_text(lapinux_core::i18n::t("game_sheet.open_image"))
+            .clicked()
+        {
             let index = images.iter().position(|seen| seen == url).unwrap_or(0);
             self.show_photo(captures(images), index);
         }
@@ -1407,43 +1495,42 @@ impl Shelf {
             ui.add_space(left);
             ui.vertical(|ui| {
                 ui.set_width(inner);
-            // Dès qu'on connaît le découpage, le texte et les visuels
-            // reprennent l'ordre de la page Steam : image, paragraphe, image.
-            if !content.description_blocks.is_empty() {
-                for block in &content.description_blocks {
-                    match block {
-                        DescriptionBlock::Text(text) => {
-                            let text = text.trim();
-                            if text.is_empty() {
-                                continue;
+                // Dès qu'on connaît le découpage, le texte et les visuels
+                // reprennent l'ordre de la page Steam : image, paragraphe, image.
+                if !content.description_blocks.is_empty() {
+                    for block in &content.description_blocks {
+                        match block {
+                            DescriptionBlock::Text(text) => {
+                                let text = text.trim();
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                ui.add_space(6.0);
+                                centered_description_text(ui, inner, text);
                             }
-                            ui.add_space(6.0);
-                            centered_description_text(ui, inner, text);
-                        }
-                        DescriptionBlock::Media(url) => {
-                            ui.add_space(8.0);
-                            self.description_media(ui, url, &images, inner);
+                            DescriptionBlock::Media(url) => {
+                                ui.add_space(8.0);
+                                self.description_media(ui, url, &images, inner);
+                            }
                         }
                     }
                 }
-            }
-            // Les fiches plus anciennes n'ont pas encore ce découpage : elles
-            // gardent leur texte puis leurs visuels.
-            if content.description_blocks.is_empty() && !content.description.trim().is_empty() {
-                ui.add_space(6.0);
-                centered_description_text(ui, inner, &content.description);
-            }
-            if content.description_blocks.is_empty() && !images.is_empty() {
-                ui.add_space(10.0);
-                for url in &images {
-                    self.description_media(ui, url, &images, inner);
+                // Les fiches plus anciennes n'ont pas encore ce découpage : elles
+                // gardent leur texte puis leurs visuels.
+                if content.description_blocks.is_empty() && !content.description.trim().is_empty() {
+                    ui.add_space(6.0);
+                    centered_description_text(ui, inner, &content.description);
                 }
-            }
+                if content.description_blocks.is_empty() && !images.is_empty() {
+                    ui.add_space(10.0);
+                    for url in &images {
+                        self.description_media(ui, url, &images, inner);
+                    }
+                }
             });
         });
         true
     }
-
 }
 
 /// Petit « i » de provenance : les annonces viennent de Steam parce qu'Epic
@@ -1460,9 +1547,7 @@ fn news_source_info(ui: &mut egui::Ui) {
         egui::FontId::proportional(8.5),
         TEXT_DIM(),
     );
-    let _ = response.on_hover_text(
-        "Actualités reprises de la fiche Steam du même jeu : Epic Games n'en publie pas pour celui-ci. Ces informations peuvent être incomplètes ou inexactes.",
-    );
+    let _ = response.on_hover_text(lapinux_core::i18n::t("gameinfo.news_from_steam"));
 }
 
 /// Une carte d'actualité : le visuel de l'annonce quand Steam le publie, puis
@@ -1493,10 +1578,8 @@ fn news_card(
                     // Le visuel d'une annonce Steam est une image 16/9 : il
                     // prend la largeur de la carte, en bandeau.
                     let height = (inner * 9.0 / 16.0).clamp(60.0, 150.0);
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(inner, height),
-                        egui::Sense::hover(),
-                    );
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(inner, height), egui::Sense::hover());
                     crate::paint_cover(ui, rect, texture, egui::Rounding::same(6.0));
                     ui.add_space(7.0);
                 }
@@ -1522,40 +1605,54 @@ fn news_card(
         ui.id().with(("news-card", news.date, news.title.as_str())),
         egui::Sense::click(),
     );
-    let response = response.on_hover_text(format!("{} — lire l'annonce", news.title));
+    let response = response.on_hover_text(lapinux_core::i18n::t_args(
+        "game_sheet.read_news",
+        &[("title", &news.title)],
+    ));
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response.clicked()
 }
 
-/// Poids maximal des visuels d'annonces gardés ouverts : une capture de presse
-/// pèse plusieurs mégaoctets en pixels, et la fiche change de jeu souvent.
-const NEWS_ART_BUDGET: usize = 256 * 1024 * 1024;
-/// Téléchargements d'images simultanés : précharger une bibliothèque ne doit
-/// pas ouvrir cinquante connexions d'un coup.
-const NEWS_ART_FETCHES: usize = 8;
+/// Poids maximal des visuels gardés ouverts. Le cache ne doit pas retenir
+/// l'équivalent de plusieurs centaines de captures : le défilement doit rester
+/// stable en mémoire, même après avoir parcouru toute la bibliothèque.
+const NEWS_ART_BUDGET: usize = 64 * 1024 * 1024;
+/// Téléchargements d'images simultanés : quatre décodages suffisent à remplir
+/// une grille, sans faire tourner huit cœurs pendant le scroll.
+const NEWS_ART_FETCHES: usize = 4;
+/// Textures téléversées par frame. Huit captures décodées peuvent arriver en
+/// même temps ; les envoyer d'un bloc au GPU provoque un à-coup pendant le
+/// défilement. Deux par frame suffisent à remplir l'écran sans bloquer le scroll.
+const NEWS_ART_UPLOADS_PER_FRAME: usize = 2;
 
 /// Décode un visuel à une taille raisonnable : les images de Steam font
 /// 1920 px de large, et une centaine d'entre elles saturent vite la mémoire.
 /// Le lecteur d'annonces n'en affiche jamais plus de 720 px de large.
-fn news_texture_from_bytes(
-    ctx: &egui::Context,
-    name: &str,
-    bytes: &[u8],
-) -> Option<egui::TextureHandle> {
+fn news_color_image(bytes: &[u8]) -> Option<egui::ColorImage> {
     let image = image::load_from_memory(bytes).ok()?;
     let image = image.thumbnail(800, 450).to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     if size[0] == 0 || size[1] == 0 {
         return None;
     }
-    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-    Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        image.as_raw(),
+    ))
+}
+
+/// Résultat préparé par le fil de téléchargement. Les images fixes arrivent
+/// déjà décodées : seul l'envoi en texture reste sur le fil d'interface.
+enum NewsArtPayload {
+    Still(egui::ColorImage),
+    Gif(Vec<u8>),
 }
 
 /// Visuels des annonces : téléchargés une fois par adresse, puis gardés en
-/// texture. Le téléchargement vit sur son propre fil, la fiche ne l'attend pas.
+/// texture. Le téléchargement et le décodage vivent sur leur propre fil, la
+/// fiche ne les attend pas et l'interface ne paie pas les JPEG en pleine frame.
 pub(crate) struct NewsArt {
     textures: std::collections::HashMap<String, egui::TextureHandle>,
     /// Petits GIF de description, joués seulement quand ils sont affichés.
@@ -1564,8 +1661,14 @@ pub(crate) struct NewsArt {
     /// parcouru trop de jeux.
     budget: crate::TextureBudget<String>,
     pending: std::collections::HashSet<String>,
-    rx: Option<mpsc::Receiver<(String, Vec<u8>)>>,
-    tx: Option<mpsc::Sender<(String, Vec<u8>)>>,
+    /// Adresses qui viennent d'échouer, avec l'instant de l'échec : on ne les
+    /// redemande pas avant le délai de reprise, sinon chaque image relançait
+    /// un téléchargement que la boutique venait déjà de refuser.
+    failed: std::collections::HashMap<String, std::time::Instant>,
+    /// Visuels décodés en attente de téléversement GPU.
+    ready: std::collections::VecDeque<(String, Option<NewsArtPayload>)>,
+    rx: Option<mpsc::Receiver<(String, Option<NewsArtPayload>)>>,
+    tx: Option<mpsc::Sender<(String, Option<NewsArtPayload>)>>,
 }
 
 impl Default for NewsArt {
@@ -1575,6 +1678,8 @@ impl Default for NewsArt {
             gifs: std::collections::HashMap::new(),
             budget: crate::TextureBudget::new(NEWS_ART_BUDGET),
             pending: std::collections::HashSet::new(),
+            failed: std::collections::HashMap::new(),
+            ready: std::collections::VecDeque::new(),
             rx: None,
             tx: None,
         }
@@ -1583,6 +1688,27 @@ impl Default for NewsArt {
 
 impl NewsArt {
     pub(crate) fn ensure(&mut self, ctx: &egui::Context, urls: &[String]) {
+        self.ensure_with(ctx, urls, true);
+    }
+
+    /// Variante pour les couvertures de cartes : un GIF n'y est jamais joué.
+    /// On garde seulement sa première image, décodée hors du fil UI ; sinon un
+    /// lot de couvertures animées fait décoder puis téléverser des dizaines de
+    /// frames pendant le défilement.
+    pub(crate) fn ensure_still(&mut self, ctx: &egui::Context, urls: &[String]) {
+        self.ensure_with(ctx, urls, false);
+    }
+
+    fn ensure_with(&mut self, ctx: &egui::Context, urls: &[String], animate: bool) {
+        // Les pages redemandent leurs visuels à chaque image : ce passage
+        // remet les captures affichées en tête du budget. Sans lui, une image
+        // encore visible pouvait être évincée à l'arrivée d'une autre, puis
+        // retéléchargée aussitôt — un rechargement en boucle dans les fiches.
+        for url in urls {
+            if self.textures.contains_key(url) {
+                self.budget.touch(url);
+            }
+        }
         if self.pending.len() >= NEWS_ART_FETCHES {
             return;
         }
@@ -1598,6 +1724,7 @@ impl NewsArt {
             if url.is_empty()
                 || self.textures.contains_key(url)
                 || self.pending.contains(url)
+                || self.failed(url)
             {
                 continue;
             }
@@ -1607,12 +1734,20 @@ impl NewsArt {
             self.pending.insert(url.clone());
             let (url, tx, ctx) = (url.clone(), tx.clone(), ctx.clone());
             std::thread::spawn(move || {
-                if let Some(bytes) = crate::achievements::http_bytes(&url) {
-                    if let Some(bytes) = prepare_media(&url, &bytes) {
-                        if tx.send((url, bytes)).is_ok() {
-                            ctx.request_repaint();
+                let payload = crate::achievements::http_bytes(&url)
+                    .and_then(|bytes| prepare_media(&url, &bytes))
+                    .and_then(|bytes| {
+                        if animate && bytes.starts_with(b"GIF8") {
+                            Some(NewsArtPayload::Gif(bytes))
+                        } else {
+                            news_color_image(&bytes).map(NewsArtPayload::Still)
                         }
-                    }
+                    });
+                // Même un échec revient au fil d'interface : sans cela, sa
+                // place restait réservée dans `pending` et les images
+                // suivantes ne partaient plus.
+                if tx.send((url, payload)).is_ok() {
+                    ctx.request_repaint();
                 }
             });
         }
@@ -1621,31 +1756,46 @@ impl NewsArt {
     /// Relève les visuels arrivés. Appelé à chaque image, fiche affichée ou
     /// non : un téléchargement lancé ne doit pas rester en suspens.
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.rx else {
-            return;
-        };
-        let mut received = Vec::new();
-        while let Ok(message) = rx.try_recv() {
-            received.push(message);
+        let mut inbox = Vec::new();
+        if let Some(rx) = &self.rx {
+            while let Ok(message) = rx.try_recv() {
+                inbox.push(message);
+            }
         }
-        for (url, bytes) in received {
+        self.ready.extend(inbox);
+        for _ in 0..NEWS_ART_UPLOADS_PER_FRAME {
+            let Some((url, payload)) = self.ready.pop_front() else {
+                break;
+            };
             self.pending.remove(&url);
-            if bytes.starts_with(b"GIF8") {
-                if let Some(player) = crate::GifPlayer::load(ctx, &bytes, &url, [800, 450])
-                {
-                    let texture = player.first_texture();
+            match payload {
+                Some(NewsArtPayload::Gif(bytes)) => {
+                    if let Some(player) = crate::GifPlayer::load(ctx, &bytes, &url, [800, 450]) {
+                        let texture = player.first_texture();
+                        self.budget.note(url.clone(), &texture);
+                        self.textures.insert(url.clone(), texture);
+                        self.gifs.insert(url, player);
+                        self.trim();
+                    } else {
+                        self.failed.insert(url, std::time::Instant::now());
+                    }
+                }
+                Some(NewsArtPayload::Still(image)) => {
+                    let texture =
+                        ctx.load_texture(url.clone(), image, egui::TextureOptions::LINEAR);
                     self.budget.note(url.clone(), &texture);
-                    self.textures.insert(url.clone(), texture);
-                    self.gifs.insert(url, player);
+                    self.textures.insert(url, texture);
                     self.trim();
-                    continue;
+                }
+                // Image illisible ou téléchargement refusé : on retient
+                // l'adresse pour ne pas la redemander à chaque image.
+                None => {
+                    self.failed.insert(url, std::time::Instant::now());
                 }
             }
-            if let Some(texture) = news_texture_from_bytes(ctx, &url, &bytes) {
-                self.budget.note(url.clone(), &texture);
-                self.textures.insert(url, texture);
-                self.trim();
-            }
+        }
+        if !self.ready.is_empty() {
+            ctx.request_repaint();
         }
     }
 
@@ -1677,6 +1827,47 @@ impl NewsArt {
     /// Vrai dès qu'un média animé a été décodé, même sans extension visible.
     pub(crate) fn is_animated(&self, url: &str) -> bool {
         self.gifs.contains_key(url)
+    }
+
+    /// Pose une texture de test pour une adresse : un dégradé vertical entre
+    /// deux couleurs, comme une capture d'actualité réduite. Les tests visuels
+    /// n'ont pas de réseau, ils ont besoin d'une image immédiate.
+    #[cfg(test)]
+    pub(crate) fn seed_cover(
+        &mut self,
+        ctx: &egui::Context,
+        url: &str,
+        top: egui::Color32,
+        bottom: egui::Color32,
+    ) {
+        const WIDTH: usize = 32;
+        const HEIGHT: usize = 18;
+        let mix = |a: u8, b: u8, t: f32| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+        let mut pixels = Vec::with_capacity(WIDTH * HEIGHT);
+        for row in 0..HEIGHT {
+            let t = row as f32 / (HEIGHT - 1) as f32;
+            let color = egui::Color32::from_rgb(
+                mix(top.r(), bottom.r(), t),
+                mix(top.g(), bottom.g(), t),
+                mix(top.b(), bottom.b(), t),
+            );
+            pixels.extend(std::iter::repeat(color).take(WIDTH));
+        }
+        let image = egui::ColorImage {
+            size: [WIDTH, HEIGHT],
+            pixels,
+        };
+        let texture = ctx.load_texture(url, image, egui::TextureOptions::LINEAR);
+        self.budget.note(url.to_string(), &texture);
+        self.textures.insert(url.to_string(), texture);
+    }
+
+    /// Vrai quand cette adresse a échoué récemment : l'appelant se rabat sur
+    /// un autre visuel au lieu de relancer la même demande.
+    pub(crate) fn failed(&self, url: &str) -> bool {
+        self.failed
+            .get(url)
+            .is_some_and(|at| at.elapsed() < RETRY_AFTER_ERROR)
     }
 }
 
@@ -1797,9 +1988,9 @@ fn status_row(
     let mut reload = false;
     ui.horizontal(|ui| {
         if loading {
-            ui.spinner();
+            crate::section_icons::loading(ui, 18.0);
             ui.label(
-                egui::RichText::new("Lecture des détails Steam…")
+                egui::RichText::new(lapinux_core::i18n::t("gameinfo.reading_steam"))
                     .size(10.5)
                     .color(TEXT_DIM()),
             );
@@ -1807,8 +1998,11 @@ fn status_row(
             ui.label(egui::RichText::new(error).size(10.5).color(DANGER));
         } else if let Some(info) = info {
             let mut text = match info.fetched {
-                0 => "Lu à l'instant".to_string(),
-                fetched => format!("Relu le {}", lapinux_core::util::format_datetime(fetched)),
+                0 => lapinux_core::i18n::t("gameinfo.read_now").to_string(),
+                fetched => lapinux_core::i18n::t_fmt(
+                    "gameinfo.updated_at",
+                    &[lapinux_core::util::format_datetime(fetched)],
+                ),
             };
             if !info.sources.is_empty() {
                 text.push_str(&format!(" · {}", info.sources.join(" · ")));
@@ -1816,15 +2010,17 @@ fn status_row(
             ui.label(egui::RichText::new(text).size(10.5).color(TEXT_DIM()));
         } else {
             ui.label(
-                egui::RichText::new("Aucune lecture demandée")
+                egui::RichText::new(lapinux_core::i18n::t("gameinfo.nothing_requested"))
                     .size(10.5)
                     .color(TEXT_DIM()),
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let hint = "Relit le compte, le protocole et la boutique";
+            let hint = lapinux_core::i18n::t("gameinfo.reload_hint");
             if ui
-                .add(egui::Button::new(egui::RichText::new("Relire").size(10.5)))
+                .add(egui::Button::new(
+                    egui::RichText::new(lapinux_core::i18n::t("gameinfo.reload")).size(10.5),
+                ))
                 .on_hover_text(hint)
                 .clicked()
             {
@@ -1843,28 +2039,32 @@ fn status_row(
 fn body(ui: &mut egui::Ui, info: Option<&SteamGameInfo>, appid: u32) {
     let Some(info) = info else {
         ui.add_space(4.0);
-        muted(
-            ui,
-            "Le compte, le protocole et la boutique se lisent en tâche de fond : la fiche s'affiche dès que Steam répond.",
-        );
+        muted(ui, lapinux_core::i18n::t("gameinfo.background_read"));
         return;
     };
     let account = account_rows(&info.account);
     let store = store_rows(&info.store, appid);
     if account.is_empty() && store.is_empty() && info.stats.is_empty() {
         ui.add_space(4.0);
-        muted(
-            ui,
-            "Aucune source n'a répondu pour ce jeu : connectez le compte Steam depuis les réglages.",
-        );
+        muted(ui, lapinux_core::i18n::t("gameinfo.no_source"));
     }
-    group(ui, "Mon compte", ("game-info-account", appid), &account);
-    group(ui, "Boutique", ("game-info-store", appid), &store);
+    group(
+        ui,
+        lapinux_core::i18n::t("gameinfo.my_account"),
+        ("game-info-account", appid),
+        &account,
+    );
+    group(
+        ui,
+        lapinux_core::i18n::t("gameinfo.store_group"),
+        ("game-info-store", appid),
+        &store,
+    );
     stats_group(ui, &info.stats, appid);
     if !info.notes.is_empty() {
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("Sources muettes")
+            egui::RichText::new(lapinux_core::i18n::t("game_sheet.muted_sources"))
                 .size(11.0)
                 .strong()
                 .color(TEXT_DIM()),
@@ -1905,10 +2105,8 @@ fn group(ui: &mut egui::Ui, title: &str, salt: (&str, u32), rows: &[(&str, Strin
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(value.as_str()).size(10.5),
-                                )
-                                .wrap(),
+                                egui::Label::new(egui::RichText::new(value.as_str()).size(10.5))
+                                    .wrap(),
                             );
                         },
                     );
@@ -1927,22 +2125,27 @@ fn account_rows(play: &SteamAccountPlay) -> Vec<(&'static str, String)> {
     if !read {
         return Vec::new();
     }
-    let duration =
-        |minutes: u64| lapinux_core::util::format_duration(minutes.saturating_mul(60));
+    let duration = |minutes: u64| lapinux_core::util::format_duration(minutes.saturating_mul(60));
     let mut rows: Vec<(&'static str, String)> = Vec::new();
     rows.push((
-        "Possédé",
+        lapinux_core::i18n::t("gameinfo.owned"),
         if play.owned {
-            "Oui, sur ce compte".into()
+            lapinux_core::i18n::t("gameinfo.owned_yes").into()
         } else {
-            "Non : prêté par la famille ou hors du compte".into()
+            lapinux_core::i18n::t("gameinfo.not_owned_family").into()
         },
     ));
     if let Some(minutes) = play.minutes_total {
-        rows.push(("Temps de jeu", duration(minutes)));
+        rows.push((
+            lapinux_core::i18n::t("gameinfo.playtime"),
+            duration(minutes),
+        ));
     }
     if let Some(minutes) = play.minutes_2weeks {
-        rows.push(("Deux dernières semaines", duration(minutes)));
+        rows.push((
+            lapinux_core::i18n::t("gameinfo.last_two_weeks"),
+            duration(minutes),
+        ));
     }
     for (label, minutes) in [
         ("Windows", play.minutes_windows),
@@ -1955,22 +2158,34 @@ fn account_rows(play: &SteamAccountPlay) -> Vec<(&'static str, String)> {
         }
     }
     if let Some(last) = play.last_played.filter(|last| *last > 0) {
-        rows.push(("Dernière partie", lapinux_core::util::format_datetime(last)));
+        rows.push((
+            lapinux_core::i18n::t("gameinfo.last_session"),
+            lapinux_core::util::format_datetime(last),
+        ));
     }
     if let Some(level) = play.level {
-        rows.push(("Niveau Steam", level.to_string()));
+        rows.push((
+            lapinux_core::i18n::t("gameinfo.steam_level"),
+            level.to_string(),
+        ));
     }
     if let Some(level) = play.badge_level {
-        rows.push(("Badge du jeu", format!("niveau {level}")));
+        rows.push((
+            lapinux_core::i18n::t("gameinfo.badge_level"),
+            lapinux_core::i18n::t_args("gameinfo.level_n", &[("level", &level.to_string())]),
+        ));
     }
     if let Some(players) = play.players_now {
-        rows.push(("Joueurs en ligne", thousands(players)));
+        rows.push((
+            lapinux_core::i18n::t("game_sheet.players_online"),
+            thousands(players),
+        ));
     }
     if let Some(total) = play.achievements_total.filter(|total| *total > 0) {
         let unlocked = play.achievements_unlocked.unwrap_or(0);
         let share = f64::from(unlocked) / f64::from(total) * 100.0;
         rows.push((
-            "Succès",
+            lapinux_core::i18n::t("gameinfo.achievements"),
             format!("{unlocked} / {total} · {} %", percent(share)),
         ));
     }
@@ -1983,7 +2198,7 @@ fn account_rows(play: &SteamAccountPlay) -> Vec<(&'static str, String)> {
             ),
             None => play.last_achievement.clone(),
         };
-        rows.push(("Dernier succès", value));
+        rows.push((lapinux_core::i18n::t("gameinfo.last_achievement"), value));
     }
     if !play.rarest.is_empty() {
         let lines: Vec<String> = play
@@ -1992,14 +2207,21 @@ fn account_rows(play: &SteamAccountPlay) -> Vec<(&'static str, String)> {
             .take(RARE_ROWS)
             .map(|rare| {
                 let state = if rare.unlocked {
-                    "débloqué"
+                    lapinux_core::i18n::t("gameinfo.unlocked")
                 } else {
-                    "manquant"
+                    lapinux_core::i18n::t("gameinfo.missing")
                 };
-                format!("{} · {} % · {state}", rare.name, percent(f64::from(rare.percent)))
+                format!(
+                    "{} · {} % · {state}",
+                    rare.name,
+                    percent(f64::from(rare.percent))
+                )
             })
             .collect();
-        rows.push(("Succès les plus rares", lines.join("\n")));
+        rows.push((
+            lapinux_core::i18n::t("gameinfo.rarest_achievements"),
+            lines.join("\n"),
+        ));
     }
     rows
 }
@@ -2008,7 +2230,10 @@ fn account_rows(play: &SteamAccountPlay) -> Vec<(&'static str, String)> {
 fn store_rows(store: &SteamStorePage, appid: u32) -> Vec<(&'static str, String)> {
     let mut rows: Vec<(&'static str, String)> = Vec::new();
     if !store.price.is_empty() {
-        rows.push(("Prix", store.price.clone()));
+        rows.push((
+            lapinux_core::i18n::t("game_sheet.fact_price"),
+            store.price.clone(),
+        ));
     }
     // Le résumé des avis vient de la page communautaire, que Steam ne sert
     // plus sans cookie de session ; son compte, lui, vient d'`appdetails`.
@@ -2019,41 +2244,66 @@ fn store_rows(store: &SteamStorePage, appid: u32) -> Vec<(&'static str, String)>
             parts.push(store.review_summary.clone());
         }
         if let Some(count) = votes {
-            parts.push(format!("{} avis", thousands(count)));
+            parts.push(lapinux_core::i18n::t_args(
+                "game_sheet.reviews_count",
+                &[("count", &thousands(count))],
+            ));
         }
-        rows.push(("Avis des joueurs", parts.join(" · ")));
+        rows.push((
+            lapinux_core::i18n::t("game_sheet.player_reviews"),
+            parts.join(" · "),
+        ));
     }
     if !store.release.is_empty() {
-        rows.push(("Sortie", store.release.clone()));
+        rows.push((
+            lapinux_core::i18n::t("game_sheet.fact_release"),
+            store.release.clone(),
+        ));
     }
     if !store.genres.is_empty() {
         rows.push(("Genres", store.genres.join(" · ")));
     }
     if !store.categories.is_empty() {
-        rows.push(("Fonctionnalités", store.categories.join(" · ")));
+        rows.push((
+            lapinux_core::i18n::t("gameinfo.features"),
+            store.categories.join(" · "),
+        ));
     }
     if !store.descriptors.is_empty() {
         rows.push(("Contenu", store.descriptors.join(" · ")));
     }
     if !store.short_description.is_empty() {
-        rows.push(("Résumé", store.short_description.clone()));
+        rows.push((
+            lapinux_core::i18n::t("gameinfo.summary"),
+            store.short_description.clone(),
+        ));
     }
     if !store.screenshots.is_empty() {
         rows.push((
-            "Captures",
-            plural(store.screenshots.len(), "publiée", "publiées"),
+            lapinux_core::i18n::t("page.captures"),
+            plural(
+                store.screenshots.len(),
+                lapinux_core::i18n::t("gameinfo.published_f"),
+                lapinux_core::i18n::t("gameinfo.published_pl"),
+            ),
         ));
     }
     if !store.website.is_empty() {
         rows.push(("Site officiel", store.website.clone()));
     }
     if !store.support_url.is_empty() {
-        rows.push(("Assistance", store.support_url.clone()));
+        rows.push((
+            lapinux_core::i18n::t("game_sheet.support"),
+            store.support_url.clone(),
+        ));
     } else if !store.support_email.is_empty() {
-        rows.push(("Assistance", store.support_email.clone()));
+        rows.push((
+            lapinux_core::i18n::t("game_sheet.support"),
+            store.support_email.clone(),
+        ));
     }
     rows.push((
-        "Page boutique",
+        lapinux_core::i18n::t("game_sheet.store_page"),
         format!("https://store.steampowered.com/app/{appid}"),
     ));
     if rows.len() <= 1 {
@@ -2089,7 +2339,11 @@ fn stats_group(ui: &mut egui::Ui, stats: &[SteamStat], appid: u32) {
     }
     ui.add_space(8.0);
     egui::CollapsingHeader::new(
-        egui::RichText::new(format!("Statistiques du compte ({})", stats.len())).size(11.5),
+        egui::RichText::new(lapinux_core::i18n::t_fmt(
+            "gameinfo.account_stats",
+            &[stats.len().to_string()],
+        ))
+        .size(11.5),
     )
     .id_salt(("game-info-stats", appid))
     .default_open(false)
@@ -2148,7 +2402,6 @@ fn thousands(value: u64) -> String {
 fn percent(value: f64) -> String {
     format!("{value:.1}").replace('.', ",")
 }
-
 
 /// Pictogramme d'une fonctionnalité. Les traits sont composés comme le reste
 /// des marques de l'application : le sous-ensemble Remix embarqué ne contient
@@ -2218,11 +2471,34 @@ impl FeatureIcon {
             _ if has(&["solo"]) => FeatureIcon::Solo,
             _ if has(&["multi", "coop", "pvp", "jcj", "joueur"]) => FeatureIcon::Duo,
             _ if has(&["cloud", "nuage"]) => FeatureIcon::Cloud,
-            _ if has(&["succès", "troph"]) => FeatureIcon::Trophy,
-            _ if has(&["atelier", "workshop", "éditeur", "editeur"]) => FeatureIcon::Wrench,
+            _ if has(&[
+                lapinux_core::i18n::t("gameinfo.achievements_lower"),
+                "troph",
+            ]) =>
+            {
+                FeatureIcon::Trophy
+            }
+            _ if has(&[
+                "atelier",
+                "workshop",
+                lapinux_core::i18n::t("gameinfo.publisher"),
+                "editeur",
+            ]) =>
+            {
+                FeatureIcon::Wrench
+            }
             _ if has(&["carte"]) => FeatureIcon::Cards,
-            _ if has(&["manette", "contrôleur", "controleur"]) => FeatureIcon::Pad,
-            _ if has(&["remote", "écran", "ecran"]) => FeatureIcon::Screen,
+            _ if has(&[
+                "manette",
+                lapinux_core::i18n::t("gameinfo.controller"),
+                "controleur",
+            ]) =>
+            {
+                FeatureIcon::Pad
+            }
+            _ if has(&["remote", lapinux_core::i18n::t("gameinfo.screen"), "ecran"]) => {
+                FeatureIcon::Screen
+            }
             _ if has(&["vr", "casque"]) => FeatureIcon::Vr,
             _ if has(&["famille", "partage"]) => FeatureIcon::Family,
             _ if has(&["antitriche", "anti-triche"]) => FeatureIcon::Shield,
@@ -2341,7 +2617,12 @@ pub fn paint_feature_icon(
         }
         FeatureIcon::Family => {
             line(vec![at(-6.6, -0.4), at(0.0, -6.4), at(6.6, -0.4)]);
-            line(vec![at(-4.9, -1.2), at(-4.9, 6.2), at(4.9, 6.2), at(4.9, -1.2)]);
+            line(vec![
+                at(-4.9, -1.2),
+                at(-4.9, 6.2),
+                at(4.9, 6.2),
+                at(4.9, -1.2),
+            ]);
         }
         FeatureIcon::Shield => {
             closed(vec![
@@ -2560,7 +2841,9 @@ mod tests {
     fn the_empty_section_explains_the_background_read() {
         let texts = shelf_status(None, None, true);
         assert!(
-            texts.iter().any(|text| text.contains("Lecture des détails Steam")),
+            texts
+                .iter()
+                .any(|text| text.contains(lapinux_core::i18n::t("gameinfo.reading_steam"))),
             "{texts:?}"
         );
     }
@@ -2568,8 +2851,16 @@ mod tests {
     #[test]
     fn a_failed_read_shows_its_reason_and_the_reload_button() {
         let texts = shelf_status(None, Some("session Steam expirée"), false);
-        assert!(texts.iter().any(|text| text == "session Steam expirée"), "{texts:?}");
-        assert!(texts.iter().any(|text| text == "Relire"), "{texts:?}");
+        assert!(
+            texts.iter().any(|text| text == "session Steam expirée"),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == lapinux_core::i18n::t("gameinfo.reload")),
+            "{texts:?}"
+        );
     }
 
     #[test]
@@ -2577,15 +2868,43 @@ mod tests {
         let info = sample();
         let texts = shelf_status(Some(&info), None, false);
         let joined = texts.join("\n");
-        assert!(joined.contains("Mon compte"), "{joined}");
-        assert!(joined.contains("Temps de jeu"), "{joined}");
-        assert!(joined.contains("10 h 00"), "600 minutes : {joined}");
-        assert!(joined.contains("Niveau Steam\n42"), "niveau : {joined}");
-        assert!(joined.contains("niveau 5"), "badge du jeu : {joined}");
-        assert!(joined.contains("1 234"), "joueurs en ligne : {joined}");
-        assert!(joined.contains("3 / 4 · 75,0 %"), "succès du compte : {joined}");
         assert!(
-            joined.contains("Perfection · 1,2 % · manquant"),
+            joined.contains(lapinux_core::i18n::t("gameinfo.my_account")),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(lapinux_core::i18n::t("gameinfo.playtime")),
+            "{joined}"
+        );
+        assert!(joined.contains("10 h 00"), "600 minutes : {joined}");
+        assert!(
+            joined.contains(&format!(
+                "{}\n42",
+                lapinux_core::i18n::t("gameinfo.steam_level")
+            )),
+            "niveau : {joined}"
+        );
+        assert!(
+            joined.contains(&lapinux_core::i18n::t_args(
+                "gameinfo.level_n",
+                &[("level", "5")]
+            )),
+            "badge du jeu : {joined}"
+        );
+        assert!(joined.contains("1 234"), "joueurs en ligne : {joined}");
+        assert!(
+            joined.contains(&format!("3 / 4 · {} %", percent(75.0))),
+            "succès du compte : {joined}"
+        );
+        assert!(
+            joined.contains(&lapinux_core::i18n::t_args(
+                "gameinfo.rarest_line",
+                &[
+                    ("name", "Perfection"),
+                    ("percent", &percent(1.2)),
+                    ("state", lapinux_core::i18n::t("gameinfo.missing"))
+                ],
+            )),
             "succès rare : {joined}"
         );
     }
@@ -2773,10 +3092,22 @@ mod tests {
         let before = at("Avant l'image.");
         let between = at("Entre les images.");
         let after = at("Après la seconde.");
-        assert!(before.bottom() <= rects[0].top(), "ordre avant : {before:?} / {rects:?}");
-        assert!(rects[0].bottom() <= between.top(), "ordre milieu : {rects:?} / {between:?}");
-        assert!(between.bottom() <= rects[1].top(), "ordre entre : {between:?} / {rects:?}");
-        assert!(rects[1].bottom() <= after.top(), "ordre après : {rects:?} / {after:?}");
+        assert!(
+            before.bottom() <= rects[0].top(),
+            "ordre avant : {before:?} / {rects:?}"
+        );
+        assert!(
+            rects[0].bottom() <= between.top(),
+            "ordre milieu : {rects:?} / {between:?}"
+        );
+        assert!(
+            between.bottom() <= rects[1].top(),
+            "ordre entre : {between:?} / {rects:?}"
+        );
+        assert!(
+            rects[1].bottom() <= after.top(),
+            "ordre après : {rects:?} / {after:?}"
+        );
         let column_center = rects[0].center().x;
         for text in [before, between, after] {
             assert!(
@@ -2861,9 +3192,17 @@ mod tests {
     fn the_store_group_paints_price_reviews_and_requirements() {
         let info = sample();
         let joined = shelf_status(Some(&info), None, false).join("\n");
-        assert!(joined.contains("Boutique"), "{joined}");
+        assert!(
+            joined.contains(lapinux_core::i18n::t("collections.store")),
+            "{joined}"
+        );
         assert!(joined.contains("16,79 €"), "{joined}");
-        assert!(joined.contains("Très positive · 2 432 avis"), "{joined}");
+        let reviews = lapinux_core::i18n::t_args(
+            "game_sheet.reviews_count",
+            &[("count", &thousands(2_432))],
+        );
+        let expected = format!("Très positive · {reviews}");
+        assert!(joined.contains(expected.as_str()), "{joined}");
         assert!(joined.contains("Un jeu de gestion d'abeilles."), "{joined}");
         assert!(
             joined.contains("https://store.steampowered.com/app/1017900"),
@@ -2878,14 +3217,21 @@ mod tests {
         info.store.review_summary.clear();
         info.store.recommendations = Some(14_410);
         let joined = shelf_status(Some(&info), None, false).join("\n");
-        assert!(joined.contains("14 410 avis"), "{joined}");
+        let reviews = lapinux_core::i18n::t_args(
+            "game_sheet.reviews_count",
+            &[("count", &thousands(14_410))],
+        );
+        assert!(joined.contains(reviews.as_str()), "{joined}");
     }
 
     #[test]
     fn the_mute_sources_are_listed() {
         let info = sample();
         let joined = shelf_status(Some(&info), None, false).join("\n");
-        assert!(joined.contains("Sources muettes"), "{joined}");
+        assert!(
+            joined.contains(lapinux_core::i18n::t("game_sheet.muted_sources")),
+            "{joined}"
+        );
         assert!(joined.contains("boutique : page indisponible"), "{joined}");
     }
 
@@ -2899,7 +3245,10 @@ mod tests {
         info.stats.clear();
         info.notes.clear();
         let joined = shelf_status(Some(&info), None, false).join("\n");
-        assert!(joined.contains("Aucune source n'a répondu"), "{joined}");
+        assert!(
+            joined.contains(lapinux_core::i18n::t("gameinfo.no_source")),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -3069,10 +3418,16 @@ mod tests {
             },
         ];
         let texts = embeds(760.0, info, |shelf, ui| {
-            assert!(shelf.news_embed(ui, 1017900, None), "l'encart doit se peindre");
+            assert!(
+                shelf.news_embed(ui, 1017900, None),
+                "l'encart doit se peindre"
+            );
         });
         let joined = texts.join("\n");
-        assert!(joined.contains("Actualités"), "{joined}");
+        assert!(
+            joined.contains(lapinux_core::i18n::t("gameinfo.news")),
+            "{joined}"
+        );
         assert!(joined.contains("2 annonces"), "{joined}");
         assert!(joined.contains("Mise à jour 1.2"), "{joined}");
         assert!(joined.contains("Le mode coop arrive."), "{joined}");
@@ -3088,7 +3443,10 @@ mod tests {
     #[test]
     fn a_game_without_announcements_shows_no_news_embed() {
         let info = sample();
-        assert!(info.store.news.is_empty(), "la fiche d'essai n'en publie pas");
+        assert!(
+            info.store.news.is_empty(),
+            "la fiche d'essai n'en publie pas"
+        );
         let texts = embeds(760.0, info, |shelf, ui| {
             assert!(!shelf.news_embed(ui, 1017900, None), "rien à peindre");
         });
@@ -3111,7 +3469,10 @@ mod tests {
             shelf.summary_embed(ui, 1017900, 320.0, 200.0, None);
         });
         let joined = texts.join("\n");
-        assert!(joined.contains("Résumé"), "{joined}");
+        assert!(
+            joined.contains(lapinux_core::i18n::t("gameinfo.summary")),
+            "{joined}"
+        );
         assert!(joined.contains("gestion d'abeilles"), "{joined}");
         // Une fiche sans résumé ni capture garde son encart et le dit : la
         // carte ne disparaît pas de la ligne des trois encarts.
@@ -3120,7 +3481,10 @@ mod tests {
             shelf.summary_embed(ui, 1017900, 320.0, 200.0, None);
         });
         let joined = texts.join("\n");
-        assert!(joined.contains("Aucun résumé"), "{joined}");
+        assert!(
+            joined.contains(lapinux_core::i18n::t("gameinfo.no_summary")),
+            "{joined}"
+        );
     }
 
     /// Un clic sur une capture l'ouvre dans le panneau fixe de l'application,
@@ -3279,7 +3643,7 @@ mod tests {
                 .map(|(_, rect)| *rect)
                 .unwrap_or_else(|| panic!("{needle} manque : {painted:?}"))
         };
-        let title = rect_of("Résumé");
+        let title = rect_of(lapinux_core::i18n::t("gameinfo.summary"));
         let body = rect_of("gestion d'abeilles");
         assert!(
             body.top() >= title.bottom(),
@@ -3365,6 +3729,56 @@ mod tests {
             content.description,
             "Début de la présentation longue.\n# Titre\nCorps."
         );
+        assert!(
+            content.description_blocks.is_empty(),
+            "une présentation sans visuel garde son rendu d'un bloc"
+        );
+    }
+
+    /// Epic publie ses visuels dans la présentation sous la forme
+    /// `![légende](adresse)` : ils doivent être peints dans « À propos », à
+    /// leur place, au lieu de rester des liens Markdown bruts.
+    #[test]
+    fn epic_markdown_media_is_split_into_the_about() {
+        let details = lapinux_core::stores::StoreDetails {
+            store: lapinux_core::stores::Store::Epic,
+            description: "Avant ![plan](https://cdn.example/plan.png)\n# Construire\n![boucle](https://cdn.example/boucle.gif)\nAprès."
+                .into(),
+            ..Default::default()
+        };
+        let content = SheetContent::from_store_details(Some(&details));
+        assert_eq!(
+            content.description_images,
+            vec![
+                "https://cdn.example/plan.png".to_string(),
+                "https://cdn.example/boucle.gif".to_string()
+            ]
+        );
+        assert_eq!(
+            content.description_blocks,
+            vec![
+                DescriptionBlock::Text("Avant".into()),
+                DescriptionBlock::Media("https://cdn.example/plan.png".into()),
+                DescriptionBlock::Text("# Construire".into()),
+                DescriptionBlock::Media("https://cdn.example/boucle.gif".into()),
+                DescriptionBlock::Text("Après.".into()),
+            ]
+        );
+    }
+
+    /// Une image peut avoir un titre Markdown après son adresse : le titre
+    /// n'est pas une partie de l'URL à télécharger.
+    #[test]
+    fn a_markdown_image_title_is_not_part_of_the_url() {
+        let details = lapinux_core::stores::StoreDetails {
+            description: "![plan](https://cdn.example/plan.png \"Le plan\")".into(),
+            ..Default::default()
+        };
+        let content = SheetContent::from_store_details(Some(&details));
+        assert_eq!(
+            content.description_images,
+            vec!["https://cdn.example/plan.png".to_string()]
+        );
     }
 
     /// Une présentation de boutique passe par le même encart que Steam :
@@ -3375,7 +3789,10 @@ mod tests {
             store: lapinux_core::stores::Store::Gog,
             description: "Un jeu de survie coopératif où quatre survivants affrontent des hordes."
                 .into(),
-            screenshots: vec!["https://cdn.example/1.jpg".into(), "https://cdn.example/2.jpg".into()],
+            screenshots: vec![
+                "https://cdn.example/1.jpg".into(),
+                "https://cdn.example/2.jpg".into(),
+            ],
             news: vec![lapinux_core::stores::StoreNews {
                 title: "Patch 2.5".into(),
                 excerpt: "Notes de mise à jour.".into(),
@@ -3417,10 +3834,17 @@ mod tests {
             })
             .collect();
         assert!(
-            texts.iter().any(|text| text.starts_with("Un jeu de survie")),
+            texts
+                .iter()
+                .any(|text| text.starts_with("Un jeu de survie")),
             "résumé de la boutique absent : {texts:?}"
         );
-        assert!(texts.iter().any(|text| text == "Résumé"), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == lapinux_core::i18n::t("gameinfo.summary")),
+            "{texts:?}"
+        );
     }
 
     /// Peint l'encart du résumé dans une ligne horizontale, comme la fiche
@@ -3471,9 +3895,7 @@ mod tests {
                     egui::Rect::from_min_size(text.pos, text.galley.size()),
                 )),
                 egui::Shape::Rect(rect) if rect.fill == CARD_HOVER() => rects.push(rect.rect),
-                egui::Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::Managed(0) => {
-                    *images += 1
-                }
+                egui::Shape::Path(_) | egui::Shape::Circle(_) => *images += 1,
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
                         walk(shape, texts, rects, images);
@@ -3516,13 +3938,17 @@ mod tests {
             "les captures passent sous le texte ({first:?} / {body:?})"
         );
         assert!(
-            rects.iter()
+            rects
+                .iter()
                 .all(|rect| (rect.width() - first.width()).abs() < 0.5),
             "vignettes de largeurs différentes : {rects:?}"
         );
         assert!(rects[1].left() >= rects[0].right(), "vignettes collées");
         assert!(rects[2].left() >= rects[1].right(), "vignettes collées");
-        let bottom = rects.iter().map(|rect| rect.bottom()).fold(0.0_f32, f32::max);
+        let bottom = rects
+            .iter()
+            .map(|rect| rect.bottom())
+            .fold(0.0_f32, f32::max);
         assert!(bottom <= 170.0, "les vignettes débordent : {bottom}");
     }
 
@@ -3531,10 +3957,13 @@ mod tests {
     #[test]
     fn the_empty_summary_card_waits_with_the_bunny() {
         let (texts, rects, images) = summary_paint(None, true, true, 170.0);
-        assert_eq!(images, 1, "le lapin s'anime dans la carte");
+        assert!(
+            images > 0,
+            "l’indicateur vectoriel doit être dessiné dans la carte"
+        );
         let label = texts
             .iter()
-            .find(|(text, _)| text.contains("Lecture des détails du jeu"))
+            .find(|(text, _)| text.contains(lapinux_core::i18n::t("gameinfo.reading_game")))
             .map(|(_, rect)| *rect)
             .expect("libellé d'attente");
         // Au centre de la carte (320 px de large, à 8 px du bord), pas dans un
@@ -3563,8 +3992,9 @@ mod tests {
             .map(|index| SteamNews {
                 body: String::new(),
                 title: format!("Annonce {index}"),
-                excerpt: "Un texte d'annonce assez long pour tenir sur quelques lignes de sa carte."
-                    .into(),
+                excerpt:
+                    "Un texte d'annonce assez long pour tenir sur quelques lignes de sa carte."
+                        .into(),
                 date: 1_793_000_000 + index,
                 author: String::new(),
                 url: format!("https://exemple/{index}"),
@@ -3588,8 +4018,14 @@ mod tests {
         );
         assert!(first.right() <= second.left(), "les cartes se chevauchent");
         assert!(second.right() <= third.left(), "les cartes se chevauchent");
-        assert!((first.top() - third.top()).abs() < 1.0, "les cartes sont sur la même ligne");
-        assert!(third.right() <= 760.0, "la carte déborde de la colonne : {third:?}");
+        assert!(
+            (first.top() - third.top()).abs() < 1.0,
+            "les cartes sont sur la même ligne"
+        );
+        assert!(
+            third.right() <= 760.0,
+            "la carte déborde de la colonne : {third:?}"
+        );
         // L'aperçu descend sous le titre de sa carte au lieu de le suivre sur
         // la même ligne.
         let excerpt = painted
@@ -3616,7 +4052,10 @@ mod tests {
     fn an_excerpt_is_cut_to_its_four_lines() {
         assert_eq!(clamp_words("un deux trois", 7), "un…");
         assert_eq!(clamp_words("court", 20), "court");
-        assert_eq!(clamp_words("Mise à jour", 11), "Mise à jour");
+        assert_eq!(
+            clamp_words(lapinux_core::i18n::t("downloads.update"), 11),
+            lapinux_core::i18n::t("downloads.update")
+        );
         assert!(clamp_words(&"mot ".repeat(80), 60).ends_with('…'));
     }
 
@@ -3640,7 +4079,10 @@ mod tests {
         assert_eq!(icon(28, "Compat. contrôleurs complète"), FeatureIcon::Pad);
         assert_eq!(icon(44, "Remote Play Together"), FeatureIcon::Screen);
         assert_eq!(icon(24, "Écran partagé"), FeatureIcon::Screen);
-        assert_eq!(icon(62, "Partage familial"), FeatureIcon::Family);
+        assert_eq!(
+            icon(62, lapinux_core::i18n::t("library.origin.family")),
+            FeatureIcon::Family
+        );
         assert_eq!(icon(8, "Antitriche Valve activée"), FeatureIcon::Shield);
         assert_eq!(icon(35, "Achats en jeu"), FeatureIcon::Cart);
         assert_eq!(icon(65, "Options de sous-titres"), FeatureIcon::Options);

@@ -28,7 +28,10 @@ fn main() {
     println!("{} licences reçues", licenses.len());
     println!(
         "datées : {}",
-        licenses.iter().filter(|licence| licence.time_created > 0).count()
+        licenses
+            .iter()
+            .filter(|licence| licence.time_created > 0)
+            .count()
     );
     println!(
         "avec moyen de paiement : {}",

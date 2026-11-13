@@ -29,7 +29,7 @@ use std::time::Duration;
 use steamroom::apps::{AccessToken, AppInfo};
 use steamroom::client::{LoggedIn, SteamClient};
 use steamroom::depot::AppId;
-use steamroom::types::key_value::{KvValue, KeyValue};
+use steamroom::types::key_value::{KeyValue, KvValue};
 
 /// Adresse publique du compteur de joueurs connectés.
 const WEB_API: &str = "https://api.steampowered.com";
@@ -86,7 +86,11 @@ fn strip_image_tags(html: &str) -> String {
 /// par ffmpeg du côté de l'interface ; les formats classiques sont décodés
 /// directement.
 fn supported_media(url: &str) -> bool {
-    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
     [
         ".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".webm", ".mp4",
     ]
@@ -226,7 +230,11 @@ fn split_about_section(text: &str) -> Option<(String, String)> {
     let mut found = false;
     for line in text.lines() {
         let heading = line.trim().to_lowercase();
-        if !found && ABOUT_MARKERS.iter().any(|marker| heading.starts_with(marker)) {
+        if !found
+            && ABOUT_MARKERS
+                .iter()
+                .any(|marker| heading.starts_with(marker))
+        {
             found = true;
             continue;
         }
@@ -384,16 +392,12 @@ async fn collect(info: &mut SteamGameInfo, sources: &Sources) {
                         // éditions, pour que le poids du bloc Détails Steam soit
                         // celui du bouton de téléchargement.
                         let mut budget = native::DEPOT_KEY_BUDGET;
-                        let refused = native::refused_depots(&logged, info.appid, &root, &mut budget)
-                            .await;
+                        let refused =
+                            native::refused_depots(&logged, info.appid, &root, &mut budget).await;
                         lap!("dépôts refusés");
                         info.update = merge_installed(
                             &info.update,
-                            update_from_pics(
-                                &root,
-                                refused.as_ref(),
-                                native::default_language(),
-                            ),
+                            update_from_pics(&root, refused.as_ref(), native::default_language()),
                         );
                         let dlc: Vec<u32> = info
                             .update
@@ -469,7 +473,6 @@ async fn collect(info: &mut SteamGameInfo, sources: &Sources) {
     let _ = mark.elapsed();
     info.notes.dedup();
 }
-
 
 /// Requête Web API : la réponse JSON, ou `None` (Steam répond parfois vide).
 async fn web(http: &reqwest::Client, url: &str) -> Option<Value> {
@@ -753,7 +756,8 @@ pub fn platform_size(
             continue;
         }
         // Dépôt qu'une autre édition publie : le protocole en a refusé la clé.
-        if refused.is_some_and(|refused| refused.contains(&key.parse::<u32>().unwrap_or_default())) {
+        if refused.is_some_and(|refused| refused.contains(&key.parse::<u32>().unwrap_or_default()))
+        {
             continue;
         }
         if let Some(oslist) = depot
@@ -822,10 +826,13 @@ pub fn platform_size(
 
 /// Contenus additionnels publiés par le jeu (`extended.listofdlc`).
 fn dlc_ids(app: &KeyValue) -> Vec<u32> {
-    text_of(app.get("extended").and_then(|extended| extended.get("listofdlc")))
-        .split(',')
-        .filter_map(|id| id.trim().parse().ok())
-        .collect()
+    text_of(
+        app.get("extended")
+            .and_then(|extended| extended.get("listofdlc")),
+    )
+    .split(',')
+    .filter_map(|id| id.trim().parse().ok())
+    .collect()
 }
 
 /// Classifications officielles publiées par PICS (PEGI, ESRB, USK…).
@@ -953,11 +960,7 @@ async fn players_now(http: &reqwest::Client, appid: u32) -> Option<u64> {
 /// Compte lu par le protocole : la bibliothèque donne le temps de jeu, le
 /// service de badge le niveau, et le schéma des succès leur progression et
 /// leur rareté. Tout passe par la session, sans clé Web API.
-async fn protocol_account(
-    info: &mut SteamGameInfo,
-    client: &SteamClient<LoggedIn>,
-    steam_id: u64,
-) {
+async fn protocol_account(info: &mut SteamGameInfo, client: &SteamClient<LoggedIn>, steam_id: u64) {
     // Le groupe familial ouvre le temps de jeu des jeux prêtés ; sans lui, la
     // fiche d'un jeu de la famille n'en montrait aucun.
     let family = crate::playtime::family_group_id(client, steam_id).await;
@@ -982,9 +985,9 @@ async fn protocol_account(
                     apply_playtime(info, &play);
                     account_source(info);
                 }
-                None => info.notes.push(
-                    "compte : ce jeu ne figure pas dans la bibliothèque Steam".into(),
-                ),
+                None => info
+                    .notes
+                    .push("compte : ce jeu ne figure pas dans la bibliothèque Steam".into()),
             }
         }
         Err(error) => info
@@ -1032,9 +1035,7 @@ async fn protocol_account(
             account_source(info);
         }
         Ok(_) => {}
-        Err(error) => info
-            .notes
-            .push(format!("statistiques publiées : {error}")),
+        Err(error) => info.notes.push(format!("statistiques publiées : {error}")),
     }
 }
 
@@ -1099,11 +1100,7 @@ fn store_language(code: &str) -> &'static str {
 
 /// Page publique de la boutique, dans la langue du réglage : Steam renvoie le
 /// texte d'origine quand le jeu n'a pas de page traduite.
-async fn store_block(
-    http: &reqwest::Client,
-    appid: u32,
-    language: &str,
-) -> Option<SteamStorePage> {
+async fn store_block(http: &reqwest::Client, appid: u32, language: &str) -> Option<SteamStorePage> {
     let url = format!("{STORE_APP}{appid}&l={language}&cc=FR");
     let started = std::time::Instant::now();
     let value = web(http, &url).await?;
@@ -1196,7 +1193,10 @@ pub fn og_image(html: &str) -> Option<String> {
 /// Lit les annonces d'une réponse `GetNewsForApp` : le flux garde les
 /// publications de l'éditeur, la presse externe est écartée.
 pub fn news_from_json(value: &Value) -> Vec<SteamNews> {
-    let Some(items) = value.pointer("/appnews/newsitems").and_then(Value::as_array) else {
+    let Some(items) = value
+        .pointer("/appnews/newsitems")
+        .and_then(Value::as_array)
+    else {
         return Vec::new();
     };
     items
@@ -1419,7 +1419,13 @@ pub fn store_from_json(value: &Value, appid: u32) -> Option<SteamStorePage> {
                 final_price
             }
         }
-        None if data.get("is_free").and_then(Value::as_bool).unwrap_or(false) => "Gratuit".into(),
+        None if data
+            .get("is_free")
+            .and_then(Value::as_bool)
+            .unwrap_or(false) =>
+        {
+            "Gratuit".into()
+        }
         None => String::new(),
     };
     if let Some(list) = data.get("screenshots").and_then(Value::as_array) {
@@ -1463,7 +1469,10 @@ pub fn store_from_json(value: &Value, appid: u32) -> Option<SteamStorePage> {
             }
         }
     }
-    for (list, key) in [(&mut page.genres, "genres"), (&mut page.categories, "categories")] {
+    for (list, key) in [
+        (&mut page.genres, "genres"),
+        (&mut page.categories, "categories"),
+    ] {
         if let Some(entries) = data.get(key).and_then(Value::as_array) {
             for entry in entries {
                 let label = json_str(entry.get("description"));
@@ -1489,7 +1498,10 @@ pub fn store_from_json(value: &Value, appid: u32) -> Option<SteamStorePage> {
             page.features.push(SteamFeature { id, label });
         }
     }
-    if let Some(descriptors) = data.pointer("/content_descriptors/ids").and_then(Value::as_array) {
+    if let Some(descriptors) = data
+        .pointer("/content_descriptors/ids")
+        .and_then(Value::as_array)
+    {
         for id in descriptors {
             let label = match id.as_u64() {
                 Some(1) => "Nudité ou contenu sexuel",
@@ -1573,7 +1585,10 @@ pub fn html_text(html: &str) -> String {
                     .next()
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                let block = matches!(tag.as_str(), "p" | "li" | "ul" | "ol" | "div" | "h1" | "h2" | "h3" | "h4" | "tr");
+                let block = matches!(
+                    tag.as_str(),
+                    "p" | "li" | "ul" | "ol" | "div" | "h1" | "h2" | "h3" | "h4" | "tr"
+                );
                 if tag == "br" || (closing && block) {
                     text.push('\n');
                 }
@@ -1780,7 +1795,10 @@ mod tests {
                                     "ratings",
                                     children(vec![(
                                         "pegi",
-                                        kv("pegi", children(vec![("rating", text("rating", "18"))])),
+                                        kv(
+                                            "pegi",
+                                            children(vec![("rating", text("rating", "18"))]),
+                                        ),
                                     )]),
                                 ),
                             ),
@@ -1791,10 +1809,7 @@ mod tests {
                     "extended",
                     kv(
                         "extended",
-                        children(vec![(
-                            "listofdlc",
-                            text("listofdlc", "1017900,1017901"),
-                        )]),
+                        children(vec![("listofdlc", text("listofdlc", "1017900,1017901"))]),
                     ),
                 ),
                 (
@@ -1812,8 +1827,17 @@ mod tests {
                     kv(
                         "depots",
                         children(vec![
-                            ("branches", kv("branches", children(vec![("public", public), ("beta", beta)]))),
-                            ("1001", depot("1001", "windows,linux", "english", "1000", "500")),
+                            (
+                                "branches",
+                                kv(
+                                    "branches",
+                                    children(vec![("public", public), ("beta", beta)]),
+                                ),
+                            ),
+                            (
+                                "1001",
+                                depot("1001", "windows,linux", "english", "1000", "500"),
+                            ),
                             ("1002", depot("1002", "linux", "french", "400", "200")),
                             ("1003", depot("1003", "linux", "english", "300", "150")),
                             ("baselanguages", text("baselanguages", "english,french")),
@@ -1849,13 +1873,17 @@ mod tests {
         assert_eq!(update.install, 1300);
         assert_eq!(update.depots[0].language, "Anglais");
         assert_eq!(update.depots[1].os, vec!["Linux".to_string()]);
-    }    #[test]
+    }
+    #[test]
     fn a_depot_without_manifest_does_not_count() {
         let depot = kv(
             "5",
             children(vec![(
                 "config",
-                kv("config", children(vec![("oslist", text("oslist", "linux"))])),
+                kv(
+                    "config",
+                    children(vec![("oslist", text("oslist", "linux"))]),
+                ),
             )]),
         );
         let depots = kv("depots", children(vec![("5", depot)]));
@@ -1899,7 +1927,8 @@ mod tests {
     /// compte, sinon chaque visuel apparaîtrait deux fois.
     #[test]
     fn the_description_ignores_the_alternate_image_attribute() {
-        let html = r#"<img class="bb_img" src="https://cdn/a.avif" data-big-src="https://cdn/b.webp">"#;
+        let html =
+            r#"<img class="bb_img" src="https://cdn/a.avif" data-big-src="https://cdn/b.webp">"#;
         assert_eq!(
             description_images(html),
             vec!["https://cdn/a.avif".to_string()]
@@ -2018,7 +2047,10 @@ mod tests {
         assert_eq!(page.price, "4,99€ · -50 % (au lieu de 9,99€)");
         assert_eq!(page.discount, 50);
         assert_eq!(page.recommendations, Some(1_234_567));
-        assert_eq!(page.descriptors, vec!["Violence ou gore fréquents".to_string()]);
+        assert_eq!(
+            page.descriptors,
+            vec!["Violence ou gore fréquents".to_string()]
+        );
         // Linux passe devant Windows quand la boutique le publie.
         assert_eq!(page.requirements_min, "Processeur : 2 cœurs");
         assert_eq!(page.support_email, "aide@valve.com");
@@ -2043,8 +2075,16 @@ mod tests {
             }
         });
         let page = store_from_json(&value, 440).expect("page lue");
-        assert!(page.requirements_min.contains("Processeur"), "{}", page.requirements_min);
-        assert!(page.requirements_min.contains("Mémoire vive"), "{}", page.requirements_min);
+        assert!(
+            page.requirements_min.contains("Processeur"),
+            "{}",
+            page.requirements_min
+        );
+        assert!(
+            page.requirements_min.contains("Mémoire vive"),
+            "{}",
+            page.requirements_min
+        );
     }
 
     #[test]
@@ -2059,7 +2099,11 @@ mod tests {
             }
         });
         let page = store_from_json(&value, 440).expect("page lue");
-        assert!(page.requirements_min.contains("64 bits"), "{}", page.requirements_min);
+        assert!(
+            page.requirements_min.contains("64 bits"),
+            "{}",
+            page.requirements_min
+        );
     }
 
     #[test]
@@ -2090,9 +2134,18 @@ mod tests {
         assert_eq!(
             page.features,
             vec![
-                SteamFeature { id: 2, label: "Solo".into() },
-                SteamFeature { id: 23, label: "Steam Cloud".into() },
-                SteamFeature { id: 57, label: "Manettes DualSense".into() },
+                SteamFeature {
+                    id: 2,
+                    label: "Solo".into()
+                },
+                SteamFeature {
+                    id: 23,
+                    label: "Steam Cloud".into()
+                },
+                SteamFeature {
+                    id: 57,
+                    label: "Manettes DualSense".into()
+                },
             ]
         );
     }
@@ -2185,7 +2238,10 @@ mod tests {
         assert!(!excerpt.contains("mo…"), "{excerpt}");
         assert!(excerpt.chars().count() <= NEWS_EXCERPT + 1, "{excerpt}");
         // Sans un seul espace, la coupe reste au nombre de caractères.
-        assert_eq!(news_excerpt(&"a".repeat(400)).chars().count(), NEWS_EXCERPT + 1);
+        assert_eq!(
+            news_excerpt(&"a".repeat(400)).chars().count(),
+            NEWS_EXCERPT + 1
+        );
     }
 
     /// La fenêtre de recherche d'une entité se compte en caractères : un
@@ -2215,7 +2271,10 @@ mod tests {
                    </li></ul>";
         let text = html_text(raw);
         assert!(text.contains("Minimale"), "{text}");
-        assert!(text.contains("Système d'exploitation et processeur 64 bits"), "{text}");
+        assert!(
+            text.contains("Système d'exploitation et processeur 64 bits"),
+            "{text}"
+        );
         assert!(text.contains("Processeur : 1.8 Ghz+ Dual Core"), "{text}");
         assert!(text.lines().count() >= 3, "{text}");
     }
@@ -2237,7 +2296,10 @@ mod tests {
             installed_build_time: Some(1_690_000_000),
             ..Default::default()
         };
-        let merged = merge_installed(&installed, update_from_pics(&appinfo(), None, Some("english")));
+        let merged = merge_installed(
+            &installed,
+            update_from_pics(&appinfo(), None, Some("english")),
+        );
         assert_eq!(merged.public_build, Some(16_000_000));
         assert_eq!(merged.installed_build, Some(15_000_000));
         assert_eq!(merged.installed_build_time, Some(1_690_000_000));
@@ -2283,12 +2345,12 @@ mod tests {
             children(vec![
                 (
                     "english",
-                    text("english", "9f05c4af67da067bfa4b0ccbceef1e20613a616e/header.jpg"),
+                    text(
+                        "english",
+                        "9f05c4af67da067bfa4b0ccbceef1e20613a616e/header.jpg",
+                    ),
                 ),
-                (
-                    "french",
-                    text("french", "abcdef/header_french.jpg"),
-                ),
+                ("french", text("french", "abcdef/header_french.jpg")),
             ]),
         );
         let common = kv("common", children(vec![("header_image", header)]));
@@ -2297,7 +2359,10 @@ mod tests {
             "9f05c4af67da067bfa4b0ccbceef1e20613a616e/header.jpg"
         );
         // Ancien appinfo : un simple `header.jpg` sans chemin.
-        let flat = kv("common", children(vec![("header_image", text("header_image", "header.jpg"))]));
+        let flat = kv(
+            "common",
+            children(vec![("header_image", text("header_image", "header.jpg"))]),
+        );
         assert_eq!(store_image(Some(&flat)), "header.jpg");
         // Rien de publié : la vignette se rabat sur l'adresse à plat.
         let empty = kv("common", children(Vec::new()));

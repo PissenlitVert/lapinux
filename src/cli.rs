@@ -12,6 +12,7 @@ use std::time::Duration;
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("doctor") => doctor(),
+        Some("diagnostic-export") => diagnostic_export(args.get(1)),
         Some("scan") => scan(args.iter().any(|a| a == "--json")),
         Some("list") => list(args.iter().any(|a| a == "--json")),
         Some("protons") => protons(args.iter().any(|a| a == "--json")),
@@ -59,6 +60,7 @@ fn help() {
          \n\
          Commandes :\n\
          \x20 doctor                       diagnostic de l'environnement\n\
+         \x20 diagnostic-export <fichier>   export privé JSON sans journaux ni comptes\n\
          \x20 scan [--json]                scanne les bibliothèques Steam\n\
          \x20 list [--json]                liste les jeux connus\n\
          \x20 protons [--json]             liste les Proton installés\n\
@@ -115,6 +117,29 @@ fn doctor() -> i32 {
             1
         }
     }
+}
+
+fn diagnostic_export(destination: Option<&String>) -> i32 {
+    use std::io::Write;
+    let Some(destination) = destination else {
+        eprintln!("usage : lapinux cli diagnostic-export <fichier>");
+        return 2;
+    };
+    let client = Client::new(&paths()).without_spawn();
+    let alive = match client.request_with_timeout(&Req::Ping, Duration::from_millis(600)) {
+        Ok(envelope) => Some(envelope.ok),
+        Err(lapinux_core::Error::IpcTimeout(_)) => None,
+        Err(_) => Some(false),
+    };
+    let doctor = if alive == Some(true) { client.request_with_timeout(&Req::Doctor, Duration::from_secs(3)).ok().and_then(|e| e.into_data().ok()) } else { None };
+    let jobs: Option<Vec<lapinux_core::model::Job>> = if alive == Some(true) { client.request_with_timeout(&Req::Jobs, Duration::from_secs(2)).ok().and_then(|e| e.into_data().ok()) } else { None };
+    let report = lapinux_core::diagnostic::report(doctor.as_ref(), jobs.as_deref(), alive);
+    let result = serde_json::to_vec_pretty(&report).map_err(std::io::Error::other).and_then(|data| {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(destination)?;
+        file.write_all(&data)
+    });
+    match result { Ok(()) => { println!("Diagnostic enregistré : {destination}"); 0 }, Err(error) => { eprintln!("Export impossible : {error}"); 1 } }
 }
 
 fn print_doctor(report: &lapinux_core::model::DoctorReport) -> i32 {
@@ -189,7 +214,10 @@ fn print_scan(
     warnings: &[String],
 ) -> i32 {
     if json {
-        println!("{}", serde_json::to_string_pretty(games).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(games).unwrap_or_default()
+        );
     } else {
         println!(
             "{} bibliothèque(s), {} jeu(x) — {} installé(s)",
@@ -213,7 +241,11 @@ fn print_scan(
                 "  {:>8}  {:<42} {:<9} {}",
                 game.appid,
                 lapinux_core::util::ellipsize(&game.name, 42),
-                if game.installed { "installé" } else { "absent" },
+                if game.installed {
+                    "installé"
+                } else {
+                    "absent"
+                },
                 if game.installed {
                     format!("{} · {}", drm_label(game.drm), exe)
                 } else {
@@ -238,9 +270,7 @@ fn list(json: bool) -> i32 {
     let paths = paths();
     let games: Vec<Game> = if daemon_up() {
         match Client::new(&paths).without_spawn().request(&Req::Games) {
-            Ok(envelope) => envelope
-                .into_data::<Vec<Game>>()
-                .unwrap_or_default(),
+            Ok(envelope) => envelope.into_data::<Vec<Game>>().unwrap_or_default(),
             Err(err) => {
                 eprintln!("{err}");
                 return 1;
@@ -256,7 +286,10 @@ fn list(json: bool) -> i32 {
         }
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&games).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&games).unwrap_or_default()
+        );
     } else {
         for game in games {
             println!(
@@ -277,7 +310,10 @@ fn protons(json: bool) -> i32 {
     ];
     let list = lapinux_proton::scan(&lapinux_core::paths::steam_roots(), &extra);
     if json {
-        println!("{}", serde_json::to_string_pretty(&list).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&list).unwrap_or_default()
+        );
     } else if list.is_empty() {
         println!("aucun Proton détecté");
     } else {
@@ -390,7 +426,11 @@ fn devices() -> i32 {
     for device in lapinux_input::device::list() {
         println!(
             "{} {:<44} {:04x}:{:04x} {} boutons {}",
-            if device.gamepad { "MANETTE" } else { "PÉRIF  " },
+            if device.gamepad {
+                "MANETTE"
+            } else {
+                "PÉRIF  "
+            },
             lapinux_core::util::ellipsize(&device.name, 44),
             device.vendor,
             device.product,
@@ -413,7 +453,11 @@ fn access() -> i32 {
         };
         println!(
             "{} {:<40} {:<22} {}",
-            if device.readable { "LISIBLE" } else { "REFUSÉ " },
+            if device.readable {
+                "LISIBLE"
+            } else {
+                "REFUSÉ "
+            },
             kind,
             lapinux_core::util::ellipsize(&device.name, 38),
             device.path.display()
@@ -429,9 +473,7 @@ fn input_test(seconds: Option<String>, virtual_pad_only: bool) -> i32 {
     if virtual_pad_only {
         return virtual_pad_check();
     }
-    let seconds = seconds
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(6);
+    let seconds = seconds.and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
     let paths = paths();
     let profile = lapinux_input::ensure_profiles(&paths.data_dir, "defaut").unwrap_or_default();
     println!(
@@ -493,7 +535,10 @@ fn virtual_pad_check() -> i32 {
                 code: lapinux_input::codes::BTN_SOUTH,
                 value: 0,
             }]);
-            println!("pad virtuel « {} » créé et alimenté ; il disparaît à la fin du test", pad.name());
+            println!(
+                "pad virtuel « {} » créé et alimenté ; il disparaît à la fin du test",
+                pad.name()
+            );
             0
         }
         Err(err) => {
@@ -505,10 +550,7 @@ fn virtual_pad_check() -> i32 {
 
 fn login(username: Option<&str>) -> i32 {
     let Some(username) = username else {
-        eprintln!(
-            "usage : {} cli login <compte Steam>",
-            lapinux_core::APP_BIN
-        );
+        eprintln!("usage : {} cli login <compte Steam>", lapinux_core::APP_BIN);
         return 2;
     };
     let paths = paths();
@@ -597,10 +639,9 @@ fn finish_cli_login(
         // La date d'écriture est posée par `save_to`.
         saved_at: None,
     };
-    if let Err(err) = lapinux_steam::session::save_to(
-        &lapinux_steam::session::path_in(&paths.data_dir),
-        &saved,
-    ) {
+    if let Err(err) =
+        lapinux_steam::session::save_to(&lapinux_steam::session::path_in(&paths.data_dir), &saved)
+    {
         eprintln!("jeton non enregistré : {err}");
         return 1;
     }
@@ -648,10 +689,7 @@ fn client() -> Client {
 
 fn install(appid: Option<&String>) -> i32 {
     let Some(appid) = appid.and_then(|s| s.parse::<u32>().ok()) else {
-        eprintln!(
-            "usage : {} cli install <appid>",
-            lapinux_core::APP_BIN
-        );
+        eprintln!("usage : {} cli install <appid>", lapinux_core::APP_BIN);
         return 2;
     };
     let client = client();
@@ -678,7 +716,9 @@ fn install(appid: Option<&String>) -> i32 {
     loop {
         std::thread::sleep(Duration::from_millis(600));
         let jobs = match client.request(&Req::Jobs) {
-            Ok(envelope) => envelope.into_data::<Vec<lapinux_core::model::Job>>().unwrap_or_default(),
+            Ok(envelope) => envelope
+                .into_data::<Vec<lapinux_core::model::Job>>()
+                .unwrap_or_default(),
             Err(err) => {
                 eprintln!("{err}");
                 return 1;
@@ -750,7 +790,10 @@ fn launch(appid: Option<&String>, dry_run: bool) -> i32 {
 
 fn jobs() -> i32 {
     let client = client();
-    match client.request(&Req::Jobs).and_then(Envelope::into_data::<Vec<lapinux_core::model::Job>>) {
+    match client
+        .request(&Req::Jobs)
+        .and_then(Envelope::into_data::<Vec<lapinux_core::model::Job>>)
+    {
         Ok(jobs) if jobs.is_empty() => println!("aucune tâche"),
         Ok(jobs) => {
             for job in jobs {
@@ -773,7 +816,10 @@ fn jobs() -> i32 {
 
 fn session() -> i32 {
     let client = client();
-    match client.request(&Req::Session).and_then(Envelope::into_data::<Option<lapinux_core::model::SessionInfo>>) {
+    match client
+        .request(&Req::Session)
+        .and_then(Envelope::into_data::<Option<lapinux_core::model::SessionInfo>>)
+    {
         Ok(Some(session)) => {
             println!(
                 "{} (appid {}) pid {} depuis {} s — Proton {} · overlay {}",
@@ -782,7 +828,11 @@ fn session() -> i32 {
                 session.pid,
                 lapinux_core::util::now_unix() - session.started,
                 session.proton,
-                if session.overlay_open { "ouvert" } else { "fermé" }
+                if session.overlay_open {
+                    "ouvert"
+                } else {
+                    "fermé"
+                }
             );
         }
         Ok(None) => println!("aucune session"),
@@ -851,6 +901,7 @@ fn print_config() -> i32 {
 }
 
 fn overlay_demo(args: &[String]) -> i32 {
+    apply_overlay_language();
     let seconds = arg_value(args, "--seconds")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(3);
@@ -874,6 +925,7 @@ fn overlay_demo(args: &[String]) -> i32 {
         nav_fifo: None,
         hud_only: false,
         output: None,
+        results: None,
     };
     match lapinux_overlay::run(menu, options, |_action| {}) {
         Ok(()) => {
@@ -891,21 +943,29 @@ fn overlay_demo(args: &[String]) -> i32 {
 /// le pointeur produit une action par pixel. Les envoyer toutes ferait la
 /// queue devant `wpctl` et donnerait un curseur pâteux.
 fn coalescible_stream(wire: &str) -> Option<&'static str> {
-    ["fps_cap:", "game_volume:", "hud_scale:"]
+    ["fps_cap:", "game_volume:", "hud_scale:", "hud_style:"]
         .into_iter()
         .find(|prefix| wire.starts_with(prefix))
 }
 
 /// Transmet une action du menu au daemon, depuis le fil des actions.
-fn send_overlay_action(client: &Client, wire: &str) {
+/// Renvoie le motif du refus pour que l'overlay puisse réarmer son bouton.
+fn send_overlay_action(client: &Client, wire: &str) -> Option<String> {
     match client.request(&Req::OverlayAction {
         action: wire.to_string(),
     }) {
         Ok(envelope) if !envelope.ok => {
-            eprintln!("action refusée : {}", envelope.error.unwrap_or_default())
+            let error = envelope
+                .error
+                .unwrap_or_else(|| "le daemon a refusé l'action".into());
+            eprintln!("action refusée : {error}");
+            Some(error)
         }
-        Ok(_) => {}
-        Err(err) => eprintln!("action : {err}"),
+        Ok(_) => None,
+        Err(err) => {
+            eprintln!("action : {err}");
+            Some(err.to_string())
+        }
     }
 }
 
@@ -942,7 +1002,17 @@ fn achievement_toast(args: &[String]) -> i32 {
     }
 }
 
+/// Aligne la langue de l'overlay sur celle enregistrée par l'application :
+/// ce sous-processus ne lit pas la configuration pour lui-même.
+fn apply_overlay_language() {
+    let paths = LapinuxPaths::discover();
+    if let Ok(config) = lapinux_core::Config::load(&paths.config_file) {
+        lapinux_core::i18n::set(&config.general.lang);
+    }
+}
+
 pub fn overlay(args: &[String]) -> i32 {
+    apply_overlay_language();
     // Bandeau de succès : une surface jetable, sans menu ni raccourcis.
     if args.iter().any(|a| a == "--achievement-toast") {
         return achievement_toast(args);
@@ -953,41 +1023,39 @@ pub fn overlay(args: &[String]) -> i32 {
     menu.fps_cap = arg_value(args, "--fps")
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
-    let hud = arg_value(args, "--hud").unwrap_or_default();
-    let mangohud_flag = args.iter().any(|a| a == "--mangohud");
-    menu.hud = if mangohud_flag && hud.trim().is_empty() {
-        lapinux_overlay::menu::HudPreset::Detailed
-    } else {
-        lapinux_overlay::menu::HudPreset::from_wire(&hud)
-    };
-    menu.hud_on = mangohud_flag || args.iter().any(|a| a == "--hud-on");
     // Plaque de performance de Lapinux : elle vit dans la surface de
     // l'overlay, jamais dans celle du jeu. `--hud-only` ne l'allume pas : le
     // démon peut demander un badge d'enregistrement seul.
     menu.perf_hud = args.iter().any(|a| a == "--perf-hud");
     menu.record_badge = args.iter().any(|a| a == "--record-badge");
-    menu.record_position = lapinux_overlay::menu::HudPosition::from_wire(
-        &arg_value(args, "--record-badge-position").unwrap_or_default(),
-    );
-    menu.record_scale = arg_value(args, "--record-badge-scale")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1.0);
-    menu.perf_scale = arg_value(args, "--perf-hud-scale")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1.15);
-    menu.hud_engine = lapinux_overlay::menu::HudEngine::from_wire(
-        &arg_value(args, "--hud-engine").unwrap_or_default(),
-    );
-    menu.hud_position = lapinux_overlay::menu::HudPosition::from_wire(
-        &arg_value(args, "--hud-position").unwrap_or_default(),
-    );
-    menu.hud_layout = lapinux_overlay::menu::HudLayout::from_wire(
-        &arg_value(args, "--hud-layout").unwrap_or_default(),
-    );
-    // Le badge d'enregistrement est un élément à part : sa position et sa
-    // taille ne suivent pas celles de la plaque de performance.
-    menu.hud_graph = args.iter().any(|a| a == "--hud-graph");
-    menu.hud_cores = args.iter().any(|a| a == "--hud-cores");
+    // Le style complet arrive en JSON : il porte les couleurs, l'ordre, les
+    // unités, l'ancrage et le badge. Sans lui, un style intégré sert de repli.
+    menu.hud_style = arg_value(args, "--hud-style")
+        .and_then(|body| serde_json::from_str::<lapinux_core::hud::HudStyle>(&body).ok())
+        .unwrap_or_else(|| lapinux_core::hud::HudStyle::builtin("essential"));
+    menu.hud_style.normalize();
+    if let Some(position) = arg_value(args, "--record-badge-position") {
+        menu.hud_style.badge.position = position;
+    }
+    if let Some(scale) =
+        arg_value(args, "--record-badge-scale").and_then(|value| value.parse::<f32>().ok())
+    {
+        menu.hud_style.badge.scale = scale;
+    }
+    menu.hud_style.badge.enabled = menu.hud_style.badge.enabled || menu.record_badge;
+    menu.record_badge = menu.hud_style.badge.enabled;
+    menu.record_position =
+        lapinux_overlay::menu::HudPosition::from_wire(&menu.hud_style.badge.position);
+    menu.record_scale = menu.hud_style.badge.scale;
+    menu.perf_scale = menu.hud_style.scale;
+    menu.hud_position = lapinux_overlay::menu::HudPosition::from_wire(&menu.hud_style.position);
+    menu.hud_layout = lapinux_overlay::menu::HudLayout::from_wire(&menu.hud_style.layout);
+    menu.hud_styles = arg_value(args, "--hud-styles")
+        .and_then(|body| serde_json::from_str::<Vec<lapinux_core::hud::HudStyle>>(&body).ok())
+        .unwrap_or_default();
+    for style in &mut menu.hud_styles {
+        style.normalize();
+    }
     // Vidéos du jeu pour la page « Enregistrements » : le dossier vient du
     // démon, le jeu de son appid.
     menu.appid = arg_value(args, "--appid")
@@ -1027,6 +1095,10 @@ pub fn overlay(args: &[String]) -> i32 {
     // le daemon. Pendant un glissement de la limite de FPS, seule la dernière
     // valeur demandée compte, les précédentes sont jetées.
     let (sender, actions) = std::sync::mpsc::channel::<String>();
+    // Les échecs reviennent au panneau par ce canal : le fil des actions ne
+    // bloque jamais le menu, mais l'invitation refusée est réarmée dès que le
+    // daemon a répondu.
+    let (failures, failed_actions) = std::sync::mpsc::channel::<lapinux_overlay::ActionFailed>();
     {
         let paths = paths.clone();
         std::thread::spawn(move || {
@@ -1039,31 +1111,57 @@ pub fn overlay(args: &[String]) -> i32 {
                     match actions.try_recv() {
                         Ok(next) if coalescible_stream(&next) == Some(stream) => latest = next,
                         Ok(next) => {
-                            send_overlay_action(&client, &latest);
+                            if let Some(error) = send_overlay_action(&client, &latest) {
+                                let _ = failures.send(lapinux_overlay::ActionFailed {
+                                    action: latest.clone(),
+                                    error,
+                                });
+                            }
                             latest = next;
                             break;
                         }
                         Err(_) => break,
                     }
                 }
-                send_overlay_action(&client, &latest);
+                if let Some(error) = send_overlay_action(&client, &latest) {
+                    let _ = failures.send(lapinux_overlay::ActionFailed {
+                        action: latest,
+                        error,
+                    });
+                }
             }
         });
     }
     let options = lapinux_overlay::OverlayOptions {
         width,
         height,
-        duration: arg_value(args, "--duration").and_then(|s| s.parse().ok()).map(Duration::from_secs),
+        duration: arg_value(args, "--duration")
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs),
         font: None,
         capsule: arg_value(args, "--capsule").map(std::path::PathBuf::from),
         icon: arg_value(args, "--icon").map(std::path::PathBuf::from),
         nav_fifo: arg_value(args, "--nav-fifo").map(std::path::PathBuf::from),
         hud_only: args.iter().any(|a| a == "--hud-only"),
         output: arg_value(args, "--output"),
+        results: Some(failed_actions),
     };
+    let quit_paths = paths.clone();
     let result = lapinux_overlay::run(menu, options, move |action| {
         let wire = action.wire();
         if wire == "resume" {
+            return;
+        }
+        // « Quitter » ferme le processus juste après l'animation. Confier
+        // l'ordre au fil détaché laissait une course : le processus pouvait
+        // se terminer avant que le fil n'ait envoyé la requête, et le jeu
+        // restait ouvert jusqu'au clic suivant. L'ordre part donc ici, avant
+        // que `run` ne rende la main, avec un délai borné pour ne jamais
+        // bloquer la fermeture si le daemon ne répond pas.
+        if wire == "quit_game" {
+            let client = Client::new(&quit_paths).without_spawn();
+            let _ = client
+                .request_with_timeout(&Req::OverlayAction { action: wire }, Duration::from_secs(2));
             return;
         }
         let _ = sender.send(wire);
@@ -1077,7 +1175,6 @@ pub fn overlay(args: &[String]) -> i32 {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1184,10 @@ mod tests {
         assert_eq!(coalescible_stream("game_volume:0.42"), Some("game_volume:"));
         assert_eq!(coalescible_stream("fps_cap:120"), Some("fps_cap:"));
         assert_eq!(coalescible_stream("hud_scale:1.25"), Some("hud_scale:"));
+        assert_eq!(
+            coalescible_stream("hud_style:{\"name\":\"Course\"}"),
+            Some("hud_style:")
+        );
         // Une action ponctuelle n'est jamais absorbée par un glissement.
         assert_eq!(coalescible_stream("screenshot"), None);
         assert_eq!(coalescible_stream("game_volume:0.42"), Some("game_volume:"));

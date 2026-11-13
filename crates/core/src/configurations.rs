@@ -293,7 +293,7 @@ pub struct Configuration {
     pub kind: String,
     /// `windows`, `linux` ou `both`.
     pub platform: String,
-    /// `dxvk`, `vkd3d`, `wine`, `proton`, `gamescope`, `mangohud`, `game`.
+    /// `dxvk`, `vkd3d`, `wine`, `proton`, `gamescope`, `game`.
     pub layers: Vec<String>,
     pub author: Author,
     pub version: String,
@@ -388,7 +388,12 @@ impl Configuration {
         if !self.retired && !self.actions.has_work() {
             problems.push("actions : rien à appliquer (settings ou files)".into());
         }
+        let mut targets = std::collections::HashSet::new();
         for (index, file) in self.actions.files.iter().enumerate() {
+            // Windows traite les noms de DLL sans distinguer la casse.
+            if !targets.insert(file.target.to_ascii_lowercase()) {
+                problems.push(format!("files[{index}].target : cible dupliquée"));
+            }
             if let Err(err) = relative_path(&file.source) {
                 problems.push(format!("files[{index}].source : {err}"));
             }
@@ -402,7 +407,9 @@ impl Configuration {
             }
         }
         if self.requires.contains(&self.id) || self.conflicts.contains(&self.id) {
-            problems.push("requires/conflicts : une configuration ne se référence pas elle-même".into());
+            problems.push(
+                "requires/conflicts : une configuration ne se référence pas elle-même".into(),
+            );
         }
         problems
     }
@@ -423,9 +430,7 @@ pub const KNOWN_TYPES: [&str; 7] = [
     "content",
 ];
 pub const KNOWN_PLATFORMS: [&str; 3] = ["windows", "linux", "both"];
-pub const KNOWN_LAYERS: [&str; 7] = [
-    "dxvk", "vkd3d", "wine", "proton", "gamescope", "mangohud", "game",
-];
+pub const KNOWN_LAYERS: [&str; 6] = ["dxvk", "vkd3d", "wine", "proton", "gamescope", "game"];
 pub const KNOWN_STATUS: [&str; 3] = ["proposed", "verified", "broken"];
 
 fn is_slug(text: &str) -> bool {
@@ -488,14 +493,14 @@ pub fn file_url(base: &str, configuration: &Configuration, file: &FileSpec) -> O
     }
     let source = relative_path(&file.source).ok()?;
     let mut path = String::new();
-    for component in configuration.base.split('/').chain(
-        source
-            .components()
-            .filter_map(|component| match component {
-                Component::Normal(name) => name.to_str(),
-                _ => None,
-            }),
-    ) {
+    for component in configuration
+        .base
+        .split('/')
+        .chain(source.components().filter_map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        }))
+    {
         let component = component.trim();
         if component.is_empty() {
             continue;
@@ -604,7 +609,9 @@ impl LegacyFix {
                 },
                 files: Vec::new(),
             },
-            links: (!self.url.trim().is_empty()).then(|| vec![self.url.clone()]).unwrap_or_default(),
+            links: (!self.url.trim().is_empty())
+                .then(|| vec![self.url.clone()])
+                .unwrap_or_default(),
             size: 0,
             base: String::new(),
         }
@@ -633,6 +640,66 @@ pub struct InstalledFile {
     pub sha256: String,
     /// Une copie de l'ancien fichier attend dans les sauvegardes.
     pub backed_up: bool,
+}
+
+/// Installation d'un injecteur, suivie indépendamment des configurations du catalogue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphicsInjector {
+    pub kind: String,
+    pub version: String,
+    pub executable: String,
+    pub proxy: String,
+    pub stage: String,
+    pub files: Vec<GraphicsInjectorFile>,
+    pub staged: Vec<GraphicsInjectorFile>,
+    pub ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphicsInjectorFile {
+    pub name: String,
+    pub sha256: String,
+}
+
+/// Diagnostic d'un injecteur, calculé sur les fichiers réels et les réglages
+/// du jeu. Aucun champ n'est persisté : il décrit l'instant de la demande.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GraphicsInjectorStatus {
+    pub kind: String,
+    pub version: String,
+    pub executable: String,
+    pub proxy: String,
+    /// `ok`, `missing`, `modified`, `incomplete`, `executable_changed`.
+    pub install: String,
+    /// État de chaque fichier suivi.
+    pub files: Vec<GraphicsInjectorFileStatus>,
+    /// `applied`, `already`, `blocked`.
+    pub launch_override: String,
+    /// Cause d'un override bloqué : `wined3d`, `frame_generation`, `vkbasalt`,
+    /// `config_file`, `manual_override`, `optiscaler_proton`.
+    pub override_reason: String,
+    /// Action utile en un clic : `none`, `repair`, `reinstall`, `fix_override`.
+    pub action: String,
+    /// Dossiers de sauvegarde conservés et réellement présents.
+    pub backups: Vec<GraphicsInjectorBackup>,
+}
+
+/// Dossier de sauvegarde conservé, proposé à l'ouverture dans la fiche.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GraphicsInjectorBackup {
+    /// `user_modified` ou `stage`.
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GraphicsInjectorFileStatus {
+    pub name: String,
+    /// `intact`, `missing`, `modified`, `unlinked`, `personalized`.
+    pub state: String,
 }
 
 /// Ce que le daemon rend pour la fiche d'un jeu.

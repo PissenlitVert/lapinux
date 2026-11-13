@@ -35,12 +35,16 @@ const USB_RECEIVERS: [(u16, u16); 22] = [
     (0x0e6f, 0x0005), // récepteur sans fil Pelican Eclipse
 ];
 
+/// Vrai pour le pad virtuel Lapinux. C'est une sortie du service d'entrée :
+/// l'interface ne doit jamais le traiter comme une manette utilisateur.
+pub fn is_output_pad(name: Option<&str>) -> bool {
+    name.is_some_and(|name| name == format!("{} Virtual Pad", lapinux_core::APP_NAME))
+}
+
 pub fn is_gamepad(device: &evdev::Device) -> bool {
     let has_pad_button = device
         .supported_keys()
-        .map(|keys| {
-            keys.contains(evdev::KeyCode::new(BTN_SOUTH))
-        })
+        .map(|keys| keys.contains(evdev::KeyCode::new(BTN_SOUTH)))
         .unwrap_or(false);
     let has_stick = device
         .supported_absolute_axes()
@@ -101,17 +105,16 @@ fn is_generic_xbox(vendor: u16, product: u16, manufacturer: Option<&str>) -> boo
     }
     manufacturer
         .filter(|name| !name.trim().is_empty())
-        .map_or(false, |name| !name.to_ascii_lowercase().contains("microsoft"))
+        .map_or(false, |name| {
+            !name.to_ascii_lowercase().contains("microsoft")
+        })
 }
 
 pub fn describe(path: &PathBuf, device: &evdev::Device) -> DeviceInfo {
     let id = device.input_id();
     let detected = connection_of(path);
-    let generic_xbox = is_generic_xbox(
-        id.vendor(),
-        id.product(),
-        usb_manufacturer(path).as_deref(),
-    );
+    let generic_xbox =
+        is_generic_xbox(id.vendor(), id.product(), usb_manufacturer(path).as_deref());
     // Un clone 045e:028e se présente presque toujours par un récepteur
     // 2,4 GHz ; la liaison sert de nom plutôt qu'un « Xbox 360 Controller »
     // trompeur.
@@ -272,8 +275,8 @@ fn udev_identity(event: &Path) -> UdevIdentity {
     };
     let dev = read_text(PathBuf::from(format!("/sys/class/input/{name}/dev")));
     if let Some((major, minor)) = dev.trim().split_once(':') {
-        let data = std::fs::read_to_string(format!("/run/udev/data/c{major}:{minor}"))
-            .unwrap_or_default();
+        let data =
+            std::fs::read_to_string(format!("/run/udev/data/c{major}:{minor}")).unwrap_or_default();
         let field = |key: &str| {
             data.lines()
                 .find_map(|line| line.strip_prefix(key))
@@ -282,8 +285,8 @@ fn udev_identity(event: &Path) -> UdevIdentity {
         };
         identity.vendor = field("E:ID_VENDOR_ENC=").or_else(|| field("E:ID_VENDOR="));
         identity.model = field("E:ID_MODEL_ENC=").or_else(|| field("E:ID_MODEL="));
-        identity.serial = field("E:ID_SERIAL=")
-            .filter(|serial| !serial.eq_ignore_ascii_case("noserial"));
+        identity.serial =
+            field("E:ID_SERIAL=").filter(|serial| !serial.eq_ignore_ascii_case("noserial"));
     }
     if identity.is_empty() {
         // Pas de base udev (conteneur, nœud fraîchement créé) : les mêmes
@@ -437,7 +440,10 @@ fn unique_id(dir: &Path) -> Option<String> {
         let Ok(uevent) = std::fs::read_to_string(ancestor.join("uevent")) else {
             continue;
         };
-        if let Some(uniq) = uevent.lines().find_map(|line| line.strip_prefix("HID_UNIQ=")) {
+        if let Some(uniq) = uevent
+            .lines()
+            .find_map(|line| line.strip_prefix("HID_UNIQ="))
+        {
             return Some(uniq.to_string());
         }
     }
@@ -518,7 +524,11 @@ pub fn set_steam_lizard_mode(enabled: bool) -> Result<(), String> {
         Some(mode) if mode == enabled => Ok(()),
         Some(mode) => Err(format!(
             "le pilote est resté en mode {}",
-            if mode { "clavier/souris" } else { "manette native" }
+            if mode {
+                "clavier/souris"
+            } else {
+                "manette native"
+            }
         )),
         None => Err("le pilote n'expose plus lizard_mode".to_string()),
     }
@@ -530,7 +540,9 @@ pub fn set_steam_lizard_mode(enabled: bool) -> Result<(), String> {
 fn run_pkexec_script(script: &str) -> Result<(), String> {
     let pkexec = Path::new("/usr/bin/pkexec");
     if !pkexec.exists() {
-        return Err("pkexec introuvable : installe polkit pour autoriser l'installation".to_string());
+        return Err(
+            "pkexec introuvable : installe polkit pour autoriser l'installation".to_string(),
+        );
     }
     let output = std::process::Command::new(pkexec)
         .args(["/bin/sh", "-c", script])
@@ -786,11 +798,7 @@ mod tests {
     fn third_party_xbox_ids_are_treated_as_generic() {
         assert!(is_generic_xbox(0x045e, 0x028e, Some("Homertech")));
         assert!(is_generic_xbox(0x045e, 0x028e, Some("MICREAL")));
-        assert!(!is_generic_xbox(
-            0x045e,
-            0x028e,
-            Some("Microsoft")
-        ));
+        assert!(!is_generic_xbox(0x045e, 0x028e, Some("Microsoft")));
         // Un pad virtuel sans fabricant USB n'est pas un clone identifié.
         assert!(!is_generic_xbox(0x045e, 0x028e, None));
         assert!(!is_generic_xbox(0x045e, 0x028e, Some("  ")));
@@ -832,7 +840,10 @@ mod tests {
     #[test]
     fn fallback_names_follow_the_link() {
         assert_eq!(fallback_pad_name(DeviceLink::Usb), "Manette USB");
-        assert_eq!(fallback_pad_name(DeviceLink::Bluetooth), "Manette Bluetooth");
+        assert_eq!(
+            fallback_pad_name(DeviceLink::Bluetooth),
+            "Manette Bluetooth"
+        );
         assert_eq!(fallback_pad_name(DeviceLink::Dongle), "Manette 2,4 GHz");
         assert_eq!(fallback_pad_name(DeviceLink::Virtual), "Manette virtuelle");
         assert_eq!(fallback_pad_name(DeviceLink::Unknown), "Manette");
@@ -841,7 +852,10 @@ mod tests {
     #[test]
     fn hid_bus_is_recognised() {
         assert_eq!(parse_hid_bus("0003:0000045E:0000028E"), DeviceLink::Usb);
-        assert_eq!(parse_hid_bus("0005:0000054C:00000CE6"), DeviceLink::Bluetooth);
+        assert_eq!(
+            parse_hid_bus("0005:0000054C:00000CE6"),
+            DeviceLink::Bluetooth
+        );
         assert_eq!(parse_hid_bus("0018:0000:0000"), DeviceLink::Unknown);
         assert_eq!(parse_hid_bus(""), DeviceLink::Unknown);
     }
@@ -885,12 +899,17 @@ mod tests {
             "Xbox 360 Wireless Receiver",
             "Microsoft"
         ));
-        assert!(!is_usb_receiver(0x057e, 0x2009, "Pro Controller", "Nintendo"));
+        assert!(!is_usb_receiver(
+            0x057e,
+            0x2009,
+            "Pro Controller",
+            "Nintendo"
+        ));
     }
 
     #[test]
     fn bluetooth_addresses_are_recognised() {
-        assert!(is_mac("44:46:48:2e:38:09"));
+        assert!(is_mac("02:00:00:00:00:01"));
         assert!(is_mac("AA:BB:CC:DD:EE:FF"));
         assert!(!is_mac("FXB9954802F92"));
         assert!(!is_mac("44:46:48:2e:38"));

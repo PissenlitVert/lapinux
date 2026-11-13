@@ -125,7 +125,10 @@ fn main() {
                 if let Some(object) = item.as_object() {
                     for key in object.keys() {
                         let lower = key.to_lowercase();
-                        if lower.contains("dlc") || lower.contains("addon") || lower.contains("main") {
+                        if lower.contains("dlc")
+                            || lower.contains("addon")
+                            || lower.contains("main")
+                        {
                             extra.push(key.clone());
                         }
                     }

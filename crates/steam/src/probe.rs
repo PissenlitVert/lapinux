@@ -102,7 +102,9 @@ impl Report {
 
     /// Première interface ayant accepté d'ouvrir un pipe.
     pub fn piped(&self) -> Option<&InterfaceHit> {
-        self.interfaces.iter().find(|hit| hit.pipe.is_some_and(|p| p != 0))
+        self.interfaces
+            .iter()
+            .find(|hit| hit.pipe.is_some_and(|p| p != 0))
     }
 
     /// Étape atteinte, pour un affichage lisible.
@@ -277,9 +279,10 @@ pub fn probe(candidates: &[PathBuf], session: bool, account: Option<u32>) -> Rep
     // Le moteur de Valve charge ses voisines (crashhandler.so, libtier0_s.so)
     // depuis son propre répertoire : on le signale, la sonde n'y touche pas.
     let parent = library.parent().unwrap_or(Path::new("."));
-    report
-        .notes
-        .push(format!("répertoire de la bibliothèque : {}", parent.display()));
+    report.notes.push(format!(
+        "répertoire de la bibliothèque : {}",
+        parent.display()
+    ));
 
     let handle = match unsafe { dlopen(library) } {
         Ok(handle) => handle,
@@ -400,7 +403,9 @@ fn probe_account(report: &mut Report, object: *mut c_void, pipe: u32, user: u32)
     } {
         // `ISteamApps` : BIsSubscribed (index 0).
         report.subscribed = unsafe { call_bool(apps, 0) };
-        report.notes.push("ISteamApps obtenu (souscription lisible)".into());
+        report
+            .notes
+            .push("ISteamApps obtenu (souscription lisible)".into());
     } else {
         report.notes.push(format!("{STEAMAPPS_VERSION} absent"));
     }
@@ -554,10 +559,7 @@ pub struct SteamclientBackend {
 
 impl SteamclientBackend {
     pub fn new(libraries: Vec<PathBuf>, account: Option<u32>) -> Self {
-        Self {
-            libraries,
-            account,
-        }
+        Self { libraries, account }
     }
 }
 
@@ -714,13 +716,12 @@ fn login_command(
         config.endpoints = vec![endpoint];
     }
 
-    if let Some(saved) = crate::session::load()
-        .filter(|saved| saved.account_name.eq_ignore_ascii_case(name))
+    if let Some(saved) =
+        crate::session::load().filter(|saved| saved.account_name.eq_ignore_ascii_case(name))
     {
         println!("jeton Steam enregistré pour {name} : reconnexion sans mot de passe");
-        let mut backend =
-            crate::account::CmBackend::token(name.to_string(), saved.refresh_token)
-                .with_config(config.clone());
+        let mut backend = crate::account::CmBackend::token(name.to_string(), saved.refresh_token)
+            .with_config(config.clone());
         match backend.sign_in(&mut *prompt) {
             Ok(account) => {
                 println!("comptes Steam :");
@@ -749,12 +750,9 @@ fn login_command(
     let saved_guard = crate::session::load()
         .filter(|saved| saved.account_name.eq_ignore_ascii_case(name))
         .and_then(|saved| saved.guard_data);
-    let mut backend = crate::account::CmBackend::account_with_guard(
-        name.to_string(),
-        password,
-        saved_guard,
-    )
-    .with_config(config);
+    let mut backend =
+        crate::account::CmBackend::account_with_guard(name.to_string(), password, saved_guard)
+            .with_config(config);
     match backend.sign_in(&mut *prompt) {
         Ok(account) => {
             println!("comptes Steam :");
@@ -770,8 +768,7 @@ fn login_command(
 }
 
 fn save_session(name: &str, account: &Account) {
-    let (Some(steam_id), Some(refresh_token)) =
-        (account.steam_id, account.refresh_token.clone())
+    let (Some(steam_id), Some(refresh_token)) = (account.steam_id, account.refresh_token.clone())
     else {
         return;
     };
@@ -907,10 +904,11 @@ pub fn cli(args: &[String]) -> i32 {
             Some(value) => value,
         }
     };
-    // Les parcours autonomes ne construisent même pas la liste des
-    // bibliothèques d'un client installé : ils ne doivent jamais y retomber.
+    // Cette ancienne sonde installait et exécutait SteamCMD. Elle ne fait
+    // plus partie des parcours autorisés, même sous son ancien nom.
     if command == "runtime" {
-        return crate::runtime::cli(&args[1..]);
+        eprintln!("La sonde SteamCMD est désactivée : Lapinux n'installe ni ne lance de client de boutique.");
+        return 2;
     }
 
     let session = args.iter().any(|arg| arg == "--session");
@@ -931,7 +929,7 @@ pub fn cli(args: &[String]) -> i32 {
         other => {
             eprintln!("commande Lapinux inconnue : {other}");
             eprintln!(
-                "usage : {COMMAND} [probe [--session]] | {COMMAND} runtime [--prepare] [--probe] | \
+                "usage : {COMMAND} [probe [--session]] | \
                  {COMMAND} host [--account N] | {COMMAND} account [--login COMPTE] \
                  [--local|--cm] [--endpoint HOST:PORT]"
             );
@@ -1121,7 +1119,7 @@ fn signal_label(status: &std::process::ExitStatus) -> String {
 fn print_report(report: &Report, session: bool) {
     println!("Lapinux — hôte natif Steam (expérimental)\n");
     match (&report.library, report.size) {
-        (Some(path), Some(size)) =>        println!(
+        (Some(path), Some(size)) => println!(
             "bibliothèque  {}\n              {}",
             path.display(),
             lapinux_core::util::format_bytes(size)
@@ -1129,7 +1127,10 @@ fn print_report(report: &Report, session: bool) {
         (Some(path), None) => println!("bibliothèque  {}", path.display()),
         (None, _) => println!("bibliothèque  aucune"),
     }
-    println!("chargée       {}", if report.loaded { "oui" } else { "non" });
+    println!(
+        "chargée       {}",
+        if report.loaded { "oui" } else { "non" }
+    );
     if !report.runtime.is_empty() {
         let present = report.runtime.iter().filter(|(_, ok)| *ok).count();
         println!("runtime       {present}/{} pièces", report.runtime.len());
@@ -1199,6 +1200,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn steamcmd_runtime_command_is_disabled() {
+        assert_eq!(cli(&["runtime".into(), "--prepare".into()]), 2);
+    }
+
+    #[test]
     fn versions_are_descending() {
         let numbers: Vec<u32> = STEAMCLIENT_VERSIONS
             .iter()
@@ -1252,7 +1258,9 @@ mod tests {
             PathBuf::from("/home/moi/.local/share/Steam/steamrt64/steamclient.so")
         );
         assert!(list.len() >= 3);
-        assert!(!list.iter().any(|path| path.to_string_lossy().contains("steamcmd")));
+        assert!(!list
+            .iter()
+            .any(|path| path.to_string_lossy().contains("steamcmd")));
     }
 
     #[test]

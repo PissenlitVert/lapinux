@@ -16,14 +16,19 @@ use std::time::UNIX_EPOCH;
 /// retirées, ce qui borne l'espace disque.
 pub const SLOTS: u8 = 3;
 
-/// Racine des copies : celle des réglages, sinon les données de Lapinux.
+/// Racine des copies : celle des réglages, sinon `Sauvegardes`.
 pub fn root(paths: &LapinuxPaths, config: &Config) -> PathBuf {
     let chosen = config.general.saves_root.trim();
     if chosen.is_empty() {
-        paths.data_dir.join("saves")
-    } else {
-        lapinux_core::paths::expand_tilde(chosen)
+        return paths.saves_root();
     }
+    let chosen = lapinux_core::paths::expand_tilde(chosen);
+    // Ancien emplacement par défaut : les copies ont suivi au premier
+    // démarrage, sans changer le réglage enregistré.
+    if chosen == paths.data_dir.join("saves") && !chosen.is_dir() {
+        return paths.saves_root();
+    }
+    chosen
 }
 
 /// Nom du dossier d'un jeu : son titre lisible, l'identifiant entre
@@ -33,7 +38,11 @@ pub fn folder_label(game: &Game) -> String {
     for ch in game.name.trim().chars() {
         // Un séparateur de chemin ou un caractère de contrôle casserait le
         // dossier ; le reste du titre, accents compris, est conservé.
-        name.push(if ch.is_control() || ch == '/' { '-' } else { ch });
+        name.push(if ch.is_control() || ch == '/' {
+            '-'
+        } else {
+            ch
+        });
         // La limite est en octets : un titre en emoji ne doit pas dépasser la
         // longueur d'un nom de fichier une fois l'identifiant ajouté.
         if name.len() >= 120 {
@@ -181,7 +190,12 @@ pub fn source(game: &Game, paths: &LapinuxPaths) -> Option<PathBuf> {
             // passe avant « Saved Games », que Proton crée vide dans chaque
             // préfixe : sinon aucun jeu n'aurait de copie automatique.
             if let Some(dir) = named_folder(&user, &game.name) {
-                return Some(dir);
+                // Unreal range ses sauvegardes dans `Saved/SaveGames`. Le
+                // dossier du jeu, lui, porte aussi les caches d'assets et les
+                // maps Workshop : les copier ferait des sauvegardes de
+                // plusieurs centaines de Mo pour quelques kilo-octets utiles.
+                let unreal = dir.join("Saved/SaveGames");
+                return Some(if unreal.is_dir() { unreal } else { dir });
             }
             for rel in ["Saved Games", "Documents/My Games"] {
                 let dir = user.join(rel);
@@ -602,7 +616,9 @@ pub fn note(store: &Store, appid: u32, event: SaveEvent) {
 
 /// Poids total de toutes les copies.
 pub fn total_bytes(paths: &LapinuxPaths, config: &Config) -> u64 {
-    measure(&root(paths, config)).map(|(_, bytes, _)| bytes).unwrap_or(0)
+    measure(&root(paths, config))
+        .map(|(_, bytes, _)| bytes)
+        .unwrap_or(0)
 }
 
 /// Bilan de toutes les copies : jeux concernés, nombre de copies, poids et
@@ -657,6 +673,106 @@ pub fn backup_to_slot(
     backup_choice(game, paths, config, slot, None)
 }
 
+/// Copie vérifiée exigée avant une opération destructive. Un dossier vide ou
+/// indéterminé n'est pas une preuve qu'aucune sauvegarde n'existe ailleurs.
+pub fn verified_backup(
+    game: &Game,
+    paths: &LapinuxPaths,
+    config: &Config,
+) -> Result<String, String> {
+    if let Some(configured) = game
+        .settings
+        .save_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let configured = lapinux_core::paths::expand_tilde(configured);
+        let configured = if configured.is_absolute() {
+            configured
+        } else {
+            game.install_dir().join(configured)
+        };
+        if !configured.is_dir() {
+            return Err(format!(
+                "dossier de sauvegarde configuré introuvable : {}",
+                configured.display()
+            ));
+        }
+    }
+    let source = source(game, paths).ok_or("dossier de sauvegarde indéterminé")?;
+    ensure_recoverable_tree(&source)?;
+    let expected = fingerprint(&source).map_err(|e| format!("{} : {e}", source.display()))?;
+    if expected.0 == 0 {
+        return Err(
+            "le dossier détecté est vide : les sauvegardes ne peuvent pas être garanties".into(),
+        );
+    }
+    let source_canonical = std::fs::canonicalize(&source).map_err(|e| e.to_string())?;
+    let backup_root = root(paths, config);
+    std::fs::create_dir_all(&backup_root).map_err(|e| format!("dossier des copies : {e}"))?;
+    let root_canonical = std::fs::canonicalize(&backup_root).map_err(|e| e.to_string())?;
+    if root_canonical.starts_with(&source_canonical)
+        || std::fs::canonicalize(game.install_dir())
+            .ok()
+            .is_some_and(|dir| root_canonical.starts_with(dir))
+        || game
+            .prefix
+            .as_ref()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .is_some_and(|dir| root_canonical.starts_with(dir))
+        || std::fs::canonicalize(lapinux_proton::prefix_path(game, &paths.data_dir))
+            .ok()
+            .is_some_and(|dir| root_canonical.starts_with(dir))
+    {
+        return Err("le dossier des copies se trouve dans les fichiers à supprimer".into());
+    }
+    backup(game, paths, config)?;
+    let copies = list(game, paths, config);
+    let verified = copies
+        .iter()
+        .find(|copy| fingerprint_dir_matches(Path::new(&copy.path), expected));
+    if !fingerprint_dir_matches(&source, expected) {
+        return Err("les sauvegardes ont changé pendant la copie".into());
+    }
+    let path = verified
+        .map(|copy| copy.path.clone())
+        .ok_or_else(|| "aucune copie de sécurité vérifiée".to_string())?;
+    let copy_dir = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    let mut removed_roots = vec![
+        game.install_dir(),
+        paths.data_dir.join("prefixes").join(game.appid.to_string()),
+        game.library
+            .join("steamapps/compatdata")
+            .join(game.appid.to_string()),
+        game.library.join("compatdata").join(game.appid.to_string()),
+        game.library
+            .join("CompatData")
+            .join(lapinux_proton::prefix_name_for(game)),
+    ];
+    if let Some(prefix) = &game.prefix {
+        removed_roots.push(prefix.clone());
+    }
+    let compat = game.library.join("CompatData");
+    if let Ok(entries) = std::fs::read_dir(compat) {
+        let suffix = format!(" ({})", game.appid);
+        removed_roots.extend(
+            entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(&suffix))
+                .map(|e| e.path()),
+        );
+    }
+    if removed_roots
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .any(|p| copy_dir.starts_with(p))
+    {
+        return Err("la copie se trouve dans un dossier qui serait supprimé".into());
+    }
+    Ok(path)
+}
+
 /// Même copie, en évitant un emplacement : la restauration range la copie de
 /// sécurité ailleurs que la copie qu'elle s'apprête à relire, sinon elle
 /// l'effacerait avant de s'en servir.
@@ -670,8 +786,8 @@ fn backup_choice(
     let Some(source) = source(game, paths) else {
         return Ok(None);
     };
-    let (files, bytes, digest) = fingerprint(&source)
-        .map_err(|error| format!("{} : {error}", source.display()))?;
+    let (files, bytes, digest) =
+        fingerprint(&source).map_err(|error| format!("{} : {error}", source.display()))?;
     if files == 0 {
         return Ok(None);
     }
@@ -699,16 +815,19 @@ fn backup_choice(
             .unwrap_or(1),
     };
     // Un état identique dans l'emplacement visé n'est pas recopié.
+    let verified = |copy: &Manifest| {
+        copy.fingerprint == fingerprint
+            && fingerprint_dir_matches(&dir.join(&copy.id), (files, bytes, digest))
+    };
     if existing
         .iter()
         .find(|copy| copy.slot == target_slot)
-        .map(|copy| copy.fingerprint == fingerprint)
-        .unwrap_or(false)
+        .is_some_and(&verified)
     {
         return Ok(None);
     }
-    // Une copie automatique identique à une autre n'est pas empilée ailleurs.
-    if slot.is_none() && existing.iter().any(|copy| copy.fingerprint == fingerprint) {
+    // Un manifeste seul ne prouve pas que les fichiers sont encore intacts.
+    if slot.is_none() && existing.iter().any(verified) {
         return Ok(None);
     }
     std::fs::create_dir_all(&dir).map_err(|error| format!("{} : {error}", dir.display()))?;
@@ -727,6 +846,15 @@ fn backup_choice(
     if let Err(error) = lapinux_core::util::copy_tree(&source, &target) {
         let _ = std::fs::remove_dir_all(&target);
         return Err(format!("{} : {error}", source.display()));
+    }
+    if !fingerprint_dir_matches(&target, (files, bytes, digest))
+        || !fingerprint_dir_matches(&source, (files, bytes, digest))
+    {
+        let _ = std::fs::remove_dir_all(&target);
+        return Err(
+            "la copie de sécurité ne correspond pas aux fichiers d'origine ou ils ont changé"
+                .into(),
+        );
     }
     let mut manifest = Manifest {
         id: id.clone(),
@@ -768,6 +896,46 @@ fn backup_choice(
     Ok(Some(manifest.snapshot(&dir)))
 }
 
+/// Les liens peuvent viser des fichiers effacés avec le préfixe : les copier
+/// tels quels ne garantit pas qu'une sauvegarde sera récupérable.
+fn ensure_recoverable_tree(dir: &Path) -> Result<(), String> {
+    if std::fs::symlink_metadata(dir)
+        .map_err(|e| e.to_string())?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(format!(
+            "lien symbolique non sauvegardé : {}",
+            dir.display()
+        ));
+    }
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("{} : {e}", dir.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_symlink() {
+            return Err(format!(
+                "lien symbolique non sauvegardé : {}",
+                entry.path().display()
+            ));
+        }
+        if kind.is_dir() {
+            ensure_recoverable_tree(&entry.path())?;
+        } else if !kind.is_file() {
+            return Err(format!(
+                "fichier spécial non sauvegardé : {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn fingerprint_dir_matches(dir: &Path, expected: (usize, u64, u64)) -> bool {
+    fingerprint(dir)
+        .map(|actual| actual == expected)
+        .unwrap_or(false)
+}
+
 /// Partie du chemin qui suit le profil Windows du préfixe
 /// (`.../drive_c/users/steamuser/...`), quand la sauvegarde vit dans un
 /// préfixe. Elle permet de retrouver le même dossier dans le préfixe actuel
@@ -804,9 +972,7 @@ fn restore_target(game: &Game, paths: &LapinuxPaths, recorded: &Path) -> PathBuf
                 prefix = existing.clone();
             }
         }
-        return prefix
-            .join("pfx/drive_c/users/steamuser")
-            .join(tail);
+        return prefix.join("pfx/drive_c/users/steamuser").join(tail);
     }
     if recorded.is_dir() {
         return recorded.to_path_buf();
@@ -837,29 +1003,70 @@ pub fn restore(
     if !from.is_dir() {
         return Err("les fichiers de cette copie sont absents".into());
     }
-    // L'état qui va être remplacé part d'abord en copie : le geste reste
-    // réversible même s'il a été cliqué par erreur. La copie de sécurité évite
-    // l'emplacement relu, sinon elle l'aurait remplacé avant la lecture.
-    let _ = backup_choice(game, paths, config, None, Some(snapshot.slot));
+    let destination = restore_target(game, paths, Path::new(&snapshot.source));
+    ensure_recoverable_tree(&from)?;
+    if destination.exists() {
+        ensure_recoverable_tree(&destination)?;
+    }
+    let selected = fingerprint(&from).map_err(|error| format!("copie illisible : {error}"))?;
+    if format!("{}:{}:{:016x}", selected.0, selected.1, selected.2) != snapshot.fingerprint {
+        return Err("la copie à restaurer est incomplète ou corrompue".into());
+    }
+    let current_state = if destination.exists() {
+        Some(
+            fingerprint(&destination)
+                .map_err(|error| format!("sauvegarde actuelle illisible : {error}"))?,
+        )
+    } else {
+        None
+    };
+    // Sauvegarder exactement la destination, pas un dossier deviné différent.
+    if destination.exists() {
+        if !destination.is_dir() {
+            return Err("la destination des sauvegardes n'est pas un dossier".into());
+        }
+        let mut current = game.clone();
+        current.settings.save_dir = Some(destination.to_string_lossy().into_owned());
+        backup_choice(&current, paths, config, None, Some(snapshot.slot))
+            .map_err(|error| format!("copie de sécurité impossible : {error}"))?;
+    }
     if !from.is_dir() {
         return Err("les fichiers de cette copie ont disparu pendant la copie de sécurité".into());
     }
-    let destination = restore_target(game, paths, Path::new(&snapshot.source));
     let parent = destination
         .parent()
         .ok_or_else(|| format!("{} : dossier parent introuvable", destination.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("{} : {error}", parent.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("{} : {error}", parent.display()))?;
     // La copie est préparée à côté, puis le dossier du jeu est remplacé d'un
     // bloc : charger une sauvegarde doit donner exactement l'état choisi, pas
     // un mélange avec les fichiers de la partie en cours.
     let staging = parent.join(format!(".lapinux-saves-{}-new", snapshot.id));
     let previous = parent.join(format!(".lapinux-saves-{}-old", snapshot.id));
-    let _ = std::fs::remove_dir_all(&staging);
-    let _ = std::fs::remove_dir_all(&previous);
+    if previous.exists() || staging.exists() {
+        return Err(format!(
+            "restauration précédente inachevée : vérifier {} et {}",
+            previous.display(),
+            staging.display()
+        ));
+    }
     lapinux_core::util::copy_tree(&from, &staging)
         .map_err(|error| format!("{} : {error}", staging.display()))?;
+    let expected = fingerprint(&from).map_err(|error| format!("copie illisible : {error}"))?;
+    if format!("{}:{}:{:016x}", expected.0, expected.1, expected.2) != snapshot.fingerprint
+        || !fingerprint_dir_matches(&staging, expected)
+    {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("la copie à restaurer est incomplète ou corrompue".into());
+    }
     let moved = destination.exists();
+    if moved != current_state.is_some()
+        || current_state.is_some_and(|state| !fingerprint_dir_matches(&destination, state))
+    {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(
+            "les sauvegardes ont changé pendant la préparation ; restauration annulée".into(),
+        );
+    }
     if moved {
         std::fs::rename(&destination, &previous)
             .map_err(|error| format!("{} : {error}", destination.display()))?;
@@ -874,8 +1081,8 @@ pub fn restore(
         return Err(format!("{} : {error}", destination.display()));
     }
     let _ = std::fs::remove_dir_all(&previous);
-    let (files, _, _) = measure(&destination)
-        .map_err(|error| format!("{} : {error}", destination.display()))?;
+    let (files, _, _) =
+        measure(&destination).map_err(|error| format!("{} : {error}", destination.display()))?;
     Ok(files)
 }
 
@@ -898,14 +1105,12 @@ pub fn export(
     }
     let to = dest.join(format!("lapinux-saves-{}", game.appid));
     std::fs::create_dir_all(&to).map_err(|error| format!("{} : {error}", to.display()))?;
-    for entry in std::fs::read_dir(&from).map_err(|error| format!("{} : {error}", from.display()))? {
+    for entry in
+        std::fs::read_dir(&from).map_err(|error| format!("{} : {error}", from.display()))?
+    {
         let entry = entry.map_err(|error| format!("{} : {error}", from.display()))?;
         let target = to.join(entry.file_name());
-        if entry
-            .file_type()
-            .map(|kind| kind.is_dir())
-            .unwrap_or(false)
-        {
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             lapinux_core::util::copy_tree(&entry.path(), &target)
                 .map_err(|error| format!("{} : {error}", target.display()))?;
         } else {
@@ -1037,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn a_windows_game_finds_the_save_folder_named_after_it() {
+    fn a_windows_game_finds_the_unreal_save_folder() {
         let fixture = Fixture::new();
         let prefix = lapinux_proton::prefix_path(&fixture.game, &fixture.paths.data_dir);
         let root = prefix.join("pfx/drive_c/users/steamuser/AppData/Local/MotorSlice");
@@ -1045,8 +1250,24 @@ mod tests {
         std::fs::create_dir_all(&saves).unwrap();
         std::fs::write(saves.join("GameSave.sav"), b"progression").unwrap();
         let game = game_without_shelf(&fixture, "MOTORSLICE");
-        // Le dossier du jeu en entier : ses sauvegardes, mais aussi sa
-        // configuration, que le jeu relit au lancement.
+        // Unreal range ses sauvegardes dans `Saved/SaveGames` : le dossier du
+        // jeu, lui, peut contenir des caches et des maps de plusieurs
+        // centaines de Mo, que la copie ne doit pas embarquer.
+        assert_eq!(source(&game, &fixture.paths), Some(saves));
+        let _ = fixture.dir;
+    }
+
+    #[test]
+    fn a_named_folder_without_unreal_savegames_is_kept() {
+        let fixture = Fixture::new();
+        let prefix = lapinux_proton::prefix_path(&fixture.game, &fixture.paths.data_dir);
+        let root = prefix.join("pfx/drive_c/users/steamuser/AppData/Local/Test");
+        let saved = root.join("Saved");
+        std::fs::create_dir_all(&saved).unwrap();
+        std::fs::write(saved.join("partie.sav"), b"x").unwrap();
+        let game = game_without_shelf(&fixture, "Test");
+        // Tous les jeux Unreal n'ont pas `Saved/SaveGames` : sans lui, le
+        // dossier nommé reste la référence, comme avant.
         assert_eq!(source(&game, &fixture.paths), Some(root));
         let _ = fixture.dir;
     }
@@ -1055,8 +1276,8 @@ mod tests {
     fn a_unity_game_finds_its_folder_under_the_publisher() {
         let fixture = Fixture::new();
         let prefix = lapinux_proton::prefix_path(&fixture.game, &fixture.paths.data_dir);
-        let saves = prefix
-            .join("pfx/drive_c/users/steamuser/AppData/LocalLow/adamgryu/A Short Hike");
+        let saves =
+            prefix.join("pfx/drive_c/users/steamuser/AppData/LocalLow/adamgryu/A Short Hike");
         std::fs::create_dir_all(&saves).unwrap();
         std::fs::write(saves.join("save.dat"), b"ile").unwrap();
         let game = game_without_shelf(&fixture, "A Short Hike");
@@ -1068,8 +1289,8 @@ mod tests {
     fn a_folder_of_another_game_is_not_taken_for_a_save() {
         let fixture = Fixture::new();
         let prefix = lapinux_proton::prefix_path(&fixture.game, &fixture.paths.data_dir);
-        let other = prefix
-            .join("pfx/drive_c/users/steamuser/AppData/Local/OtherGame/Saved/SaveGames");
+        let other =
+            prefix.join("pfx/drive_c/users/steamuser/AppData/Local/OtherGame/Saved/SaveGames");
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("slot.sav"), b"x").unwrap();
         let game = game_without_shelf(&fixture, "MOTORSLICE");
@@ -1088,7 +1309,7 @@ mod tests {
         std::fs::create_dir_all(&saves).unwrap();
         std::fs::write(saves.join("GameSave.sav"), b"vieux").unwrap();
         let game = game_without_shelf(&fixture, "MotorSlice");
-        assert_eq!(source(&game, &fixture.paths), Some(root));
+        assert_eq!(source(&game, &fixture.paths), Some(saves));
         let _ = fixture.dir;
     }
 
@@ -1131,7 +1352,10 @@ mod tests {
         assert!(backup(&fixture.game, &fixture.paths, &fixture.config)
             .unwrap()
             .is_some());
-        assert_eq!(list(&fixture.game, &fixture.paths, &fixture.config).len(), 2);
+        assert_eq!(
+            list(&fixture.game, &fixture.paths, &fixture.config).len(),
+            2
+        );
         let _ = fixture.dir;
     }
 
@@ -1170,8 +1394,7 @@ mod tests {
         assert_eq!(listed[0].id, second.id);
         // Même emplacement, même minute : la nouvelle copie reprend le nom de
         // celle qu'elle remplace, et ce sont bien ses fichiers qui restent.
-        let stored = game_root(&fixture.game, &fixture.paths, &fixture.config)
-            .join(&second.id);
+        let stored = game_root(&fixture.game, &fixture.paths, &fixture.config).join(&second.id);
         assert_eq!(
             std::fs::read(stored.join("slot/niveau1.sav")).unwrap(),
             b"encore",
@@ -1218,7 +1441,10 @@ mod tests {
         assert_eq!(listed[0].slot, 1);
         assert_eq!(listed[1].slot, 2);
         assert_eq!(listed[2].slot, 3);
-        assert!(!dir.join("200").exists(), "les copies en trop sont retirées");
+        assert!(
+            !dir.join("200").exists(),
+            "les copies en trop sont retirées"
+        );
         assert!(!dir.join("100").exists());
         // L'emplacement est écrit une fois pour toutes, dans le manifeste de
         // la copie renommée « emplacement + date ».
@@ -1233,6 +1459,78 @@ mod tests {
     }
 
     #[test]
+    fn restoration_stops_when_the_safety_copy_cannot_be_written() {
+        let fixture = Fixture::new();
+        let first = backup(&fixture.game, &fixture.paths, &fixture.config)
+            .unwrap()
+            .unwrap();
+        std::fs::write(fixture.saves.join("slot/niveau1.sav"), b"current").unwrap();
+        // Une socket Unix ne peut pas être lue comme un fichier de sauvegarde.
+        // Passer par le descripteur du dossier évite la limite de longueur
+        // sun_path lorsque le répertoire temporaire est profondément imbriqué.
+        use std::os::fd::AsRawFd;
+        let dir = std::fs::File::open(&fixture.saves).unwrap();
+        let socket_path = format!("/proc/self/fd/{}/socket", dir.as_raw_fd());
+        let _socket = std::os::unix::net::UnixListener::bind(socket_path).unwrap();
+        assert!(restore(&fixture.game, &fixture.paths, &fixture.config, &first.id).is_err());
+        assert_eq!(
+            std::fs::read(fixture.saves.join("slot/niveau1.sav")).unwrap(),
+            b"current"
+        );
+    }
+
+    #[test]
+    fn corrupted_snapshot_and_interrupted_restore_never_replace_current_save() {
+        let fixture = Fixture::new();
+        let first = backup(&fixture.game, &fixture.paths, &fixture.config)
+            .unwrap()
+            .unwrap();
+        std::fs::write(fixture.saves.join("slot/niveau1.sav"), b"current").unwrap();
+        std::fs::write(Path::new(&first.path).join("slot/niveau1.sav"), b"corrupt").unwrap();
+        assert!(restore(&fixture.game, &fixture.paths, &fixture.config, &first.id).is_err());
+        assert_eq!(
+            std::fs::read(fixture.saves.join("slot/niveau1.sav")).unwrap(),
+            b"current"
+        );
+
+        std::fs::write(Path::new(&first.path).join("slot/niveau1.sav"), b"un").unwrap();
+        let previous = fixture
+            .saves
+            .parent()
+            .unwrap()
+            .join(format!(".lapinux-saves-{}-old", first.id));
+        std::fs::create_dir_all(&previous).unwrap();
+        std::fs::write(previous.join("recovery"), b"keep").unwrap();
+        assert!(restore(&fixture.game, &fixture.paths, &fixture.config, &first.id).is_err());
+        assert_eq!(std::fs::read(previous.join("recovery")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read(fixture.saves.join("slot/niveau1.sav")).unwrap(),
+            b"current"
+        );
+    }
+
+    #[test]
+    fn verified_backup_rejects_missing_empty_and_destination_inside_game() {
+        let mut fixture = Fixture::new();
+        let copy = verified_backup(&fixture.game, &fixture.paths, &fixture.config).unwrap();
+        assert!(Path::new(&copy).is_dir());
+        fixture.config.general.saves_root = fixture
+            .game
+            .install_dir()
+            .join("copies")
+            .display()
+            .to_string();
+        assert!(verified_backup(&fixture.game, &fixture.paths, &fixture.config).is_err());
+        fixture.config.general.saves_root.clear();
+        std::os::unix::fs::symlink("slot/niveau1.sav", fixture.saves.join("link")).unwrap();
+        assert!(verified_backup(&fixture.game, &fixture.paths, &fixture.config).is_err());
+        std::fs::remove_dir_all(&fixture.saves).unwrap();
+        assert!(verified_backup(&fixture.game, &fixture.paths, &fixture.config).is_err());
+        std::fs::create_dir_all(&fixture.saves).unwrap();
+        assert!(verified_backup(&fixture.game, &fixture.paths, &fixture.config).is_err());
+    }
+
+    #[test]
     fn a_restore_puts_the_files_back_and_keeps_a_safety_copy() {
         let fixture = Fixture::new();
         let first = backup(&fixture.game, &fixture.paths, &fixture.config)
@@ -1240,13 +1538,7 @@ mod tests {
             .unwrap();
         std::fs::write(fixture.saves.join("slot/niveau1.sav"), b"abime").unwrap();
         std::fs::write(fixture.saves.join("en-trop.sav"), b"a effacer").unwrap();
-        let restored = restore(
-            &fixture.game,
-            &fixture.paths,
-            &fixture.config,
-            &first.id,
-        )
-        .unwrap();
+        let restored = restore(&fixture.game, &fixture.paths, &fixture.config, &first.id).unwrap();
         assert_eq!(restored, 2);
         assert_eq!(
             std::fs::read(fixture.saves.join("slot/niveau1.sav")).unwrap(),
@@ -1259,7 +1551,10 @@ mod tests {
             "le chargement remplace le dossier, il ne le fusionne pas"
         );
         // L'état abîmé a été copié avant d'être remplacé.
-        assert_eq!(list(&fixture.game, &fixture.paths, &fixture.config).len(), 2);
+        assert_eq!(
+            list(&fixture.game, &fixture.paths, &fixture.config).len(),
+            2
+        );
         let _ = fixture.dir;
     }
 
@@ -1293,7 +1588,10 @@ mod tests {
             b"progression",
             "la copie doit atterrir dans le préfixe que le jeu lit"
         );
-        assert!(!old_saves.exists(), "l'ancien préfixe ne doit pas être recréé");
+        assert!(
+            !old_saves.exists(),
+            "l'ancien préfixe ne doit pas être recréé"
+        );
         let _ = fixture.dir;
     }
 
@@ -1334,7 +1632,10 @@ mod tests {
         let second = backup(&fixture.game, &fixture.paths, &fixture.config)
             .unwrap()
             .unwrap();
-        assert_eq!(list(&fixture.game, &fixture.paths, &fixture.config).len(), 2);
+        assert_eq!(
+            list(&fixture.game, &fixture.paths, &fixture.config).len(),
+            2
+        );
         let removed = remove(&fixture.game, &fixture.paths, &fixture.config, &first.id).unwrap();
         assert_eq!(removed.id, first.id);
         let dir = game_root(&fixture.game, &fixture.paths, &fixture.config);
@@ -1354,10 +1655,18 @@ mod tests {
             .unwrap()
             .unwrap();
         let dest = fixture.dir.path().join("export");
-        let written = export(&fixture.game, &fixture.paths, &fixture.config, &dest.display().to_string())
-            .unwrap();
+        let written = export(
+            &fixture.game,
+            &fixture.paths,
+            &fixture.config,
+            &dest.display().to_string(),
+        )
+        .unwrap();
         assert_eq!(written, dest.join("lapinux-saves-42"));
-        assert!(written.join(&snapshot.id).join("slot/niveau1.sav").is_file());
+        assert!(written
+            .join(&snapshot.id)
+            .join("slot/niveau1.sav")
+            .is_file());
         assert!(game_root(&fixture.game, &fixture.paths, &fixture.config)
             .join(&snapshot.id)
             .is_dir());
@@ -1375,7 +1684,10 @@ mod tests {
         );
         // Un chemin relatif part du dossier du jeu.
         fixture.game.settings.save_dir = Some("sauvegardes".into());
-        assert_eq!(source(&fixture.game, &fixture.paths), Some(fixture.saves.clone()));
+        assert_eq!(
+            source(&fixture.game, &fixture.paths),
+            Some(fixture.saves.clone())
+        );
         let _ = fixture.dir;
     }
 
@@ -1399,8 +1711,8 @@ mod tests {
     #[test]
     fn the_journal_keeps_the_latest_operations_newest_first() {
         let fixture = Fixture::new();
-        let store = lapinux_core::store::Store::open(&fixture.paths.data_dir.join("test.redb"))
-            .unwrap();
+        let store =
+            lapinux_core::store::Store::open(&fixture.paths.data_dir.join("test.redb")).unwrap();
         for step in 0..HISTORY_MAX + 2 {
             note(
                 &store,
@@ -1424,8 +1736,8 @@ mod tests {
     #[test]
     fn copies_older_than_the_journal_still_appear_in_the_history() {
         let fixture = Fixture::new();
-        let store = lapinux_core::store::Store::open(&fixture.paths.data_dir.join("test.redb"))
-            .unwrap();
+        let store =
+            lapinux_core::store::Store::open(&fixture.paths.data_dir.join("test.redb")).unwrap();
         let snapshot = backup(&fixture.game, &fixture.paths, &fixture.config)
             .unwrap()
             .unwrap();

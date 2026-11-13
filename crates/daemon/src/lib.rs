@@ -8,23 +8,28 @@ pub mod discord_apps;
 pub mod doctor;
 mod fps;
 mod frames;
-mod kwin_shot;
+mod graphics_injectors;
 pub mod jobs;
+mod kwin_shot;
 pub mod launch;
 pub mod logs;
 mod saves;
 pub mod social;
 pub mod steam;
-mod steam_headless;
+mod steam_shim;
+mod steaminput;
 pub mod stores;
+mod dlss;
 mod toasts;
+mod unlock_fps;
+mod update;
 mod tray;
 
 use lapinux_core::config::Config;
 use lapinux_core::ipc::{self, Envelope, Req};
 use lapinux_core::model::{
-    Game, Job, JobReport, JobState, ProtonInfo, SaveEvent, SaveEventKind, SessionInfo,
-    SteamLoginState,
+    Game, GameSettings, GameTech, Job, JobReport, JobState, ProtonInfo, SaveEvent, SaveEventKind,
+    SessionInfo, SteamLoginState,
 };
 use lapinux_core::paths::LapinuxPaths;
 use lapinux_core::store::Store;
@@ -32,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub type Result<T> = std::result::Result<T, lapinux_core::Error>;
@@ -67,9 +72,8 @@ impl Throttle {
     }
 
     fn apply(&self, config: &Config) {
-        self.global.set_rate(mbit_per_sec_to_bytes(
-            config.downloads.global_mbit_per_sec,
-        ));
+        self.global
+            .set_rate(mbit_per_sec_to_bytes(config.downloads.global_mbit_per_sec));
         if let Ok(mut stores) = self.stores.lock() {
             for (store, mbit) in &config.downloads.store_mbit_per_sec {
                 stores
@@ -132,8 +136,8 @@ fn move_directory(from: &Path, to: &Path) {
 }
 
 fn apply_game_language(config: &Config) {
-    let code = lapinux_core::lang::find(&config.general.game_language)
-        .map(|language| language.code);
+    let code =
+        lapinux_core::lang::find(&config.general.game_language).map(|language| language.code);
     lapinux_steam::native::set_language_override(code);
 }
 
@@ -227,6 +231,10 @@ impl RateTracker {
 const JOBS_KEY: &str = "jobs";
 const JOBS_KEEP: usize = 80;
 
+/// Clé du store pour l'empreinte des bibliothèques Steam : elle permet au
+/// démarrage de sauter le scan complet quand aucun manifeste n'a bougé.
+const LIBRARY_FINGERPRINT_KEY: &str = "library.fingerprint";
+
 /// Recharge les tâches du dernier daemon. Une tâche qui était en cours ou en
 /// pause ne peut pas reprendre seule après un arrêt : elle devient une tâche
 /// *interrompue*, à reprendre d'un clic, avec ses compteurs et les fichiers
@@ -250,9 +258,7 @@ fn restore_jobs(store: &Store) -> Vec<Job> {
             job.finished = Some(now);
             job.message =
                 "interrompu par le redémarrage ; les fichiers déjà reçus sont conservés".into();
-        } else if job.state == JobState::Cancelled
-            && job.message.contains("redémarrage")
-        {
+        } else if job.state == JobState::Cancelled && job.message.contains("redémarrage") {
             // Fichier écrit par une version qui marquait les interruptions du
             // démarrage comme des annulations : ces tâches sont à reprendre,
             // elles n'ont pas été annulées par l'utilisateur.
@@ -276,6 +282,9 @@ pub struct Shared {
     pub store: Arc<Store>,
     pub config: Mutex<Config>,
     pub jobs: Mutex<Vec<Job>>,
+    /// Exclusif pendant la décision d'arrêt ; les requêtes et le pompage de
+    /// file détiennent une lecture pour empêcher tout démarrage concurrent.
+    shutdown_gate: RwLock<bool>,
     /// Dernière écriture des tâches sur disque, pour limiter les écritures
     /// pendant qu'un téléchargement avance de quelques mégaoctets.
     jobs_saved: Mutex<Option<Instant>>,
@@ -283,7 +292,13 @@ pub struct Shared {
     /// Drapeaux de pause des téléchargements, par identifiant de tâche.
     pub pause: Mutex<HashMap<String, Arc<AtomicBool>>>,
     pub protons: Mutex<Vec<ProtonInfo>>,
+    /// Téléchargement de mise à jour en cours, relu par les réglages.
+    pub update_progress: Mutex<Option<lapinux_core::update::UpdateProgress>>,
+    /// Un seul téléchargement de mise à jour à la fois.
+    pub update_busy: AtomicBool,
     pub session: Mutex<Option<launch::SessionState>>,
+    /// Sérialise les mutations de sauvegarde, lancement et désinstallation.
+    pub(crate) save_operation: Mutex<()>,
     /// Enregistrement vidéo de la partie en cours, quand il tourne.
     pub recorder: Mutex<Option<captures::Recorder>>,
     /// Sérialise le démarrage d'un enregistrement : deux appels rapprochés
@@ -307,8 +322,8 @@ pub struct Shared {
     pub nav_out: Mutex<Option<std::fs::File>>,
     /// Synchronisation du catalogue Steam en arrière-plan.
     pub catalog_running: AtomicBool,
-    /// Les fiches détaillées ont déjà été demandées une fois.
-    pub catalog_details_checked: AtomicBool,
+    /// Vérification légère du compte au démarrage (un appel `GetOwnedGames`).
+    pub account_probe_running: AtomicBool,
     pub catalog_error: Mutex<Option<String>>,
     /// Dernière connexion Steam demandée par l'écran de connexion.
     pub login: Mutex<SteamLoginState>,
@@ -317,15 +332,25 @@ pub struct Shared {
     /// Lectures Steam par jeu (fiche, succès) gardées quelques minutes : chaque
     /// lecture ouvrait une session, et Steam n'en garde qu'une par compte.
     pub game_reads: Mutex<crate::steam::GameReadCache>,
+    /// Moteur et anti-triche relevés par jeu : la fiche, le lancement et les
+    /// captures posent la même question, et relire les fichiers du jeu à
+    /// chaque capture coûterait cher.
+    tech: Mutex<HashMap<u32, (GameTech, Instant)>>,
     /// Relevé du cloud pris au lancement d'un jeu, gardé jusqu'à sa sortie :
     /// la comparaison dit ce que la partie a envoyé sur le cloud Steam.
     pub cloud_before: Mutex<Option<(u32, lapinux_core::model::CloudSaves)>>,
+    /// Relevé Epic/GOG pris avant le lancement, consommé à la fermeture.
+    pub(crate) store_cloud_before: Mutex<Option<stores::StoreCloudBaseline>>,
     /// Comparaison cloud déjà faite pour un jeu, gardée jusqu'au lancement
     /// suivant : la fiche l'affiche sans relire le cloud à chaque repeint.
     pub cloud_last: Mutex<Option<(u32, lapinux_core::model::CloudDiff)>>,
     /// Session sociale Steam : présence publiée, amis, famille. Née au premier
     /// besoin et conservée tant que le daemon vit.
     pub social: Mutex<Option<Arc<lapinux_steam::social::Social>>>,
+    /// Archive locale des messages Steam déjà chargés : Steam ne garde qu'une
+    /// fenêtre récente, l'archive permet de conserver ce qui a été vu.
+    pub chat_archive:
+        Mutex<std::collections::BTreeMap<u64, Vec<lapinux_core::social::SteamChatMessage>>>,
     /// Jeu Steam dont la partie est en cours. Il est publié sur Steam quand le
     /// réglage l'autorise, et repris par une session qui se reconnecte.
     pub steam_playing: Mutex<Option<u32>>,
@@ -358,6 +383,78 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// Moteur, suréchantillonneurs et anti-triche d'un jeu, relevés une fois
+    /// toutes les cinq minutes : le même relevé sert la fiche, le lancement et
+    /// les captures.
+    pub(crate) fn game_tech(&self, game: &Game) -> GameTech {
+        let Ok(mut cache) = self.tech.lock() else {
+            return GameTech::default();
+        };
+        if let Some((tech, at)) = cache.get(&game.appid) {
+            if at.elapsed() < Duration::from_secs(300) {
+                return tech.clone();
+            }
+        }
+        let root = game.install_dir();
+        let tech = if root.is_dir() {
+            crate::steam::detect_tech(&root)
+        } else {
+            GameTech::default()
+        };
+        cache.insert(game.appid, (tech.clone(), Instant::now()));
+        tech
+    }
+
+    /// Un anti-triche protège-t-il ce jeu ? Un jeu protégé lance sans pont,
+    /// sans injecteurs et sans enregistrement automatique.
+    pub(crate) fn anticheat_protected(&self, game: &Game) -> bool {
+        self.game_tech(game).protected()
+    }
+
+    /// Réglages effectifs d'un jeu, protection anti-triche comprise, et le
+    /// verdict qui l'accompagne. Seule porte d'entrée du daemon : les défauts
+    /// viennent du cœur, jamais d'une règle recopiée ici.
+    pub(crate) fn protected_settings(&self, game: &Game) -> (GameSettings, bool) {
+        let protected = self.anticheat_protected(game);
+        let mut settings = game.settings.clone();
+        if protected {
+            settings.apply_protected_defaults(game.native);
+        }
+        (settings, protected)
+    }
+
+    /// Portail d'arrêt en lecture. Un fil qui a paniqué en le tenant
+    /// empoisonne le verrou : le récupérer vaut mieux que refuser toutes les
+    /// requêtes du daemon jusqu'au redémarrage.
+    pub(crate) fn gate_read(&self) -> std::sync::RwLockReadGuard<'_, bool> {
+        self.shutdown_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn try_begin_shutdown(&self) -> bool {
+        let mut gate = match self.shutdown_gate.try_write() {
+            Ok(gate) => gate,
+            // Une requête ou un pompage de file le tient : l'arrêt attend.
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+            // Empoisonné par un panic : l'état « arrêt demandé » reste lisible,
+            // donc l'arrêt peut se décider normalement.
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        if *gate {
+            return false;
+        }
+        let jobs_idle = self.jobs.lock().map(|jobs| jobs.iter().all(|job| !matches!(
+            job.state, JobState::Running | JobState::Queued | JobState::Paused
+        ))).unwrap_or(false);
+        // Une carte annulée disparaît avant l'arrêt effectif de son moteur.
+        let workers_idle = self.cancel.lock().map(|workers| workers.is_empty()).unwrap_or(false);
+        let session_idle = self.session.lock().map(|session| session.is_none()).unwrap_or(false);
+        if !jobs_idle || !workers_idle || !session_idle { return false; }
+        *gate = true;
+        true
+    }
+
     pub fn new(paths: &LapinuxPaths) -> Result<Self> {
         paths.ensure().map_err(lapinux_core::Error::Io)?;
         // La permission de capture doit exister avant le démarrage de KWin :
@@ -400,16 +497,21 @@ impl Shared {
             None => return Err(last.expect("Store::open a échoué sans erreur")),
         });
         let jobs = restore_jobs(&store);
-        Ok(Self {
+        migrate_shader_caches(&config, &store);
+        let shared = Self {
             paths: paths.clone(),
             store,
             config: Mutex::new(config),
             jobs: Mutex::new(jobs),
+            shutdown_gate: RwLock::new(false),
             jobs_saved: Mutex::new(None),
             cancel: Mutex::new(HashMap::new()),
             pause: Mutex::new(HashMap::new()),
             protons: Mutex::new(Vec::new()),
+            update_progress: Mutex::new(None),
+            update_busy: AtomicBool::new(false),
             session: Mutex::new(None),
+            save_operation: Mutex::new(()),
             recorder: Mutex::new(None),
             recording_start: Mutex::new(()),
             system: Mutex::new(lapinux_core::system::SystemSampler::new()),
@@ -419,14 +521,17 @@ impl Shared {
             toasts: Mutex::new(crate::toasts::ToastQueue::default()),
             nav_out: Mutex::new(None),
             catalog_running: AtomicBool::new(false),
-            catalog_details_checked: AtomicBool::new(false),
+            account_probe_running: AtomicBool::new(false),
             catalog_error: Mutex::new(None),
             login: Mutex::new(SteamLoginState::default()),
             token_check: Mutex::new(crate::steam::TokenCheck::default()),
             game_reads: Mutex::new(crate::steam::GameReadCache::default()),
+            tech: Mutex::new(HashMap::new()),
             cloud_before: Mutex::new(None),
+            store_cloud_before: Mutex::new(None),
             cloud_last: Mutex::new(None),
             social: Mutex::new(None),
+            chat_archive: Mutex::new(crate::social::load_chat_archive(paths)),
             steam_playing: Mutex::new(None),
             discord_view: Mutex::new(discord::Viewing::default()),
             discord_active: AtomicBool::new(true),
@@ -442,7 +547,9 @@ impl Shared {
                 version: lapinux_core::VERSION.to_string(),
                 started: lapinux_core::util::now_unix().max(0) as u64,
             },
-        })
+        };
+        shared.ensure_sheet_cache_dirs();
+        Ok(shared)
     }
 
     /// Enregistre les tâches sur disque. Les mises à jour de progression sont
@@ -480,10 +587,7 @@ impl Shared {
     }
 
     pub fn config_snapshot(&self) -> Config {
-        self.config
-            .lock()
-            .map(|c| c.clone())
-            .unwrap_or_default()
+        self.config.lock().map(|c| c.clone()).unwrap_or_default()
     }
 
     /// Applique une modification du fichier sans redémarrer le daemon.
@@ -499,9 +603,53 @@ impl Shared {
     }
 
     /// Scanner les bibliothèques Steam et fusionner avec les réglages connus.
+    /// Un scan demandé explicitement reste complet.
     pub fn rescan_library(&self) -> Result<Vec<Game>> {
         let managed = self.config_snapshot().library_root();
         self.rescan_library_at(&managed)
+    }
+
+    /// Recharge la bibliothèque au démarrage sans refaire un scan complet quand
+    /// rien n'a bougé. L'empreinte légère des manifestes est comparée à celle
+    /// enregistrée par le dernier scan : seuls un jeu ajouté, retiré, mis à
+    /// jour ou une bibliothèque de plus déclenchent la relecture. La liste déjà
+    /// enregistrée est rendue telle quelle sinon, donc les nouveaux jeux sont
+    /// pris en compte dès le lancement suivant sans payer le scan habituel.
+    pub fn refresh_library_if_changed(&self) -> Result<Vec<Game>> {
+        let managed = self.config_snapshot().library_root();
+        self.refresh_library_from(&lapinux_core::paths::steam_roots(), &managed)
+    }
+
+    /// Variante testable sans lire les bibliothèques de la session : les
+    /// racines Steam sont fournies par l'appelant.
+    fn refresh_library_from(&self, roots: &[PathBuf], managed: &Path) -> Result<Vec<Game>> {
+        // Un ancien rangement déplace des dossiers entiers : l'empreinte doit
+        // être lue après, sinon elle décrirait une bibliothèque disparue.
+        self.migrate_managed_layout(managed);
+        let stored = self.store.load_games().unwrap_or_default();
+        let current = lapinux_steam::fingerprint_with_managed(roots, Some(managed));
+        let previous = self
+            .store
+            .get_json::<lapinux_steam::LibraryFingerprint>(LIBRARY_FINGERPRINT_KEY)
+            .ok()
+            .flatten();
+        if !stored.is_empty() && previous.as_ref() == Some(&current) {
+            tracing::info!(
+                "bibliothèques Steam inchangées : scan complet évité ({} jeux)",
+                stored.len()
+            );
+            return Ok(stored);
+        }
+        let known: HashSet<u32> = stored.iter().map(|game| game.appid).collect();
+        let games = self.rescan_library_recorded(roots, managed, current)?;
+        let added = games
+            .iter()
+            .filter(|game| !known.contains(&game.appid))
+            .count();
+        if added > 0 {
+            tracing::info!("{added} nouveau(x) jeu(x) ajouté(s) à la bibliothèque");
+        }
+        Ok(games)
     }
 
     /// Scan en utilisant la racine indiquée : un téléchargement doit voir le
@@ -509,7 +657,20 @@ impl Shared {
     pub(crate) fn rescan_library_at(&self, managed: &std::path::Path) -> Result<Vec<Game>> {
         self.migrate_managed_layout(managed);
         let roots = lapinux_core::paths::steam_roots();
-        let report = lapinux_steam::scan_with_managed(&roots, Some(managed));
+        let fingerprint = lapinux_steam::fingerprint_with_managed(&roots, Some(managed));
+        self.rescan_library_recorded(&roots, managed, fingerprint)
+    }
+
+    /// Scan complet puis enregistrement de l'empreinte lue avant lui. Si un
+    /// manifeste change pendant le scan, l'empreinte reste plus ancienne que le
+    /// disque : le démarrage suivant rescannera, jamais l'inverse.
+    fn rescan_library_recorded(
+        &self,
+        roots: &[PathBuf],
+        managed: &Path,
+        fingerprint: lapinux_steam::LibraryFingerprint,
+    ) -> Result<Vec<Game>> {
+        let report = lapinux_steam::scan_with_managed(roots, Some(managed));
         for warning in &report.warnings {
             tracing::warn!("scan : {warning}");
         }
@@ -518,6 +679,11 @@ impl Shared {
         self.store
             .save_games(&merged)
             .map_err(|e| lapinux_core::Error::Other(e.to_string()))?;
+        // Une empreinte oubliée ne perd rien : elle force seulement un scan de
+        // plus au prochain démarrage.
+        if let Err(err) = self.store.set_json(LIBRARY_FINGERPRINT_KEY, &fingerprint) {
+            tracing::warn!("empreinte des bibliothèques non enregistrée : {err}");
+        }
         Ok(merged)
     }
 
@@ -698,6 +864,9 @@ impl Shared {
     /// Parties terminées, de la plus récente à la plus ancienne : une lecture
     /// locale, sans réseau.
     pub fn session_history(&self) -> Result<Envelope> {
+        // La purge précède la lecture : une partie plus vieille que la durée
+        // choisie ne doit pas réapparaître le temps d'un rafraîchissement.
+        self.prune_activity_history();
         let mut sessions = self
             .store
             .get_json::<Vec<lapinux_core::model::PlaySession>>("sessions")
@@ -718,9 +887,11 @@ impl Shared {
             .unwrap_or_default();
         let before = sessions.len();
         let mut seconds = 0u64;
+        let mut logs: Vec<String> = Vec::new();
         sessions.retain(|session| {
             if session.appid == appid && session.started == started {
                 seconds += session.seconds;
+                logs.push(session.log.clone());
                 false
             } else {
                 true
@@ -732,12 +903,15 @@ impl Shared {
                 .set_json("sessions", &sessions)
                 .map_err(|error| lapinux_core::Error::Other(error.to_string()))?;
             self.forget_playtime(&[(appid, seconds)]);
+            for log in &logs {
+                self.remove_session_log(log);
+            }
         }
         Ok(Envelope::ok(&serde_json::json!({ "deleted": deleted })))
     }
 
-    /// Vide une journée entière de l'historique : toutes les parties dont la
-    /// fin tombe dans ce jour.
+    /// Vide une journée entière de l'historique : toutes les parties qui ont
+    /// commencé ce jour-là, comme les cartes de la page Activité.
     pub fn clear_session_day(&self, day: i64) -> Result<Envelope> {
         let mut sessions = self
             .store
@@ -746,14 +920,16 @@ impl Shared {
             .unwrap_or_default();
         let before = sessions.len();
         let mut removed: HashMap<u32, u64> = HashMap::new();
+        let mut logs: Vec<String> = Vec::new();
         sessions.retain(|session| {
-            let ended = if session.ended > 0 {
-                session.ended
-            } else {
+            let started = if session.started > 0 {
                 session.started
+            } else {
+                session.ended
             };
-            if lapinux_core::util::day_start(ended) == day {
+            if lapinux_core::util::day_start(started) == day {
                 *removed.entry(session.appid).or_default() += session.seconds;
+                logs.push(session.log.clone());
                 false
             } else {
                 true
@@ -766,8 +942,107 @@ impl Shared {
                 .map_err(|error| lapinux_core::Error::Other(error.to_string()))?;
             let removed: Vec<(u32, u64)> = removed.into_iter().collect();
             self.forget_playtime(&removed);
+            for log in &logs {
+                self.remove_session_log(log);
+            }
         }
         Ok(Envelope::ok(&serde_json::json!({ "deleted": deleted })))
+    }
+
+    /// Supprime les parties plus anciennes que la durée choisie dans les
+    /// réglages, avec leur journal : l'activité reste bornée même si le joueur
+    /// n'ouvre jamais la page. Les journaux orphelins d'un lancement interrompu
+    /// suivent la même échéance.
+    pub fn prune_activity_history(&self) -> usize {
+        let days = self
+            .config_snapshot()
+            .general
+            .activity_retention_days
+            .clamp(1, 365) as i64;
+        let cutoff = lapinux_core::util::now_unix() - days * 86_400;
+        let Ok(stored) = self
+            .store
+            .get_json::<Vec<lapinux_core::model::PlaySession>>("sessions")
+        else {
+            return 0;
+        };
+        let Some(mut sessions) = stored else {
+            self.prune_activity_logs(cutoff);
+            return 0;
+        };
+        let before = sessions.len();
+        let mut removed: HashMap<u32, u64> = HashMap::new();
+        let mut logs: Vec<String> = Vec::new();
+        sessions.retain(|session| {
+            let at = if session.ended > 0 {
+                session.ended
+            } else {
+                session.started
+            };
+            if at > 0 && at < cutoff {
+                *removed.entry(session.appid).or_default() += session.seconds;
+                logs.push(session.log.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let deleted = before - sessions.len();
+        if deleted > 0 {
+            if let Err(error) = self.store.set_json("sessions", &sessions) {
+                tracing::warn!("activité : purge impossible ({error})");
+                return 0;
+            }
+            self.forget_playtime(&removed.into_iter().collect::<Vec<_>>());
+            for log in &logs {
+                self.remove_session_log(log);
+            }
+        }
+        self.prune_activity_logs(cutoff);
+        deleted
+    }
+
+    /// Retire un journal de partie, jamais le `games.log` partagé des anciennes
+    /// versions ni un autre fichier du dossier.
+    pub(crate) fn remove_session_log(&self, log: &str) {
+        let path = Path::new(log);
+        if !path.starts_with(&self.paths.log_dir) {
+            return;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        if !name.starts_with("game-") || !name.ends_with(".log") {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("activité : journal {name} non supprimé ({error})");
+            }
+        }
+    }
+
+    /// Journaux de parties qui ne sont plus rattachés à une activité : un
+    /// lancement tué avant l'enregistrement de la session laisse un fichier.
+    fn prune_activity_logs(&self, cutoff: i64) {
+        let Ok(entries) = std::fs::read_dir(&self.paths.log_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("game-") || !name.ends_with(".log") {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+                continue;
+            };
+            let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) else {
+                continue;
+            };
+            if (age.as_secs() as i64) < cutoff {
+                self.remove_session_log(&entry.path().to_string_lossy());
+            }
+        }
     }
 
     /// Retire des secondes au temps de jeu cumulé des jeux et au total, sans
@@ -782,10 +1057,7 @@ impl Shared {
                 let _ = self.store.save_game(&game);
             }
         }
-        if let Ok(mut stored) = self
-            .store
-            .get_json::<lapinux_core::model::Stats>("stats")
-        {
+        if let Ok(mut stored) = self.store.get_json::<lapinux_core::model::Stats>("stats") {
             let mut stats = stored.take().unwrap_or_default();
             let total: u64 = removed.iter().map(|(_, seconds)| *seconds).sum();
             stats.total_seconds = stats.total_seconds.saturating_sub(total);
@@ -811,10 +1083,7 @@ impl Shared {
                 update(job);
                 terminal = matches!(
                     job.state,
-                    JobState::Done
-                        | JobState::Failed
-                        | JobState::Cancelled
-                        | JobState::Interrupted
+                    JobState::Done | JobState::Failed | JobState::Cancelled | JobState::Interrupted
                 );
                 if let Ok(mut trackers) = self.rates.lock() {
                     let now = Instant::now();
@@ -826,9 +1095,7 @@ impl Shared {
                     }
                     if terminal {
                         tracker.finish(now, job.network);
-                        let finished = job
-                            .finished
-                            .unwrap_or_else(lapinux_core::util::now_unix);
+                        let finished = job.finished.unwrap_or_else(lapinux_core::util::now_unix);
                         let elapsed = finished.saturating_sub(job.started).max(0) as u64;
                         job.report = Some(tracker.report(job.network, job.written, elapsed));
                         trackers.remove(id);
@@ -850,14 +1117,38 @@ pub fn run(paths: LapinuxPaths, ready: Option<std::sync::mpsc::Sender<()>>) -> R
     // que ce soit, sans bloquer si Plasma n'est pas encore joignable.
     lapinux_input::panels::restore_stale(&paths.data_dir);
     let shared = Arc::new(Shared::new(&paths)?);
+    // Les fiches utilisent des dossiers stables ; cette préparation retire
+    // aussi les anciens dossiers versionnés avant la première lecture.
+    shared.ensure_sheet_cache_dirs();
+    // Le pont Windows ne se connecte pas : il depose les succes accordes dans
+    // une file, que le daemon vide avec sa session partagee.
+    {
+        let watcher = Arc::clone(&shared);
+        std::thread::spawn(move || loop {
+            watcher.drain_achievement_spool();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        });
+    }
     shared.persist_jobs(true);
     // Les versions précédentes écrivaient un journal par partie et par
     // overlay : ils sont retirés pour que la liste des journaux reste courte.
     crate::logs::prune_legacy(&paths);
+    // Une activité plus vieille que la durée choisie ne doit pas attendre
+    // l'ouverture du profil pour disparaître, ni son journal rester sur le
+    // disque.
+    shared.prune_activity_history();
+    {
+        let cleaner = Arc::clone(&shared);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(3_600));
+            cleaner.prune_activity_history();
+        });
+    }
 
     if paths.socket.exists() {
-        let alive = ipc::send_request_timeout(&paths.socket, &Req::Ping, Duration::from_millis(300))
-            .is_ok();
+        let alive =
+            ipc::send_request_timeout(&paths.socket, &Req::Ping, Duration::from_millis(300))
+                .is_ok();
         if alive {
             return Err(lapinux_core::Error::Ipc(
                 "un daemon écoute déjà sur ce socket".into(),
@@ -870,7 +1161,10 @@ pub fn run(paths: LapinuxPaths, ready: Option<std::sync::mpsc::Sender<()>>) -> R
     // leur rayon : un simple renommage de dossier, sans relire ni recopier un
     // octet, et la fiche du jeu suit.
     shared.migrate_store_shelves();
-    let _ = shared.rescan_library();
+    let _ = shared.refresh_library_if_changed();
+    // Le compte est vérifié sans relire tout le catalogue : un appel rend les
+    // appids, et seuls les jeux absents sont ajoutés.
+    shared.start_account_probe();
     let _ = shared.scan_protons();
     // Une manette branchée doit l'emporter sur sa liaison sans fil, sur
     // toutes les pages : le veilleur vit avec le daemon.
@@ -900,6 +1194,15 @@ pub fn run(paths: LapinuxPaths, ready: Option<std::sync::mpsc::Sender<()>>) -> R
     // le bureau, sans jeu pour la refermer ni overlay pour la couper : on
     // l'arrête avant d'ouvrir le socket.
     Shared::reap_stale_hud();
+    // Un enregistrement lancé par un daemon mort ne doit pas lui survivre :
+    // son encodeur est laissé finir son fichier, ses capteurs audio sont
+    // arrêtés et la vidéo est récupérée. Le badge REC, lui, tombe avec
+    // `reap_stale_hud` ci-dessus.
+    shared.recover_orphan_recording();
+    // Et une partie lancée par un daemon mort ne doit pas non plus survivre :
+    // son groupe (GameScope, `bwrap`, la scène, le jeu) est arrêté, puis les
+    // processus Proton restés dans le préfixe.
+    shared.recover_orphan_session();
 
     let listener = bind_socket(&paths)?;
     // Seul le daemon qui possède le socket sert le menu : un second daemon
@@ -1005,10 +1308,13 @@ fn refuse(mut stream: UnixStream) {
     // d'une écriture coupée en pleine trame. Le délai reste court parce que ce
     // refus s'exécute sur le fil d'acceptation : un client muet ne doit pas
     // retenir les connexions suivantes.
-    stream.set_read_timeout(Some(Duration::from_millis(300))).ok();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .ok();
     stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
     let _ = ipc::read_frame(&mut stream);
-    let envelope = Envelope::err("daemon occupé : trop de requêtes à la fois, réessaie dans un instant");
+    let envelope =
+        Envelope::err("daemon occupé : trop de requêtes à la fois, réessaie dans un instant");
     let body = serde_json::to_vec(&envelope).unwrap_or_default();
     let _ = ipc::write_frame(&mut stream, &body);
     let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -1067,9 +1373,7 @@ fn serve_quick_menu(shared: Arc<Shared>) {
     let game_window_gone = move |pid: u32| {
         let _ = tasks.send(QuickTask::GameWindowGone(pid));
     };
-    if let Err(err) =
-        lapinux_input::shortcut::serve(toggle, game_window, game_window_gone)
-    {
+    if let Err(err) = lapinux_input::shortcut::serve(toggle, game_window, game_window_gone) {
         tracing::warn!("menu rapide : {err}");
     }
 }
@@ -1078,9 +1382,8 @@ fn bind_socket(paths: &LapinuxPaths) -> Result<UnixListener> {
     if let Some(parent) = paths.socket.parent() {
         std::fs::create_dir_all(parent).map_err(lapinux_core::Error::Io)?;
     }
-    let listener = UnixListener::bind(&paths.socket).map_err(|e| {
-        lapinux_core::Error::Ipc(format!("bind {} : {e}", paths.socket.display()))
-    })?;
+    let listener = UnixListener::bind(&paths.socket)
+        .map_err(|e| lapinux_core::Error::Ipc(format!("bind {} : {e}", paths.socket.display())))?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600)).ok();
     Ok(listener)
@@ -1139,9 +1442,15 @@ fn log_action(request: &Req) {
             platform.as_deref().unwrap_or("automatique")
         ),
         Req::UninstallGame { appid } => tracing::info!("désinstallation de {appid} demandée"),
+        Req::UninstallGameWithBackup { appid } => {
+            tracing::info!("désinstallation de {appid} avec copie demandée")
+        }
         Req::CancelJob { id } => tracing::info!("tâche {id} annulée"),
         Req::PauseJob { id, paused } => {
-            tracing::info!("tâche {id} {}", if *paused { "mise en pause" } else { "reprise" })
+            tracing::info!(
+                "tâche {id} {}",
+                if *paused { "mise en pause" } else { "reprise" }
+            )
         }
         Req::ClearHistory => tracing::info!("historique des téléchargements effacé"),
         Req::DeleteJob { id } => tracing::info!("tâche {id} retirée de l'historique"),
@@ -1155,12 +1464,60 @@ fn log_action(request: &Req) {
         Req::OverlayToggle => tracing::info!("menu rapide basculé"),
         Req::OverlayAction { action } => tracing::info!("action du menu rapide : {action}"),
         Req::RecordingPause { paused } => {
-            tracing::info!("enregistrement {}", if *paused { "en pause" } else { "repris" })
+            tracing::info!(
+                "enregistrement {}",
+                if *paused { "en pause" } else { "repris" }
+            )
         }
         Req::SetConfig { .. } => tracing::info!("configuration enregistrée"),
         Req::SteamCatalog { refresh: true } => tracing::info!("synchronisation du catalogue Steam"),
         Req::SteamCatalogPatch { .. } => tracing::info!("jeu d'une clé ajouté au catalogue"),
         Req::GameInfo { appid } => tracing::info!("fiche Steam du jeu {appid} demandée"),
+        Req::SteamInput { appid } => {
+            tracing::info!("profils Steam Input du jeu {appid} demandés")
+        }
+        Req::SteamInputSaved => tracing::info!("configurations Steam Input conservées demandées"),
+        Req::SteamInputApply { appid, profile } => tracing::info!(
+            "application du profil Steam Input {} au jeu {appid}",
+            profile.display()
+        ),
+        Req::SteamInputCommunity {
+            appid,
+            query,
+            controller,
+            page,
+        } => tracing::info!(
+            "catalogue Steam Input du jeu {appid} demandé (page {page}, filtre {:?}, manette {:?})",
+            query,
+            controller
+        ),
+        Req::SteamInputCommunityApply { appid, profile } => tracing::info!(
+            "configuration communautaire Steam Input {} appliquée au jeu {appid}",
+            profile.id
+        ),
+        Req::SteamWorkshop { appid, refresh, .. } => tracing::info!(
+            "atelier du jeu {appid} demandé{}",
+            if *refresh {
+                " (abonnements en ligne)"
+            } else {
+                ""
+            }
+        ),
+        Req::SteamWorkshopArrange { appid, .. } => {
+            tracing::info!("rangement de l'atelier de {appid} dans Mods demandé")
+        }
+        Req::SteamWorkshopManage {
+            appid, ids, action, ..
+        } => tracing::info!(
+            "action Atelier {action:?} sur {appid} ({} contenu(s))",
+            ids.len()
+        ),
+        Req::SteamWorkshopDownload { appid, ids, .. } => {
+            tracing::info!(
+                "téléchargement DepotDownloader de l'atelier {appid} ({} contenu(s))",
+                ids.len()
+            )
+        }
         Req::GameConfigurations { appid } => {
             tracing::debug!("configurations du jeu {appid} demandées")
         }
@@ -1176,11 +1533,18 @@ fn log_action(request: &Req) {
         Req::AchievementToast { appid, .. } => {
             tracing::info!("bandeau de succès du jeu {appid} demandé")
         }
-        Req::SteamCloud { appid } => {
+        Req::StoreAchievements { appid, names } => tracing::info!(
+            "{} succès à enregistrer pour {appid} (pont Steamworks)",
+            names.len()
+        ),
+        Req::SteamCloud { appid } | Req::SteamCloudFresh { appid } => {
             tracing::info!("sauvegardes cloud du jeu {appid} demandées")
         }
         Req::CloudRestore { appid } => {
             tracing::info!("récupération des sauvegardes cloud du jeu {appid}")
+        }
+        Req::ResolveSteamCloud { appid, .. } | Req::ResolveStoreCloud { appid, .. } => {
+            tracing::info!("résolution cloud du jeu {appid} demandée")
         }
         Req::CloudUpload { appid } => {
             tracing::info!("envoi des sauvegardes cloud du jeu {appid}")
@@ -1219,15 +1583,22 @@ fn log_action(request: &Req) {
         ),
         Req::StoreLogin { store, .. } => tracing::info!("connexion {} demandée", store.label()),
         Req::StoreLogout { store } => tracing::info!("compte {} retiré", store.label()),
-        Req::StoreInstall { store, store_id, .. } => {
+        Req::StoreInstall {
+            store, store_id, ..
+        } => {
             tracing::info!("installation {store_id} demandée depuis {}", store.label())
         }
         Req::StoreDetails { appid } => {
             tracing::info!("fiche de boutique du jeu {appid} demandée")
         }
         Req::StoreFreeGames => tracing::info!("jeux gratuits demandés"),
+        Req::StoreFriends => tracing::info!("amis des boutiques demandés"),
+        Req::StoreNotifications => tracing::info!("notifications des boutiques demandées"),
         Req::StoreClaimFreeGames { ids } => {
-            tracing::info!("récupération de {} offre(s) gratuite(s) demandée", ids.len())
+            tracing::info!(
+                "récupération de {} offre(s) gratuite(s) demandée",
+                ids.len()
+            )
         }
         Req::DiscordView { section, .. } => {
             tracing::debug!("vue publiée sur Discord : {section}")
@@ -1244,6 +1615,29 @@ fn log_action(request: &Req) {
         Req::SteamSocialMessage { steam_id, .. } => {
             tracing::info!("message Steam demandé pour {steam_id}")
         }
+        Req::SteamSocialSticker { steam_id, name } => {
+            tracing::info!("autocollant Steam {name} demandé pour {steam_id}")
+        }
+        Req::SteamChatHistory { steam_id, older } => {
+            tracing::info!(
+                "historique Steam demandé pour {steam_id}{}",
+                if *older { " (page plus ancienne)" } else { "" }
+            )
+        }
+        Req::SteamChatImport { steam_id, .. } => {
+            tracing::info!("import d'historique Steam demandé pour {steam_id}")
+        }
+        Req::SteamLobbyCreate {
+            appid, max_members, ..
+        } => {
+            tracing::info!("lobby Steam demandé pour {appid} ({max_members} places)")
+        }
+        Req::SteamLobbyInvite { steam_id } => {
+            tracing::info!("invitation Steam demandée pour {steam_id}")
+        }
+        Req::SteamLobbyJoin { appid, lobby, .. } => {
+            tracing::info!("rejointe du lobby Steam {lobby} demandée (appid {appid})")
+        }
         Req::StoreSize { appid } => {
             tracing::info!("poids du jeu de boutique {appid} demandé")
         }
@@ -1251,8 +1645,8 @@ fn log_action(request: &Req) {
             tracing::info!("poids des contenus du jeu de boutique {appid} demandé")
         }
         Req::StoreUpdates => tracing::info!("recherche des mises à jour de boutique"),
-        Req::ClearCaches => tracing::info!("caches vidés depuis les réglages"),
-        Req::Shutdown => tracing::info!("arrêt du daemon demandé"),
+        Req::ClearCaches => tracing::info!("vidage des caches demandé depuis les réglages"),
+        Req::Shutdown | Req::ShutdownIfIdle => tracing::info!("arrêt du daemon demandé"),
         _ => {}
     }
 }
@@ -1282,12 +1676,54 @@ fn store_kind(shared: &Shared, appid: u32) -> Option<lapinux_core::stores::Store
     // Possédé mais pas installé : sa boutique se lit dans la bibliothèque du
     // compte, que le daemon garde en cache. Sans ce repli, les succès et le
     // cloud d'un jeu de boutique non installé partaient vers Steam.
-    shared
-        .cached_store_entry(appid)
-        .map(|entry| entry.store)
+    shared.cached_store_entry(appid).map(|entry| entry.store)
+}
+
+/// Réponse d'une opération du daemon dont l'erreur est déjà un message
+/// lisible : la fiche affiche tel quel le refus d'un jeu protégé.
+fn json_reply<T: serde::Serialize>(
+    result: std::result::Result<T, String>,
+) -> lapinux_core::Result<Envelope> {
+    result
+        .map(|value| Envelope::ok(&value))
+        .map_err(lapinux_core::Error::Other)
+}
+
+/// Reprend les caches de shaders de l'ancienne disposition
+/// (`<bibliothèque>/cache/<appid>`) dans `Shaders/<jeu> (<appid>)`, pour les
+/// jeux déjà connus. Les autres restent en place, sans être supprimés.
+fn migrate_shader_caches(config: &Config, store: &Store) {
+    let root = config.library_root();
+    let legacy = root.join("cache");
+    if !legacy.is_dir() {
+        return;
+    }
+    let Ok(games) = store.load_games() else {
+        return;
+    };
+    for game in games {
+        let from = legacy.join(game.appid.to_string());
+        let to = root
+            .join("Shaders")
+            .join(crate::saves::folder_label(&game));
+        if from.is_dir() && !to.exists() {
+            let _ = std::fs::rename(&from, &to);
+        }
+    }
 }
 
 fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
+    // L'arrêt ne peut réussir pendant une requête en vol, ni laisser entrer
+    // une nouvelle requête entre son contrôle et la fin du processus.
+    let _active = if matches!(request, Req::Shutdown | Req::ShutdownIfIdle) {
+        None
+    } else {
+        let gate = shared.gate_read();
+        if *gate {
+            return Envelope::err("daemon en cours d'arrêt");
+        }
+        Some(gate)
+    };
     log_action(&request);
     let result: Result<Envelope> = match request {
         Req::Ping => Ok(Envelope::ok(&shared.build)),
@@ -1302,7 +1738,35 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
             .game(appid)
             .map(|game| Envelope::ok(&game))
             .map_err(|e| lapinux_core::Error::Other(e.to_string())),
-        Req::SaveSettings { appid, settings } => shared.save_settings(appid, settings),
+        Req::GameTech { appid } => shared
+            .store
+            .game(appid)
+            .map_err(|e| lapinux_core::Error::Other(e.to_string()))
+            .and_then(|game| {
+                let game =
+                    game.ok_or_else(|| lapinux_core::Error::Other(lapinux_core::i18n::t("downloads.err_game_not_found").into()))?;
+                if !game.installed || game.native {
+                    return Ok(Envelope::ok(&lapinux_core::model::GameTech::default()));
+                }
+                let root = game.install_dir();
+                if !root.is_dir() {
+                    return Err(lapinux_core::Error::Other(
+                        "dossier du jeu inaccessible".into(),
+                    ));
+                }
+                Ok(Envelope::ok(&shared.game_tech(&game)))
+            }),
+        Req::DlssState { appid } => json_reply(shared.dlss_state(appid)),
+        Req::DlssUpdate { appid } => json_reply(shared.dlss_update(appid)),
+        Req::DlssRestore { appid } => json_reply(shared.dlss_restore(appid)),
+        Req::SaveSettings { appid, settings } => {
+            // L'option « débloquer la limite du jeu » s'applique dès que le
+            // réglage change, sans attendre la partie suivante.
+            shared.save_settings(appid, settings).map(|envelope| {
+                shared.sync_unlock_fps(appid);
+                envelope
+            })
+        }
         Req::Launch { appid, dry_run } => shared.launch(appid, dry_run),
         Req::Stop => shared.stop_session(),
         Req::Session => Ok(Envelope::ok(&shared.session_info())),
@@ -1324,6 +1788,7 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
             platform,
         } => shared.install_game(appid, dlc, platform),
         Req::UninstallGame { appid } => shared.uninstall_game(appid),
+        Req::UninstallGameWithBackup { appid } => shared.uninstall_game_with_backup(appid),
         Req::CancelJob { id } => shared.cancel_job(&id),
         Req::PauseJob { id, paused } => shared.pause_job(&id, paused),
         Req::ClearHistory => shared.clear_history(),
@@ -1339,6 +1804,8 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
         },
         Req::Protons => shared.scan_protons().map(|p| Envelope::ok(&p)),
         Req::ProtonReleases => single_releases(),
+        Req::InstallFrameGeneration { version } => shared.install_frame_generation(version),
+        Req::RemoveFrameGeneration { version } => shared.remove_frame_generation(&version),
         Req::InstallProton {
             repo,
             asset,
@@ -1350,20 +1817,29 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
         Req::OverlayAction { action } => shared.overlay_action(&action),
         Req::Devices => Ok(Envelope::ok(&lapinux_input::device::list_cached())),
         Req::Profiles => Ok(Envelope::ok(&lapinux_input::list_profiles(
-            &shared.paths.data_dir,
+            &shared.paths.manettes_dir(),
         ))),
         Req::Config => Ok(Envelope::ok(&shared.config_snapshot())),
-        Req::SetConfig { config } => match shared.save_config(config) {
-            Ok(envelope) => {
-                // Passer en mode simultané peut libérer toute la file d'un
-                // coup ; le passage en file ne coupe pas les tâches en cours.
-                if envelope.ok {
-                    shared.pump_install_queue();
+        Req::SetConfig { config } => {
+            let previous = shared.config_snapshot();
+            match shared.save_config(config) {
+                Ok(envelope) => {
+                    // Passer en mode simultané peut libérer toute la file d'un
+                    // coup ; le passage en file ne coupe pas les tâches en cours.
+                    if envelope.ok {
+                        shared.pump_install_queue();
+                        // Les réglages HUD modifiés depuis la fenêtre Réglages
+                        // s'appliquent à la partie en cours en relançant les
+                        // seules surfaces du HUD, jamais le jeu.
+                        if shared.config_snapshot().capture != previous.capture {
+                            shared.reload_hud_surfaces();
+                        }
+                    }
+                    Ok(envelope)
                 }
-                Ok(envelope)
+                Err(err) => Err(err),
             }
-            Err(err) => Err(err),
-        },
+        }
         Req::SteamStatus => Ok(Envelope::ok(&shared.steam_status())),
         Req::SteamCatalog { refresh } => shared.steam_catalog(refresh),
         Req::SteamCatalogPatch { appid, name } => shared.steam_catalog_patch(appid, name),
@@ -1371,6 +1847,33 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
             Some(envelope) => Ok(envelope),
             None => shared.game_info(appid),
         },
+        Req::SteamInput { appid } => shared.steam_input(appid),
+        Req::SteamInputSaved => shared.steam_input_saved(),
+        Req::SteamInputApply { appid, profile } => shared.steam_input_apply(appid, &profile),
+        Req::SteamInputCommunity {
+            appid,
+            query,
+            controller,
+            page,
+        } => shared.steam_input_community(appid, &query, controller.as_deref(), page),
+        Req::SteamInputCommunityApply { appid, profile } => {
+            shared.steam_input_community_apply(appid, &profile)
+        }
+        Req::SteamWorkshop {
+            appid,
+            name,
+            refresh,
+        } => shared.steam_workshop(appid, &name, refresh),
+        Req::SteamWorkshopArrange { appid, name } => shared.steam_workshop_arrange(appid, &name),
+        Req::SteamWorkshopManage {
+            appid,
+            name,
+            ids,
+            action,
+        } => shared.steam_workshop_manage(appid, &name, &ids, action),
+        Req::SteamWorkshopDownload { appid, name, ids } => {
+            shared.steam_workshop_download(appid, &name, &ids)
+        }
         Req::GameConfigurations { appid } => {
             // Le catalogue se relit derrière la réponse : la fiche ne dépend
             // jamais du réseau.
@@ -1379,6 +1882,29 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
         }
         Req::InstallConfiguration { appid, id } => shared.install_configuration(appid, &id),
         Req::RemoveConfiguration { appid, id } => shared.remove_configuration(appid, &id),
+        Req::GraphicsInjectors { appid } => shared.graphics_injectors(appid),
+        Req::InstallGraphicsInjector {
+            appid,
+            kind,
+            version,
+            executable,
+            proxy,
+        } => shared.install_graphics_injector(appid, &kind, &version, &executable, &proxy),
+        Req::RemoveGraphicsInjector { appid, kind } => {
+            shared.remove_graphics_injector(appid, &kind)
+        }
+        Req::GraphicsInjectorStatuses { appid } => shared.graphics_injector_statuses(appid),
+        Req::RepairGraphicsInjector { appid, kind } => {
+            shared.repair_graphics_injector(appid, &kind)
+        }
+        Req::ReinstallGraphicsInjector { appid, kind } => {
+            shared.reinstall_graphics_injector(appid, &kind)
+        }
+        Req::FixGraphicsInjectorOverride { appid, kind } => {
+            shared.fix_graphics_injector_override(appid, &kind)
+        }
+        Req::SteamBridgeStatus { appid } => shared.steam_bridge_status(appid),
+        Req::RepairSteamBridge { appid } => shared.repair_steam_bridge(appid),
         // Succès et sauvegardes savent aussi lire chez Epic et GOG : seule la
         // fiche Steam (PICS, boutique) reste propre à Steam.
         Req::GameAchievements { appid } => match store_kind(shared, appid) {
@@ -1390,10 +1916,17 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
         Req::AchievementToast { appid, api_name } => shared
             .test_achievement_toast(appid, &api_name)
             .map(|value| Envelope::ok(&value)),
+        // Le pont Steamworks n'ouvre pas de session : il confie l'écriture au
+        // daemon, qui partage déjà la sienne avec les lectures et les bandeaux.
+        Req::StoreAchievements { appid, names } => shared
+            .store_steam_achievements(appid, &names)
+            .map(|value| Envelope::ok(&value)),
+        Req::SteamCloudFresh { appid } => match store_kind(shared, appid) {
+            Some(store) if store != lapinux_core::stores::Store::Steam => shared.store_cloud(appid),
+            _ => shared.steam_cloud_fresh(appid),
+        },
         Req::SteamCloud { appid } => match store_kind(shared, appid) {
-            Some(store) if store != lapinux_core::stores::Store::Steam => {
-                shared.store_cloud(appid)
-            }
+            Some(store) if store != lapinux_core::stores::Store::Steam => shared.store_cloud(appid),
             _ => shared.steam_cloud(appid),
         },
         Req::CloudRestore { appid } => match store_kind(shared, appid) {
@@ -1402,6 +1935,22 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
             }
             _ => shared.cloud_restore(appid),
         },
+        Req::ResolveSteamCloud {
+            appid,
+            choice,
+            expected,
+        } => {
+            if store_kind(shared, appid) != Some(lapinux_core::stores::Store::Steam) {
+                Ok(Envelope::err("résolution réservée aux jeux Steam"))
+            } else {
+                shared.resolve_steam_cloud(appid, choice, expected)
+            }
+        }
+        Req::ResolveStoreCloud {
+            appid,
+            choice,
+            expected,
+        } => shared.resolve_store_cloud(appid, choice, expected),
         Req::SaveSnapshots { appid } => {
             let config = shared.config_snapshot();
             let copies = match shared.store.game(appid) {
@@ -1462,6 +2011,17 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
                 Envelope::err("fermez le jeu avant de charger une sauvegarde"),
             ),
             Ok(Some(game)) => {
+                let _guard = match shared.save_operation.try_lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return Envelope::err(
+                            "une opération de sauvegarde ou de lancement est déjà en cours",
+                        )
+                    }
+                };
+                if shared.session_info().map(|info| info.appid) == Some(appid) {
+                    return Envelope::err("fermez le jeu avant de charger une sauvegarde");
+                }
                 let config = shared.config_snapshot();
                 match crate::saves::restore(&game, &shared.paths, &config, &snapshot) {
                     Ok(files) => {
@@ -1516,12 +2076,7 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
             let exported = match shared.store.game(appid) {
                 Ok(Some(game)) => {
                     let result = crate::saves::export(&game, &shared.paths, &config, &dest);
-                    result.map(|path| {
-                        (
-                            path,
-                            crate::saves::list(&game, &shared.paths, &config),
-                        )
-                    })
+                    result.map(|path| (path, crate::saves::list(&game, &shared.paths, &config)))
                 }
                 Ok(None) => Err("jeu inconnu".to_string()),
                 Err(err) => Err(err.to_string()),
@@ -1549,7 +2104,10 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
         }
         Req::SavesOverview => {
             let config = shared.config_snapshot();
-            Ok(Envelope::ok(&crate::saves::overview(&shared.paths, &config)))
+            Ok(Envelope::ok(&crate::saves::overview(
+                &shared.paths,
+                &config,
+            )))
         }
         Req::CloudUpload { appid } => match store_kind(shared, appid) {
             Some(store) if store != lapinux_core::stores::Store::Steam => {
@@ -1586,6 +2144,8 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
         } => shared.store_install(store, store_id, platform),
         Req::StoreDetails { appid } => shared.store_details(appid),
         Req::StoreFreeGames => shared.store_free_games(),
+        Req::StoreFriends => shared.store_friends(),
+        Req::StoreNotifications => shared.store_notifications(),
         Req::StoreClaimFreeGames { ids } => shared.store_claim_free_games(ids.clone()),
         Req::DiscordView {
             section,
@@ -1619,23 +2179,81 @@ fn dispatch(shared: &Arc<Shared>, request: Req) -> Envelope {
         Req::SteamFriendsState => shared.steam_friends_state(),
         Req::SteamSocialPresence { presence } => shared.steam_social_presence(presence),
         Req::SteamSocialRedeemKey { key } => shared.steam_social_redeem(&key),
-        Req::SteamSocialMessage { steam_id, text } => {
-            shared.steam_social_message(steam_id, &text)
-        }
-        Req::Logs { file, lines } => Ok(Envelope::ok(&logs::view(&shared.paths, file.as_deref(), lines))),
+        Req::SteamSocialMessage { steam_id, text } => shared.steam_social_message(steam_id, &text),
+        Req::SteamSocialSticker { steam_id, name } => shared.steam_social_sticker(steam_id, &name),
+        Req::SteamChatHistory { steam_id, older } => shared.steam_chat_history(steam_id, older),
+        Req::SteamChatImport { steam_id, path } => shared.steam_chat_import(steam_id, &path),
+        Req::SteamLobbyCreate {
+            appid,
+            max_members,
+            lobby_type,
+            lobby_flags,
+            cell_id,
+        } => shared.steam_lobby_create(appid, max_members, lobby_type, lobby_flags, cell_id),
+        Req::SteamLobbyInvite { steam_id } => shared.steam_lobby_invite(steam_id),
+        Req::SteamLobbyJoin {
+            appid,
+            lobby,
+            connect,
+        } => shared.steam_lobby_join(appid, lobby, &connect),
+        Req::Logs { file, lines } => Ok(Envelope::ok(&logs::view(
+            &shared.paths,
+            file.as_deref(),
+            lines,
+        ))),
         Req::Stats => Ok(Envelope::ok(
-            &shared.store.get_json::<lapinux_core::model::Stats>("stats").ok().flatten().unwrap_or_default(),
+            &shared
+                .store
+                .get_json::<lapinux_core::model::Stats>("stats")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
         )),
-        Req::ClearCaches => Ok(Envelope::ok(&serde_json::json!({
-            "freed": shared.clear_caches()
-        }))),
-        Req::Shutdown => {
-            let _ = std::fs::remove_file(&shared.paths.socket);
-            std::thread::spawn(|| {
-                std::thread::sleep(Duration::from_millis(100));
-                std::process::exit(0);
-            });
-            Ok(Envelope::unit())
+        Req::ClearCaches => shared.clear_caches().map(|freed| {
+            Envelope::ok(&serde_json::json!({
+                "freed": freed
+            }))
+        }),
+        Req::UpdateCheck => json_reply(update::check()),
+        Req::UpdateDownload {
+            tag,
+            name,
+            url,
+            size,
+            sha256,
+        } => update::download(
+            shared,
+            update::Download {
+                tag,
+                name,
+                url,
+                size,
+                sha256,
+            },
+        )
+        .map(|_| Envelope::unit())
+        .map_err(lapinux_core::Error::Other),
+        Req::UpdateState => Ok(Envelope::ok(
+            &shared
+                .update_progress
+                .lock()
+                .ok()
+                .and_then(|progress| progress.clone()),
+        )),
+        Req::UpdateInstall => update::install(shared)
+            .map(|tag| Envelope::ok(&tag))
+            .map_err(lapinux_core::Error::Other),
+        Req::Shutdown | Req::ShutdownIfIdle => {
+            if !shared.try_begin_shutdown() {
+                Err(lapinux_core::Error::Other(lapinux_core::i18n::t("downloads.err_shutdown_blocked").into()))
+            } else {
+                let _ = std::fs::remove_file(&shared.paths.socket);
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    std::process::exit(0);
+                });
+                Ok(Envelope::unit())
+            }
         }
     };
 
@@ -1697,6 +2315,69 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_refuses_active_requests_jobs_and_cancelling_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(dir.path());
+        let shared = Arc::new(Shared::new(&paths).unwrap());
+        let request = shared.shutdown_gate.read().unwrap();
+        assert!(!shared.try_begin_shutdown());
+        drop(request);
+        for state in [JobState::Running, JobState::Queued, JobState::Paused] {
+            shared.jobs.lock().unwrap().push(test_job("job", Some(1), state));
+            assert!(!shared.try_begin_shutdown());
+            shared.jobs.lock().unwrap().clear();
+        }
+        shared.cancel.lock().unwrap().insert("cancelling".into(), Arc::new(AtomicBool::new(true)));
+        assert!(!shared.try_begin_shutdown());
+        shared.cancel.lock().unwrap().clear();
+        assert!(shared.try_begin_shutdown());
+        assert!(!dispatch(&shared, Req::Ping).ok);
+    }
+
+    #[test]
+    fn concurrent_shutdown_attempts_have_a_single_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(dir.path());
+        let shared = Arc::new(Shared::new(&paths).unwrap());
+        // Huit demandes d'arrêt simultanées : le portail est à sens unique,
+        // une seule doit le franchir et les autres garder le daemon en vie.
+        let wins: Vec<bool> = std::thread::scope(|scope| {
+            let attempts: Vec<_> = (0..8)
+                .map(|_| {
+                    let shared = Arc::clone(&shared);
+                    scope.spawn(move || shared.try_begin_shutdown())
+                })
+                .collect();
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().expect("fil d'arrêt"))
+                .collect()
+        });
+        assert_eq!(wins.iter().filter(|won| **won).count(), 1, "{wins:?}");
+        assert!(!dispatch(&shared, Req::Ping).ok);
+    }
+
+    #[test]
+    fn a_panicked_request_does_not_lock_the_daemon_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(dir.path());
+        let shared = Arc::new(Shared::new(&paths).unwrap());
+        // Un fil meurt avec le verrou de lecture en main : c'est ce que laisse
+        // un panic au milieu d'une requête. Sans récupération, le verrou
+        // empoisonné ferait répondre « daemon en cours d'arrêt » à tout, et
+        // interdirait même l'arrêt.
+        let poisoner = Arc::clone(&shared);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.shutdown_gate.read().unwrap();
+            panic!("requête interrompue");
+        })
+        .join();
+        assert!(dispatch(&shared, Req::Ping).ok);
+        assert!(shared.try_begin_shutdown());
+        assert!(!dispatch(&shared, Req::Ping).ok);
+    }
+
+    #[test]
     fn ipc_dispatch_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let paths = LapinuxPaths::under(dir.path());
@@ -1721,7 +2402,59 @@ mod tests {
         assert!(dispatch(&shared, Req::Config).ok);
         assert!(dispatch(&shared, Req::Doctor).ok);
         assert!(dispatch(&shared, Req::Devices).ok);
-        assert!(!dispatch(&shared, Req::Launch { appid: 999, dry_run: true }).ok);
+        assert!(
+            !dispatch(
+                &shared,
+                Req::Launch {
+                    appid: 999,
+                    dry_run: true
+                }
+            )
+            .ok
+        );
+    }
+
+    #[test]
+    fn game_tech_reports_installed_windows_libraries_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(dir.path());
+        let shared = Arc::new(Shared::new(&paths).unwrap());
+        let mut game = Game {
+            appid: 4242,
+            installdir: "sample".into(),
+            library: dir.path().to_path_buf(),
+            installed: true,
+            ..Default::default()
+        };
+        let root = game.install_dir();
+        std::fs::create_dir_all(root.join("Binaries")).unwrap();
+        std::fs::write(root.join("Binaries/nvngx_dlss.dll"), b"x").unwrap();
+        shared.store.save_game(&game).unwrap();
+        let detected: lapinux_core::model::GameTech =
+            dispatch(&shared, Req::GameTech { appid: game.appid })
+                .into_data()
+                .unwrap();
+        assert!(detected.dlss.dlss);
+        game.native = true;
+        shared.store.save_game(&game).unwrap();
+        let detected: lapinux_core::model::GameTech =
+            dispatch(&shared, Req::GameTech { appid: game.appid })
+                .into_data()
+                .unwrap();
+        assert_eq!(detected, lapinux_core::model::GameTech::default());
+        game.native = false;
+        game.installed = false;
+        shared.store.save_game(&game).unwrap();
+        let detected: lapinux_core::model::GameTech =
+            dispatch(&shared, Req::GameTech { appid: game.appid })
+                .into_data()
+                .unwrap();
+        assert_eq!(detected, lapinux_core::model::GameTech::default());
+        assert!(!dispatch(&shared, Req::GameTech { appid: 9999 }).ok);
+        game.installed = true;
+        game.installdir = "missing".into();
+        shared.store.save_game(&game).unwrap();
+        assert!(!dispatch(&shared, Req::GameTech { appid: game.appid }).ok);
     }
 
     #[test]
@@ -1729,7 +2462,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = LapinuxPaths::under(dir.path());
         let shared = Arc::new(Shared::new(&paths).unwrap());
-        let build: lapinux_core::ipc::DaemonBuild = dispatch(&shared, Req::Ping).into_data().unwrap();
+        let build: lapinux_core::ipc::DaemonBuild =
+            dispatch(&shared, Req::Ping).into_data().unwrap();
         // Le binaire de test existe : son empreinte identifie ce daemon.
         assert!(build.stamp > 0);
         assert_eq!(build.stamp, lapinux_core::paths::current_binary_stamp());
@@ -1750,6 +2484,55 @@ mod tests {
         shared.reload_config();
 
         assert_eq!(shared.config_snapshot().overlay.hotkey, "Ctrl+F9");
+    }
+
+    #[test]
+    fn activity_pruning_and_deletion_remove_the_game_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(dir.path());
+        std::fs::create_dir_all(&paths.log_dir).unwrap();
+        let shared = Arc::new(Shared::new(&paths).unwrap());
+        let now = lapinux_core::util::now_unix();
+        let old_log = paths.log_dir.join("game-1-1.log");
+        let recent_log = paths.log_dir.join("game-2-2.log");
+        std::fs::write(&old_log, "ancienne partie").unwrap();
+        std::fs::write(&recent_log, "partie récente").unwrap();
+        let old = lapinux_core::model::PlaySession {
+            appid: 1,
+            name: "Ancien".into(),
+            started: now - 8 * 86_400,
+            ended: now - 8 * 86_400,
+            seconds: 60,
+            log: old_log.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let recent = lapinux_core::model::PlaySession {
+            appid: 2,
+            name: "Récent".into(),
+            started: now - 30,
+            ended: now,
+            seconds: 30,
+            log: recent_log.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        shared
+            .store
+            .set_json("sessions", &vec![old, recent.clone()])
+            .unwrap();
+
+        // Une semaine par défaut : l'ancienne partie et son journal partent,
+        // la récente reste.
+        assert_eq!(shared.prune_activity_history(), 1);
+        assert!(!old_log.exists());
+        assert!(recent_log.exists());
+
+        // Supprimer la carte d'activité supprime aussi le journal qui lui est
+        // rattaché.
+        assert!(shared.delete_session(2, recent.started).unwrap().ok);
+        assert!(!recent_log.exists());
+        let history: Vec<lapinux_core::model::PlaySession> =
+            shared.session_history().unwrap().into_data().unwrap();
+        assert!(history.is_empty());
     }
 
     #[test]
@@ -1786,14 +2569,16 @@ mod tests {
             .ok
         );
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(!dispatch(
-            &shared,
-            Req::PauseJob {
-                id: "inconnue".into(),
-                paused: true,
-            }
-        )
-        .ok);
+        assert!(
+            !dispatch(
+                &shared,
+                Req::PauseJob {
+                    id: "inconnue".into(),
+                    paused: true,
+                }
+            )
+            .ok
+        );
     }
 
     #[test]
@@ -1801,7 +2586,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = LapinuxPaths::under(dir.path());
         let shared = Arc::new(Shared::new(&paths).unwrap());
-        shared.jobs.lock().unwrap().push(test_job("jeu-1", Some(1), JobState::Running));
+        shared
+            .jobs
+            .lock()
+            .unwrap()
+            .push(test_job("jeu-1", Some(1), JobState::Running));
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         shared
             .cancel
@@ -1819,9 +2608,32 @@ mod tests {
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         assert!(shared.jobs.lock().unwrap().is_empty());
         assert!(
-            !dispatch(&shared, Req::CancelJob { id: "inconnue".into() }).ok,
+            !dispatch(
+                &shared,
+                Req::CancelJob {
+                    id: "inconnue".into()
+                }
+            )
+            .ok,
             "une tâche inconnue doit être refusée"
         );
+    }
+
+    #[test]
+    fn paused_and_interrupted_jobs_can_be_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(dir.path());
+        let shared = Arc::new(Shared::new(&paths).unwrap());
+        shared.jobs.lock().unwrap().push(test_job("paused", Some(1), JobState::Paused));
+        shared.jobs.lock().unwrap().push(test_job("interrupted", Some(2), JobState::Interrupted));
+        let flag = Arc::new(AtomicBool::new(false));
+        shared.cancel.lock().unwrap().insert("paused".into(), Arc::clone(&flag));
+        assert!(dispatch(&shared, Req::CancelJob { id: "paused".into() }).ok);
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(dispatch(&shared, Req::CancelJob { id: "interrupted".into() }).ok);
+        assert!(shared.jobs.lock().unwrap().is_empty());
+        drop(shared);
+        assert!(Shared::new(&paths).unwrap().jobs.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1897,7 +2709,13 @@ mod tests {
         shared.persist_jobs(true);
 
         assert!(
-            dispatch(&shared, Req::CancelJob { id: "game-42-1".into() }).ok,
+            dispatch(
+                &shared,
+                Req::CancelJob {
+                    id: "game-42-1".into()
+                }
+            )
+            .ok,
             "une tâche en attente doit pouvoir être annulée"
         );
         let jobs = shared.jobs.lock().unwrap();
@@ -2048,6 +2866,61 @@ mod tests {
     }
 
     #[test]
+    fn startup_skips_the_scan_when_the_library_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(dir.path());
+        let shared = Arc::new(Shared::new(&paths).unwrap());
+        let root = dir.path().join("LapinuxLibrary");
+        std::fs::create_dir_all(root.join("Steam/Jeu")).unwrap();
+        lapinux_steam::write_manifest(&root, 42, "Jeu", "Jeu", 1, true).unwrap();
+
+        let first = shared.refresh_library_from(&[], &root).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(shared
+            .store
+            .get_json::<lapinux_steam::LibraryFingerprint>(LIBRARY_FINGERPRINT_KEY)
+            .unwrap()
+            .is_some());
+
+        // Le nom enregistré survit au second démarrage : la liste est
+        // rechargée sans relire les manifestes.
+        let mut stored = shared.store.load_games().unwrap();
+        stored[0].name = "Renommé".into();
+        shared.store.save_games(&stored).unwrap();
+        let skipped = shared.refresh_library_from(&[], &root).unwrap();
+        assert_eq!(skipped[0].name, "Renommé");
+
+        // Un manifeste de plus change l'empreinte : le scan revient et ajoute
+        // le nouveau jeu à la bibliothèque.
+        lapinux_steam::write_manifest(&root, 77, "Nouveau", "Nouveau", 1, true).unwrap();
+        let refreshed = shared.refresh_library_from(&[], &root).unwrap();
+        assert_eq!(refreshed.len(), 2);
+        assert!(refreshed.iter().any(|game| game.appid == 77));
+    }
+
+    #[test]
+    fn hud_style_from_settings_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(dir.path());
+        let shared = Arc::new(Shared::new(&paths).unwrap());
+        let mut config = shared.config_snapshot();
+        let mut style = config.capture.active_hud_style();
+        style.name = "Course".into();
+        style.colors.fps = "#F87171".into();
+        style.colors.graph = "#A3E635".into();
+        let id = config.capture.set_active_hud_style(style.clone());
+        assert!(dispatch(&shared, Req::SetConfig { config }).ok);
+        drop(shared);
+
+        let restarted = Arc::new(Shared::new(&paths).unwrap());
+        let style = restarted.config_snapshot().capture.active_hud_style();
+        assert_eq!(style.id, id);
+        assert_eq!(style.name, "Course");
+        assert_eq!(style.colors.fps, "#F87171FF");
+        assert_eq!(style.colors.graph, "#A3E635FF");
+    }
+
+    #[test]
     fn settings_are_persisted() {
         let dir = tempfile::tempdir().unwrap();
         let paths = LapinuxPaths::under(dir.path());
@@ -2062,7 +2935,15 @@ mod tests {
             .unwrap();
         let mut config = shared.config_snapshot();
         config.general.library_root = dir.path().join("jeux").display().to_string();
-        assert!(dispatch(&shared, Req::SetConfig { config: config.clone() }).ok);
+        assert!(
+            dispatch(
+                &shared,
+                Req::SetConfig {
+                    config: config.clone()
+                }
+            )
+            .ok
+        );
         let stored: Config = dispatch(&shared, Req::Config).into_data().unwrap();
         assert_eq!(stored.general.library_root, config.general.library_root);
     }

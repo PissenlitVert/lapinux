@@ -11,7 +11,7 @@ use lapinux_core::model::{DeviceInfo, DeviceLink};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 /// Numéro de séquence Bluetooth, dans le quartet haut de l'octet `seq_tag`.
@@ -128,7 +128,10 @@ pub fn haptic(
     let probe = pad.upload_ff_effect(FFEffectData {
         direction: 0,
         trigger: FFTrigger::default(),
-        replay: FFReplay { length: 1, delay: 0 },
+        replay: FFReplay {
+            length: 1,
+            delay: 0,
+        },
         kind: FFEffectKind::Rumble {
             strong_magnitude: 0,
             weak_magnitude: 0,
@@ -207,7 +210,10 @@ pub fn haptic(
         if let Ok(mut effect) = pad.upload_ff_effect(FFEffectData {
             direction: 0,
             trigger: FFTrigger::default(),
-            replay: FFReplay { length: 0, delay: 0 },
+            replay: FFReplay {
+                length: 0,
+                delay: 0,
+            },
             kind: FFEffectKind::Rumble {
                 strong_magnitude: 0,
                 weak_magnitude: 0,
@@ -238,7 +244,8 @@ pub fn haptic_hd(
     }
     if !matches!(device.connection, DeviceLink::Bluetooth) {
         return Err(Error::Other(
-            "ce chemin HD demande le Bluetooth ; en USB, la carte son de la manette le remplace".into(),
+            "ce chemin HD demande le Bluetooth ; en USB, la carte son de la manette le remplace"
+                .into(),
         ));
     }
     let left = left.clamp(0.0, 1.0);
@@ -355,12 +362,7 @@ fn haptics_sign(report: &mut [u8; 142]) {
 
 /// Une impulsion de rumble sur les deux moteurs, bloquante pour le fil de
 /// test seulement.
-fn pulse(
-    pad: &mut evdev::Device,
-    strong: u16,
-    weak: u16,
-    length: Duration,
-) -> Result<()> {
+fn pulse(pad: &mut evdev::Device, strong: u16, weak: u16, length: Duration) -> Result<()> {
     if length.is_zero() {
         return Ok(());
     }
@@ -424,11 +426,7 @@ pub fn rumble(device: &DeviceInfo, intensity: f32) -> Result<()> {
 ///
 /// La remise à zéro est faite par un fil séparé, même si l'interface n'est plus
 /// affichée. Une nouvelle demande annule la remise à zéro de la précédente.
-pub fn dualsense_trigger_test(
-    device: &DeviceInfo,
-    test: TriggerTest,
-    seconds: u8,
-) -> Result<()> {
+pub fn dualsense_trigger_test(device: &DeviceInfo, test: TriggerTest, seconds: u8) -> Result<()> {
     if !is_dualsense(device) {
         return Err(Error::Other(
             "les gâchettes adaptatives sont réservées à la DualSense".into(),
@@ -515,11 +513,7 @@ pub fn dualsense_lightbar(device: &DeviceInfo, color: [u8; 3]) -> Result<()> {
         return Ok(());
     }
     std::thread::sleep(Duration::from_millis(120));
-    file.write_all(&lightbar_report(
-        bluetooth,
-        next_bluetooth_seq(),
-        color,
-    ))?;
+    file.write_all(&lightbar_report(bluetooth, next_bluetooth_seq(), color))?;
     Ok(())
 }
 
@@ -686,12 +680,7 @@ fn off_report(bluetooth: bool) -> Vec<u8> {
 ///
 /// `right` et `left` occupent les deux emplacements d'effet ; `lightbar`
 /// n'active que la couleur RGB et ne touche pas aux gâchettes.
-fn output_report(
-    bluetooth: bool,
-    seq: u8,
-    right: &[u8; 11],
-    left: &[u8; 11],
-) -> Vec<u8> {
+fn output_report(bluetooth: bool, seq: u8, right: &[u8; 11], left: &[u8; 11]) -> Vec<u8> {
     build_report(bluetooth, seq, Some((right, left)), None)
 }
 

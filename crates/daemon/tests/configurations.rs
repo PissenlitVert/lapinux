@@ -148,9 +148,7 @@ fn installe_et_retire_une_configuration() {
     let dir = tempfile::tempdir().unwrap();
     let paths = LapinuxPaths::under(dir.path());
     paths.ensure().unwrap();
-    let game_dir = dir
-        .path()
-        .join("library/steamapps/common/Test Game/data");
+    let game_dir = dir.path().join("library/steamapps/common/Test Game/data");
     std::fs::create_dir_all(&game_dir).unwrap();
     std::fs::write(game_dir.join("hello.txt"), b"original").unwrap();
 
@@ -175,7 +173,10 @@ fn installe_et_retire_une_configuration() {
     shared.start_configurations_in_background();
 
     let set = await_catalog(&shared);
-    assert!(set.configurations.iter().any(|entry| entry.id == "test-game-hello"));
+    assert!(set
+        .configurations
+        .iter()
+        .any(|entry| entry.id == "test-game-hello"));
     assert!(set.installed.is_empty());
 
     let envelope = shared
@@ -211,6 +212,34 @@ fn installe_et_retire_une_configuration() {
     let untouched = shared.store.game(4242).unwrap().unwrap();
     assert!(untouched.settings.args.is_empty());
 
+    // Une modification personnelle empêche le retrait du fichier et doit
+    // conserver sa sauvegarde ainsi que la trace pour une nouvelle tentative.
+    std::fs::write(game_dir.join("hello.txt"), b"personnel").unwrap();
+    assert!(shared
+        .install_configuration(4242, "test-game-hello")
+        .is_err());
+    let partial = shared
+        .remove_configuration(4242, "test-game-hello")
+        .unwrap()
+        .into_data::<InstallReport>()
+        .unwrap();
+    assert!(!partial.warnings.is_empty());
+    assert_eq!(
+        std::fs::read(game_dir.join("hello.txt")).unwrap(),
+        b"personnel"
+    );
+    assert_eq!(std::fs::read(&backup).unwrap(), b"original");
+    assert_eq!(
+        shared
+            .game_configurations(4242)
+            .unwrap()
+            .into_data::<ConfigurationSet>()
+            .unwrap()
+            .installed
+            .len(),
+        1
+    );
+    std::fs::write(game_dir.join("hello.txt"), &content).unwrap();
     let envelope = shared
         .remove_configuration(4242, "test-game-hello")
         .expect("retrait");

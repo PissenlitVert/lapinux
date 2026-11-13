@@ -61,13 +61,7 @@ pub fn sanitize_name(value: &str) -> String {
 }
 
 /// Rend le nom sans extension à partir du modèle choisi par l'utilisateur.
-pub fn render_stem(
-    template: &str,
-    game: &str,
-    appid: u32,
-    fps: u32,
-    at: i64,
-) -> String {
+pub fn render_stem(template: &str, game: &str, appid: u32, fps: u32, at: i64) -> String {
     let date = iso_date(at);
     let time = file_time(at);
     let game = sanitize_name(game);
@@ -144,10 +138,11 @@ pub fn game_from_stem(stem: &str) -> String {
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     let mut index = 0;
     while index < tokens.len() {
-        let token = tokens[index].trim_matches(|c: char| matches!(c, '-' | '_' | '(' | ')' | '[' | ']'));
-        let next = tokens
-            .get(index + 1)
-            .map(|next| next.trim_matches(|c: char| matches!(c, '-' | '_' | '(' | ')' | '[' | ']')));
+        let token =
+            tokens[index].trim_matches(|c: char| matches!(c, '-' | '_' | '(' | ')' | '[' | ']'));
+        let next = tokens.get(index + 1).map(|next| {
+            next.trim_matches(|c: char| matches!(c, '-' | '_' | '(' | ')' | '[' | ']'))
+        });
         let is_number = token.chars().all(|c| c.is_ascii_digit()) && !token.is_empty();
         let is_rate = matches!(next, Some("FPS" | "fps" | "IPS" | "ips"));
         if is_number && is_rate {
@@ -161,9 +156,13 @@ pub fn game_from_stem(stem: &str) -> String {
         words.push(token);
         index += 1;
     }
-    let game = words.join(" ").trim_matches(|c: char| matches!(c, '-' | '_' | '(' | ')' | '[' | ']' | ' ')).to_string();
+    let game = words
+        .join(" ")
+        .trim_matches(|c: char| matches!(c, '-' | '_' | '(' | ')' | '[' | ']' | ' '))
+        .to_string();
     if game.is_empty() {
-        stem.trim_matches(|c: char| matches!(c, '-' | '_' | '(' | ')' | '[' | ']' | ' ')).to_string()
+        stem.trim_matches(|c: char| matches!(c, '-' | '_' | '(' | ')' | '[' | ']' | ' '))
+            .to_string()
     } else {
         game
     }
@@ -246,12 +245,21 @@ mod tests {
         let at = 1_793_000_000;
         let stem = render_stem(DEFAULT_NAME_FORMAT, "MotorSlice", 0, 30, at);
         assert!(stem.ends_with(" - MotorSlice - 30 FPS"), "{stem}");
-        assert_eq!(stem, format!("{} {} - MotorSlice - 30 FPS", iso_date(at), file_time(at)));
+        assert_eq!(
+            stem,
+            format!("{} {} - MotorSlice - 30 FPS", iso_date(at), file_time(at))
+        );
     }
 
     #[test]
     fn les_separateurs_ne_sortent_jamais_du_dossier() {
-        let stem = render_stem("{date} - {jeu} - {fps} FPS", "../Motor/Slice", 0, 30, 1_793_000_000);
+        let stem = render_stem(
+            "{date} - {jeu} - {fps} FPS",
+            "../Motor/Slice",
+            0,
+            30,
+            1_793_000_000,
+        );
         assert!(!stem.contains('/'));
         assert!(stem.contains("Motor-Slice"));
     }

@@ -13,7 +13,7 @@ use eframe::egui;
 use lapinux_core::client::Client;
 use lapinux_core::ipc::Req;
 use lapinux_core::stores::{Store, StoreAccount, StoreLibrary, StoresView};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -60,6 +60,9 @@ pub(crate) struct Stores {
     /// liste fusionnée doit être reconstruite, même hors de la page
     /// Bibliothèque.
     changed: bool,
+    /// Une vue a apporté des jeux absents de la précédente : leur nouveauté
+    /// reste à annoncer.
+    arrivals: bool,
     /// Installation en cours de lancement : la lecture du plan passe par le
     /// réseau, elle ne doit pas figer l'écran.
     install: Option<(Store, mpsc::Receiver<std::result::Result<String, String>>)>,
@@ -93,6 +96,7 @@ impl Default for Stores {
             queued: None,
             refresh_at: None,
             changed: false,
+            arrivals: false,
             install: None,
             asked: false,
             asked_games: false,
@@ -141,10 +145,7 @@ impl Stores {
 
     /// Boutique et jaquette d'un jeu déjà installé, quand une boutique le
     /// publie : la fiche s'en sert pour l'image de la ligne compacte.
-    pub(crate) fn cover_of(
-        &self,
-        appid: u32,
-    ) -> Option<(lapinux_core::stores::Store, String)> {
+    pub(crate) fn cover_of(&self, appid: u32) -> Option<(lapinux_core::stores::Store, String)> {
         self.owned_games()
             .into_iter()
             .find(|game| game.appid == appid)
@@ -198,19 +199,34 @@ impl Stores {
             } else if due && self.rx.is_none() && self.settle_tries < 300 {
                 self.settle = Some(std::time::Instant::now());
                 self.settle_tries += 1;
-                self.spawn(client, self.selected, true, Req::Stores { refresh: false, only: Vec::new() });
+                self.spawn(
+                    client,
+                    self.selected,
+                    true,
+                    Req::Stores {
+                        refresh: false,
+                        only: Vec::new(),
+                    },
+                );
             }
         }
         // Une réponse reçue — trois comptes, ou un refus à afficher — clôt la
         // relance : sans cette borne, un daemon qui échoue à chaque coup
         // relancerait une demande à chaque image.
-        let settled =
-            self.view.accounts.len() >= Store::EXTERNAL.len() || !self.error.is_empty();
+        let settled = self.view.accounts.len() >= Store::EXTERNAL.len() || !self.error.is_empty();
         if self.rx.is_some() || (self.asked && settled) {
             return;
         }
         self.asked = true;
-        self.spawn(client, self.selected, true, Req::Stores { refresh: false, only: Vec::new() });
+        self.spawn(
+            client,
+            self.selected,
+            true,
+            Req::Stores {
+                refresh: false,
+                only: Vec::new(),
+            },
+        );
     }
 
     /// Demande en plus la relecture des bibliothèques : la page Bibliothèque en
@@ -221,14 +237,20 @@ impl Stores {
         // occupe l'unique échange avec le daemon, et sur une grande
         // bibliothèque elle prend des minutes — le panneau des comptes
         // resterait alors sans état ni lien d'autorisation.
-        if self.asked_games
-            || self.rx.is_some()
-            || self.view.accounts.len() < Store::EXTERNAL.len()
+        if self.asked_games || self.rx.is_some() || self.view.accounts.len() < Store::EXTERNAL.len()
         {
             return;
         }
         self.asked_games = true;
-        self.spawn(client, self.selected, true, Req::Stores { refresh: true, only: Vec::new() });
+        self.spawn(
+            client,
+            self.selected,
+            true,
+            Req::Stores {
+                refresh: true,
+                only: Vec::new(),
+            },
+        );
     }
 
     /// La première vue des comptes est arrivée, leur relecture réseau est
@@ -245,6 +267,13 @@ impl Stores {
     /// invalide alors la liste fusionnée, quelle que soit la page ouverte.
     pub(crate) fn take_changed(&mut self) -> bool {
         std::mem::take(&mut self.changed)
+    }
+
+    /// Vrai une fois quand une vue a apporté des jeux absents de la
+    /// précédente : la comparaison des nouveaux jeux doit passer avant que la
+    /// photographie ne les absorbe.
+    pub(crate) fn take_arrivals(&mut self) -> bool {
+        std::mem::take(&mut self.arrivals)
     }
 
     /// Le daemon a été remplacé : sa vue peut venir d'un binaire précédent, on
@@ -275,9 +304,9 @@ impl Stores {
                             .into_data::<StoresView>()
                             .map_err(|error| error.to_string())
                     } else {
-                        Err(envelope
-                            .error
-                            .unwrap_or_else(|| lapinux_core::i18n::t("stores.unknown_error").into()))
+                        Err(envelope.error.unwrap_or_else(|| {
+                            lapinux_core::i18n::t("stores.unknown_error").into()
+                        }))
                     }
                 });
             let _ = tx.send((store, reply));
@@ -295,7 +324,15 @@ impl Stores {
         }
         self.asked_games = true;
         self.refresh_at = Some(lapinux_core::util::now_unix());
-        self.spawn_user(client, self.selected, false, Req::Stores { refresh: true, only });
+        self.spawn_user(
+            client,
+            self.selected,
+            false,
+            Req::Stores {
+                refresh: true,
+                only,
+            },
+        );
     }
 
     /// Une demande venue d'un geste de l'utilisateur : si l'échange est pris
@@ -341,16 +378,34 @@ impl Stores {
             }
             None => {}
         }
-        let received = self.rx.as_ref().map(|(_, quiet, rx)| (*quiet, rx.try_recv()));
+        let received = self
+            .rx
+            .as_ref()
+            .map(|(_, quiet, rx)| (*quiet, rx.try_recv()));
         match received {
             Some((quiet, Ok((store, Ok(view))))) => {
+                // Un jeu présent seulement dans la nouvelle vue est une
+                // arrivée : le contrôle des nouveaux jeux repartira, même si
+                // la photographie du lancement est déjà écrite.
+                let known: HashSet<u32> = self
+                    .view
+                    .libraries
+                    .iter()
+                    .flat_map(|library| library.entries.iter())
+                    .map(|entry| entry.appid)
+                    .collect();
+                if view
+                    .libraries
+                    .iter()
+                    .flat_map(|library| library.entries.iter())
+                    .any(|entry| !known.contains(&entry.appid))
+                {
+                    self.arrivals = true;
+                }
                 self.view = view;
                 self.rx = None;
                 // Même silencieuse, une nouvelle vue peut contenir des jeux
                 // ajoutés : la liste fusionnée ne doit pas rester en cache.
-                // `library_checked` est relancé par le contrôle de nouveaux
-                // jeux, pas ici, pour ne pas réécrire la photographie à chaque
-                // lecture de la page Comptes.
                 self.changed = true;
                 self.error.remove(&store);
                 // Une boutique connectée sans bibliothèque lue : sa relecture
@@ -363,9 +418,9 @@ impl Stores {
                             .iter()
                             .find(|library| library.store == account.store)
                             .map(|library| {
-                            (library.fetched == 0 && library.entries.is_empty())
-                                || self.refresh_at.map_or(false, |at| library.fetched < at)
-                        })
+                                (library.fetched == 0 && library.entries.is_empty())
+                                    || self.refresh_at.map_or(false, |at| library.fetched < at)
+                            })
                             .unwrap_or(true)
                 });
                 if pending {
@@ -377,12 +432,17 @@ impl Stores {
                     self.settle = None;
                     self.settle_tries = 0;
                 }
-                (!quiet).then(|| lapinux_core::i18n::t_args("stores.up_to_date", &[("store", store.label())]))
+                (!quiet).then(|| {
+                    lapinux_core::i18n::t_args("stores.up_to_date", &[("store", store.label())])
+                })
             }
             Some((_, Ok((store, Err(error))))) => {
                 self.rx = None;
                 self.error.insert(store, error.clone());
-                Some(lapinux_core::i18n::t_args("stores.error", &[("store", store.label()), ("error", &error.to_string())]))
+                Some(lapinux_core::i18n::t_args(
+                    "stores.error",
+                    &[("store", store.label()), ("error", &error.to_string())],
+                ))
             }
             Some((_, Err(mpsc::TryRecvError::Disconnected))) => {
                 self.rx = None;
@@ -434,7 +494,11 @@ impl Stores {
                         // Les marques restent blanches : c'est la pastille du
                         // statut qui dit si le compte est connecté. Un logo
                         // éteint se lisait comme un logo cassé.
-                        let ink = if selected || connected { TEXT() } else { ACCENT() };
+                        let ink = if selected || connected {
+                            TEXT()
+                        } else {
+                            ACCENT()
+                        };
                         // La marque garde son lettrage : à cette taille, « EPIC
                         // GAMES » et « gog.com » se lisent, là où une
                         // silhouette réduite ne disait plus rien. En dessous de
@@ -449,15 +513,9 @@ impl Stores {
                         );
                         // Le nom du compte reste hors de la liste : un point
                         // vert dit « connecté », un point rouge « non ».
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                crate::status_dot(
-                                    ui,
-                                    if connected { OK } else { DANGER },
-                                );
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            crate::status_dot(ui, if connected { OK } else { DANGER });
+                        });
                     });
                 });
             let response = ui.interact(
@@ -550,12 +608,8 @@ impl Stores {
         let busy = self.busy(store);
         let caps = store.capabilities();
         let subtitle = match store {
-            Store::Epic => {
-                lapinux_core::i18n::t("stores.subtitle.epic")
-            }
-            Store::Gog => {
-                lapinux_core::i18n::t("stores.subtitle.gog")
-            }
+            Store::Epic => lapinux_core::i18n::t("stores.subtitle.epic"),
+            Store::Gog => lapinux_core::i18n::t("stores.subtitle.gog"),
             Store::Itch => lapinux_core::i18n::t("stores.subtitle.itch"),
             Store::Steam => lapinux_core::i18n::t("stores.subtitle.steam"),
         };
@@ -593,13 +647,31 @@ impl Stores {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if connected {
-                        if action_button(ui, lapinux_core::i18n::t("stores.logout"), ActionTone::Quiet).clicked() {
+                        if action_button(
+                            ui,
+                            lapinux_core::i18n::t("stores.logout"),
+                            ActionTone::Quiet,
+                        )
+                        .clicked()
+                        {
                             logout = true;
                         }
-                        if action_button(ui, lapinux_core::i18n::t("stores.reload"), ActionTone::Quiet).clicked() {
+                        if action_button(
+                            ui,
+                            lapinux_core::i18n::t("stores.reload"),
+                            ActionTone::Quiet,
+                        )
+                        .clicked()
+                        {
                             refresh = true;
                         }
-                    } else if action_button(ui, lapinux_core::i18n::t("stores.refresh"), ActionTone::Quiet).clicked() {
+                    } else if action_button(
+                        ui,
+                        lapinux_core::i18n::t("stores.refresh"),
+                        ActionTone::Quiet,
+                    )
+                    .clicked()
+                    {
                         // Une réponse perdue (daemon remplacé, délai) laissait
                         // le panneau sans lien d'autorisation : ce bouton
                         // redemande l'état, sans toucher au réseau.
@@ -615,16 +687,34 @@ impl Stores {
             // Ce qui manque s'explique au survol, boutique par boutique.
             let missing = match store {
                 Store::Itch => lapinux_core::i18n::t("stores.missing.itch"),
-                Store::Epic => {
-                    lapinux_core::i18n::t("stores.missing.epic")
-                }
+                Store::Epic => lapinux_core::i18n::t("stores.missing.epic"),
                 _ => lapinux_core::i18n::t("stores.missing.unsupported"),
             };
             ui.horizontal_wrapped(|ui| {
-                capability_chip(ui, lapinux_core::i18n::t("stores.capability.library"), caps.library, missing);
-                capability_chip(ui, lapinux_core::i18n::t("stores.capability.install"), caps.install, missing);
-                capability_chip(ui, lapinux_core::i18n::t("stores.capability.cloud"), caps.cloud, missing);
-                capability_chip(ui, lapinux_core::i18n::t("stores.capability.achievements"), caps.achievements, missing);
+                capability_chip(
+                    ui,
+                    lapinux_core::i18n::t("stores.capability.library"),
+                    caps.library,
+                    missing,
+                );
+                capability_chip(
+                    ui,
+                    lapinux_core::i18n::t("stores.capability.install"),
+                    caps.install,
+                    missing,
+                );
+                capability_chip(
+                    ui,
+                    lapinux_core::i18n::t("stores.capability.cloud"),
+                    caps.cloud,
+                    missing,
+                );
+                capability_chip(
+                    ui,
+                    lapinux_core::i18n::t("stores.capability.achievements"),
+                    caps.achievements,
+                    missing,
+                );
             });
             if !connected {
                 ui.add_space(12.0);
@@ -640,7 +730,10 @@ impl Stores {
                         if is_itch {
                             lapinux_core::i18n::t("stores.button.itch_key").to_string()
                         } else {
-                            lapinux_core::i18n::t_args("stores.button.login", &[("store", store.label())])
+                            lapinux_core::i18n::t_args(
+                                "stores.button.login",
+                                &[("store", store.label())],
+                            )
                         },
                         ActionTone::Light,
                     )
@@ -698,36 +791,58 @@ impl Stores {
                         connect = true;
                     }
                     if busy {
-                        ui.spinner();
+                        crate::section_icons::loading(ui, 18.0);
                     }
                 });
             }
             if let Some(error) = &error {
                 ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(error)
-                        .size(11.0)
-                        .color(DANGER),
-                );
+                ui.label(egui::RichText::new(error).size(11.0).color(DANGER));
             }
         });
         if reload {
             self.forget();
-            self.spawn_user(client, store, true, Req::Stores { refresh: false, only: Vec::new() });
+            self.spawn_user(
+                client,
+                store,
+                true,
+                Req::Stores {
+                    refresh: false,
+                    only: Vec::new(),
+                },
+            );
             return None;
         }
         if logout {
             self.spawn_user(client, store, false, Req::StoreLogout { store });
-            return Some(lapinux_core::i18n::t_args("stores.account_removed", &[("store", store.label())]));
+            return Some(lapinux_core::i18n::t_args(
+                "stores.account_removed",
+                &[("store", store.label())],
+            ));
         }
         if refresh {
             self.refresh_at = Some(lapinux_core::util::now_unix());
-            self.spawn_user(client, store, false, Req::Stores { refresh: true, only: Vec::new() });
-            return Some(lapinux_core::i18n::t_args("stores.reloading", &[("store", store.label())]));
+            self.spawn_user(
+                client,
+                store,
+                false,
+                Req::Stores {
+                    refresh: true,
+                    only: Vec::new(),
+                },
+            );
+            return Some(lapinux_core::i18n::t_args(
+                "stores.reloading",
+                &[("store", store.label())],
+            ));
         }
         if connect {
             let token = self.token.get(&store).cloned().unwrap_or_default();
-            let account = if connected { account_name } else { String::new() };
+            let account = if connected {
+                account_name
+            } else {
+                String::new()
+            };
             self.spawn_user(
                 client,
                 store,
@@ -742,7 +857,12 @@ impl Stores {
         None
     }
 
-    fn library_card(&mut self, ui: &mut egui::Ui, _client: &Client, store: Store) -> Option<String> {
+    fn library_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        _client: &Client,
+        store: Store,
+    ) -> Option<String> {
         let library = self.library(store);
         let account = self.account(store);
         let count = library.entries.len();
@@ -755,7 +875,10 @@ impl Stores {
             if library.fetched > 0 {
                 lapinux_core::i18n::t_args(
                     "stores.library.reloaded",
-                    &[("date", &lapinux_core::util::format_datetime(library.fetched))],
+                    &[(
+                        "date",
+                        &lapinux_core::util::format_datetime(library.fetched),
+                    )],
                 )
             } else {
                 lapinux_core::i18n::t("stores.library.never").to_string()
@@ -763,36 +886,38 @@ impl Stores {
         } else {
             lapinux_core::i18n::t("stores.library.connect").to_string()
         };
-        settings_card(ui, lapinux_core::i18n::t("stores.library.title"), &subtitle, |ui| {
-            if let Some(error) = &library.error {
-                ui.label(egui::RichText::new(error).size(11.0).color(WARN));
-                ui.add_space(6.0);
-            }
-            // Seulement le nombre de jeux : la liste complète vit dans la
-            // Bibliothèque principale, pas dans les réglages du compte.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(count.to_string())
-                        .size(28.0)
-                        .strong()
-                        .color(TEXT()),
-                );
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.add_space(5.0);
+        settings_card(
+            ui,
+            lapinux_core::i18n::t("stores.library.title"),
+            &subtitle,
+            |ui| {
+                if let Some(error) = &library.error {
+                    ui.label(egui::RichText::new(error).size(11.0).color(WARN));
+                    ui.add_space(6.0);
+                }
+                // Seulement le nombre de jeux : la liste complète vit dans la
+                // Bibliothèque principale, pas dans les réglages du compte.
+                ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(if count == 1 {
-                            lapinux_core::i18n::t("stores.library.games_one")
-                        } else {
-                            lapinux_core::i18n::t("stores.library.games_many")
-                        })
+                        egui::RichText::new(count.to_string())
+                            .size(28.0)
+                            .strong()
+                            .color(TEXT()),
+                    );
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(5.0);
+                        ui.label(
+                            egui::RichText::new(if count == 1 {
+                                lapinux_core::i18n::t("stores.library.games_one")
+                            } else {
+                                lapinux_core::i18n::t("stores.library.games_many")
+                            })
                             .size(12.0)
                             .color(TEXT_DIM()),
-                    );
-                });
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         muted(
                             ui,
                             if installed > 1 {
@@ -807,20 +932,17 @@ impl Stores {
                                 )
                             },
                         );
-                    },
-                );
-            });
-            if !account.connected {
-                ui.add_space(4.0);
-                muted(ui, lapinux_core::i18n::t("stores.library.empty"));
-            } else if count == 0 && library.fetched == 0 {
-                ui.add_space(4.0);
-                muted(
-                    ui,
-                    lapinux_core::i18n::t("stores.library.unread"),
-                );
-            }
-        });
+                    });
+                });
+                if !account.connected {
+                    ui.add_space(4.0);
+                    muted(ui, lapinux_core::i18n::t("stores.library.empty"));
+                } else if count == 0 && library.fetched == 0 {
+                    ui.add_space(4.0);
+                    muted(ui, lapinux_core::i18n::t("stores.library.unread"));
+                }
+            },
+        );
         None
     }
 
@@ -834,7 +956,10 @@ impl Stores {
         platform: Option<String>,
     ) -> Option<String> {
         if self.install.is_some() {
-            return Some(lapinux_core::i18n::t_args("stores.install.preparing", &[("store", store.label())]));
+            return Some(lapinux_core::i18n::t_args(
+                "stores.install.preparing",
+                &[("store", store.label())],
+            ));
         }
         let (tx, rx) = mpsc::channel();
         self.install = Some((store, rx));
@@ -855,17 +980,27 @@ impl Stores {
                     },
                     Duration::from_secs(120),
                 )
-                .map_err(|error| lapinux_core::i18n::t_args("stores.error", &[("store", store.label()), ("error", &error.to_string())]))
+                .map_err(|error| {
+                    lapinux_core::i18n::t_args(
+                        "stores.error",
+                        &[("store", store.label()), ("error", &error.to_string())],
+                    )
+                })
                 .and_then(|envelope| {
                     if envelope.ok {
-                        Ok(lapinux_core::i18n::t_args("stores.install.started", &[("platform", &label)]))
+                        Ok(lapinux_core::i18n::t_args(
+                            "stores.install.started",
+                            &[("platform", &label)],
+                        ))
                     } else {
                         Err(format!(
                             "{} : {}",
                             store.label(),
                             envelope
                                 .error
-                                .unwrap_or_else(|| lapinux_core::i18n::t("stores.install.refused").into())
+                                .unwrap_or_else(
+                                    || lapinux_core::i18n::t("stores.install.refused").into()
+                                )
                         ))
                     }
                 });
@@ -883,6 +1018,9 @@ pub(crate) fn platform_label(platform: &str) -> &str {
         "linux" => "Linux",
         "windows" => "Windows",
         "macos" => "macOS",
+        "android" => "Android",
+        "ios" => "iOS",
+        "mobile" => "Mobile",
         other => other,
     }
 }

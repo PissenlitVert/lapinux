@@ -15,11 +15,17 @@ fn main() {
         if let Some(family) = snapshot.family.as_ref() {
             println!("famille {:?} groupe {}", family.name, family.group_id);
             for member in &family.members {
-                println!("  {} {} jeux={}", member.steam_id, member.name, member.games);
+                println!(
+                    "  {} {} jeux={}",
+                    member.steam_id, member.name, member.games
+                );
             }
             done = family.members.iter().any(|member| member.games > 0);
         }
     }
     let last = social.snapshot();
-    println!("état {:?} erreur {:?} terminé={}", last.state, last.error, done);
+    println!(
+        "état {:?} erreur {:?} terminé={}",
+        last.state, last.error, done
+    );
 }

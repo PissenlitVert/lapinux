@@ -2,7 +2,10 @@
 
 fn main() {
     println!("registre : {:?}", lapinux_steam::native::steam_language());
-    println!("langue par défaut : {:?}", lapinux_steam::native::default_language());
+    println!(
+        "langue par défaut : {:?}",
+        lapinux_steam::native::default_language()
+    );
     println!(
         "libellé : {:?}",
         lapinux_steam::native::default_language_label()

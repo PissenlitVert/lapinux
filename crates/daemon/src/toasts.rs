@@ -106,9 +106,7 @@ impl Shared {
             command.arg("--toast-game").arg(&toast.game);
         }
         if let Some(percent) = toast.percent {
-            command
-                .arg("--toast-percent")
-                .arg(format!("{percent:.1}"));
+            command.arg("--toast-percent").arg(format!("{percent:.1}"));
         }
         if let Some(icon) = &toast.icon {
             command.arg("--toast-icon").arg(icon);
@@ -322,9 +320,7 @@ impl Shared {
                     .max_by_key(|item| item.unlock_time.unwrap_or(0))
             })
             .or_else(|| read.items.first())
-            .ok_or_else(|| {
-                lapinux_core::Error::Other("ce jeu ne publie aucun succès".into())
-            })?;
+            .ok_or_else(|| lapinux_core::Error::Other("ce jeu ne publie aucun succès".into()))?;
         let game = self.toast_game_name(appid);
         let toast = AchievementToast {
             title: chosen.name.clone(),

@@ -11,13 +11,13 @@
 //! présence est donc toujours le nom de l'application dont on tient
 //! l'identifiant, jamais un texte libre.
 //!
-//! En partie et sur une fiche, Lapinux se présente donc sous l'application
-//! Discord officielle du jeu, trouvée dans le catalogue détectable (voir
-//! [`super::discord_apps`]) : le titre est le jeu. Un jeu absent du catalogue
-//! reste sans présence en jeu. Les pages de l'application, elles, se publient
-//! sous l'application Lapinux : c'est la seule façon de faire avec l'API
-//! Discord, aucun client tiers ne pouvant renommer une application à la
-//! volée.
+//! En partie et sur une fiche, Lapinux se présente sous l'application Discord
+//! officielle du jeu, trouvée dans le catalogue détectable (voir
+//! [`super::discord_apps`]) : le titre est alors le jeu. Un jeu absent du
+//! catalogue se présente sous l'application Lapinux, avec son nom en tête de
+//! la première ligne : Discord ne permet pas de renommer une application à la
+//! volée, mais la présence reste publiée. Les pages de l'application, elles,
+//! se publient aussi sous Lapinux.
 
 use lapinux_core::config::DiscordConfig;
 
@@ -115,9 +115,7 @@ impl Presence {
     /// Ouvre le socket et se présente. `None` quand Discord ne tourne pas.
     fn connect(client_id: &str) -> Option<Self> {
         let mut stream = connect_socket()?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .ok()?;
@@ -235,10 +233,9 @@ pub fn activity(
             // La cadence du moment, et la moyenne quand elle dit autre chose :
             // une chute passagère ne se lit pas dans une seule mesure.
             let details = match session.fps.filter(|stats| stats.current > 0) {
-                Some(stats) if stats.avg > 0 && stats.avg != stats.current => format!(
-                    "En jeu · {} i/s · moy. {} i/s",
-                    stats.current, stats.avg
-                ),
+                Some(stats) if stats.avg > 0 && stats.avg != stats.current => {
+                    format!("En jeu · {} i/s · moy. {} i/s", stats.current, stats.avg)
+                }
                 Some(stats) => format!("En jeu · {} i/s", stats.current),
                 None => "En jeu".to_string(),
             };
@@ -306,10 +303,7 @@ pub fn activity(
                 parts.push(lapinux_core::util::format_bytes(job.downloaded));
             }
             if speed_bps > 0 {
-                parts.push(format!(
-                    "{}/s",
-                    lapinux_core::util::format_bytes(speed_bps)
-                ));
+                parts.push(format!("{}/s", lapinux_core::util::format_bytes(speed_bps)));
             }
             parts.push(APP_MENTION.to_string());
             let state = parts.join(" · ");
@@ -404,6 +398,26 @@ pub fn activity(
         return Some(activity);
     }
     None
+}
+
+/// Nom du jeu quand l'activité se publie sous l'application Lapinux : le
+/// titre Discord est alors « Lapinux », et le nom du jeu doit rester lisible
+/// dans la première ligne. Les jeux reconnus gardent leur application et
+/// n'ont donc pas besoin de ce préfixe.
+fn prefix_game_name(activity: &mut serde_json::Value, name: &str) {
+    let name = clamp(name);
+    if name.is_empty() {
+        return;
+    }
+    let details = activity
+        .get("details")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    activity["details"] = serde_json::Value::String(clamp(&if details.is_empty() {
+        name
+    } else {
+        format!("{name} · {details}")
+    }));
 }
 
 /// Application sous laquelle publier en partie : celle du jeu.
@@ -619,18 +633,14 @@ pub fn run(shared: Arc<super::Shared>) {
             .map(|view| view.clone())
             .unwrap_or_default();
         let session = shared.session_info();
-        let job = shared
-            .jobs
-            .lock()
-            .ok()
-            .and_then(|jobs| {
-                jobs.iter()
-                    .find(|job| job.state == lapinux_core::model::JobState::Running)
-                    .cloned()
-            });
+        let job = shared.jobs.lock().ok().and_then(|jobs| {
+            jobs.iter()
+                .find(|job| job.state == lapinux_core::model::JobState::Running)
+                .cloned()
+        });
         let now = lapinux_core::util::now_unix();
         let speed = download_speed(&mut download_sample, job.as_ref(), now);
-        let activity = activity(
+        let mut activity = activity(
             &config,
             &viewing,
             session.as_ref(),
@@ -639,13 +649,15 @@ pub fn run(shared: Arc<super::Shared>) {
             now,
         );
         // Le titre d'une activité Discord est le nom de l'application qui la
-        // publie. En partie, c'est donc le jeu ou rien : jamais « Lapinux » à
-        // la place du jeu. Un téléchargement ou une page, actions de
-        // l'application, gardent son nom quand le jeu n'est pas reconnu.
+        // publie. En partie, Lapinux utilise l'application du jeu quand il la
+        // connaît ; sinon il publie sous la sienne et met le nom du jeu dans
+        // la première ligne. Un téléchargement ou une page gardent aussi son
+        // nom.
         let application = if config.show_game && session.is_some() {
             session
                 .as_ref()
                 .and_then(|session| session_application(&shared, session))
+                .or_else(client_id)
         } else if config.show_downloads && job.is_some() {
             job.as_ref()
                 .and_then(|job| job_application(&shared, job))
@@ -666,6 +678,14 @@ pub fn run(shared: Arc<super::Shared>) {
             idle(&shared, Duration::from_secs(5));
             continue;
         };
+        if config.show_game
+            && session.is_some()
+            && client_id().as_deref() == Some(application.as_str())
+        {
+            if let (Some(activity), Some(session)) = (activity.as_mut(), session.as_ref()) {
+                prefix_game_name(activity, &session.name);
+            }
+        }
         if client.is_some() && connected.as_deref() != Some(application.as_str()) {
             if let Some(client) = client.as_mut() {
                 client.clear();
@@ -739,7 +759,6 @@ mod tests {
             "started": 1_700_000_000,
             "proton": "GE-Proton",
             "fps_cap": 165,
-            "mangohud": true,
             "overlay_open": false,
             "input_profile": "defaut",
             "log_path": "/tmp/session.log",
@@ -794,6 +813,17 @@ mod tests {
         assert_eq!(assets["large_image"], "https://cdn.example/cover.jpg");
         assert_eq!(assets["large_text"], "MOTORSLICE");
         assert!(assets.get("small_image").is_none());
+    }
+
+    #[test]
+    fn a_game_outside_discords_catalog_keeps_its_name_under_lapinux() {
+        let mut value = activity(&CONFIG, &Viewing::default(), Some(&session()), None, 0, NOW)
+            .expect("activité attendue");
+        prefix_game_name(&mut value, "LIMINAL STATE");
+        assert_eq!(
+            value["details"],
+            "LIMINAL STATE · En jeu · 158 i/s · moy. 78 i/s"
+        );
     }
 
     #[test]

@@ -176,7 +176,11 @@ impl Client {
     }
 
     fn replace_daemon(&self) -> bool {
-        let _ = ipc::send_request_timeout(&self.socket, &Req::Shutdown, Duration::from_secs(2));
+        // Les anciennes versions ne comprennent pas cette requête et ne sont
+        // donc jamais arrêtées par un client qui ne peut vérifier leur sécurité.
+        if !matches!(ipc::send_request_timeout(&self.socket, &Req::ShutdownIfIdle, Duration::from_secs(2)), Ok(response) if response.ok) {
+            return false;
+        }
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline && self.daemon_alive() {
             std::thread::sleep(Duration::from_millis(50));
@@ -340,10 +344,7 @@ mod tests {
             stamp: 42,
             ..Default::default()
         });
-        assert_eq!(
-            fresh.data.get("stamp").and_then(|v| v.as_u64()),
-            Some(42)
-        );
+        assert_eq!(fresh.data.get("stamp").and_then(|v| v.as_u64()), Some(42));
     }
 
     #[test]
@@ -355,6 +356,25 @@ mod tests {
         assert!(SpawnLock::acquire(&socket, Duration::from_millis(150)).is_none());
         drop(first);
         assert!(SpawnLock::acquire(&socket, Duration::from_millis(150)).is_some());
+    }
+
+    #[test]
+    fn restart_never_uses_unsafe_shutdown_on_an_old_daemon() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let payload = ipc::read_frame(&mut stream).unwrap();
+            let req: Req = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(req, Req::ShutdownIfIdle);
+            let body = serde_json::to_vec(&Envelope::err("unknown request")).unwrap();
+            ipc::write_frame(&mut stream, &body).unwrap();
+        });
+        let client = Client { socket, auto_spawn: false, log_file: dir.path().join("daemon.log") };
+        assert!(!client.restart_daemon());
+        server.join().unwrap();
     }
 
     #[test]

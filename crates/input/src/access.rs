@@ -37,13 +37,11 @@ pub fn audit() -> Vec<Access> {
         .into_iter()
         .map(|path| {
             let name = sysfs_name(&path);
-            let keyboard = has_code(&path, "key", codes::KEY_A)
-                && has_code(&path, "key", codes::KEY_TAB);
-            let gamepad = has_code(&path, "key", codes::BTN_SOUTH)
-                && has_code(&path, "abs", codes::ABS_X);
-            let error = std::fs::File::open(&path)
-                .err()
-                .map(|err| err.to_string());
+            let keyboard =
+                has_code(&path, "key", codes::KEY_A) && has_code(&path, "key", codes::KEY_TAB);
+            let gamepad =
+                has_code(&path, "key", codes::BTN_SOUTH) && has_code(&path, "abs", codes::ABS_X);
+            let error = std::fs::File::open(&path).err().map(|err| err.to_string());
             Access {
                 path,
                 name,

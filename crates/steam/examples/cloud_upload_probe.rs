@@ -57,7 +57,8 @@ fn main() {
             ..Default::default()
         };
         println!("dossier : {prefix} (changement {})", state.change_number);
-        let batch = match cloud::begin_batch(&client, appid, "lapinux-probe", &[name.clone()]).await {
+        let batch = match cloud::begin_batch(&client, appid, "lapinux-probe", &[name.clone()]).await
+        {
             Ok(batch) => batch,
             Err(error) => {
                 println!("lot refusé : {error}");

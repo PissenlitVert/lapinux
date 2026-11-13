@@ -9,6 +9,7 @@
 //! publique : ils peuvent changer sans préavis, et les erreurs le disent.
 
 use crate::achievements::Achievement;
+use lapinux_core::i18n::t;
 use crate::cloud::RemoteFile;
 use crate::common::{self, Error, InstallPlan, LoginLink, Result, Step};
 use lapinux_core::stores::{store_appid, Store, StoreDetails, StoreGame, StoreTokens};
@@ -77,10 +78,8 @@ pub fn refresh(tokens: &StoreTokens) -> Result<StoreTokens> {
 
 /// Appel du point d'échange de jetons.
 fn token_request(form: &[(&str, &str)]) -> Result<Value> {
-    let mut query: Vec<(&str, &str)> = vec![
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
-    ];
+    let mut query: Vec<(&str, &str)> =
+        vec![("client_id", CLIENT_ID), ("client_secret", CLIENT_SECRET)];
     query.extend_from_slice(form);
     let url = format!(
         "{AUTH}/token?{}",
@@ -128,7 +127,10 @@ fn tokens_from(value: &Value) -> Result<StoreTokens> {
 
 /// Nom du compte GOG.
 pub fn account_label(tokens: &StoreTokens) -> Result<String> {
-    let value = common::get_json(&format!("{EMBED}/userData.json"), Some(&tokens.access_token))?;
+    let value = common::get_json(
+        &format!("{EMBED}/userData.json"),
+        Some(&tokens.access_token),
+    )?;
     if let Some(name) = value
         .get("username")
         .and_then(Value::as_str)
@@ -144,7 +146,10 @@ pub fn account_label(tokens: &StoreTokens) -> Result<String> {
 
 /// Bibliothèque : les identifiants possédés, puis leurs fiches produit.
 pub fn library(tokens: &StoreTokens) -> Result<Vec<StoreGame>> {
-    let owned = common::get_json(&format!("{EMBED}/user/data/games"), Some(&tokens.access_token))?;
+    let owned = common::get_json(
+        &format!("{EMBED}/user/data/games"),
+        Some(&tokens.access_token),
+    )?;
     let ids: Vec<u64> = owned
         .get("owned")
         .and_then(Value::as_array)
@@ -154,9 +159,7 @@ pub fn library(tokens: &StoreTokens) -> Result<Vec<StoreGame>> {
                 .filter_map(|item| match item {
                     Value::Number(number) => number.as_u64(),
                     Value::String(text) => text.parse().ok(),
-                    Value::Object(object) => object
-                        .get("id")
-                        .and_then(Value::as_u64),
+                    Value::Object(object) => object.get("id").and_then(Value::as_u64),
                     _ => None,
                 })
                 .collect()
@@ -243,7 +246,11 @@ fn galaxy_facts(id: u64) -> (Option<String>, Vec<String>, Vec<String>) {
 /// Une fiche produit GOG, telle que la bibliothèque l'affiche.
 fn store_game(product: &Value) -> Option<StoreGame> {
     let id = product.get("id").and_then(Value::as_u64)?;
-    let name = product.get("title").and_then(Value::as_str)?.trim().to_string();
+    let name = product
+        .get("title")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
     if name.is_empty() {
         return None;
     }
@@ -289,6 +296,8 @@ fn store_game(product: &Value) -> Option<StoreGame> {
         name,
         cover,
         platforms,
+        mobile: false,
+        mobile_platforms: Vec::new(),
         namespace: String::new(),
         catalog_item: String::new(),
         size: None,
@@ -298,7 +307,7 @@ fn store_game(product: &Value) -> Option<StoreGame> {
         // rapporte déjà la jaquette.
         publishers: Vec::new(),
         developers: Vec::new(),
-            dlc: Vec::new(),
+        dlc: Vec::new(),
     })
 }
 
@@ -473,12 +482,14 @@ pub fn cloud_list(
     };
     let mut files = Vec::new();
     let Some(entries) = value.as_array() else {
-        return Ok(files);
+        return Err(Error::Parse("réponse de sauvegardes GOG incomplète".into()));
     };
     for entry in entries {
-        let Some(full_name) = entry.get("name").and_then(Value::as_str) else {
-            continue;
-        };
+        let full_name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| Error::Parse("nom de sauvegarde GOG manquant".into()))?;
         let relative = strip_dir(full_name, dir_name);
         files.push(RemoteFile {
             name: relative,
@@ -511,6 +522,22 @@ pub fn cloud_download(
     file: &RemoteFile,
     dest: &Path,
 ) -> Result<u64> {
+    let bytes = cloud_read(tokens, store_id, platform, dir_name, file)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(dest, &bytes)?;
+    Ok(bytes.len() as u64)
+}
+
+/// Lit une sauvegarde sans modifier le dossier local du jeu.
+pub fn cloud_read(
+    tokens: &StoreTokens,
+    store_id: &str,
+    platform: &str,
+    dir_name: &str,
+    file: &RemoteFile,
+) -> Result<Vec<u8>> {
     let (client_id, access, user_id) = cloud_session(tokens, store_id, platform)?;
     let full = if file.full_name.trim().is_empty() {
         join_dir(dir_name, &file.name)
@@ -521,16 +548,11 @@ pub fn cloud_download(
         "{CLOUD}/v1/{user_id}/{client_id}/{}",
         percent_encode_path(&full)
     );
-    let bytes = crate::cloud::get_bytes(
+    crate::cloud::get_save_bytes(
         &url,
         Some(&access),
         &[("User-Agent", SAVES_UA), ("Accept", "application/json")],
-    )?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(dest, &bytes)?;
-    Ok(bytes.len() as u64)
+    )
 }
 
 /// Envoie un fichier local dans le cloud du jeu.
@@ -544,7 +566,11 @@ pub fn cloud_upload(
     modified: i64,
 ) -> Result<u64> {
     let (client_id, access, user_id) = cloud_session(tokens, store_id, platform)?;
-    let full = join_dir(dir_name, &file.name);
+    let full = if file.full_name.trim().is_empty() {
+        join_dir(dir_name, &file.name)
+    } else {
+        file.full_name.clone()
+    };
     let url = format!(
         "{CLOUD}/v1/{user_id}/{client_id}/{}",
         percent_encode_path(&full)
@@ -641,9 +667,7 @@ pub fn install_plan(tokens: &StoreTokens, store_id: &str, platform: &str) -> Res
                         .map(str::to_string)
                         .or_else(|| {
                             let file_id = file.get("id").and_then(Value::as_str)?;
-                            Some(format!(
-                                "{API}/products/{id}/downlink/installer/{file_id}"
-                            ))
+                            Some(format!("{API}/products/{id}/downlink/installer/{file_id}"))
                         })?;
                     Some((link, size))
                 })
@@ -741,7 +765,9 @@ pub fn install(
             let link = value
                 .get("downlink")
                 .and_then(Value::as_str)
-                .ok_or_else(|| Error::Parse("GOG n'a pas donné d'adresse de téléchargement".into()))?;
+                .ok_or_else(|| {
+                    Error::Parse(t("downloads.store_no_download_url").into())
+                })?;
             link.to_string()
         } else {
             url.clone()
@@ -764,7 +790,7 @@ pub fn install(
         };
         let (link, path) = resolved
             .get(file)
-            .ok_or_else(|| Error::Other("installeur GOG non résolu".into()))?;
+            .ok_or_else(|| Error::Other(t("downloads.store_installer_unresolved").into()))?;
         let done = common::download(link, None, path, *size, &mut |received, announced| {
             progress(completed + received, announced.max(total))
         })?;
@@ -790,8 +816,8 @@ pub fn install(
                 common::run_innoextract(&path, dest)?;
                 break;
             }
-            Step::Unzip { file } => {
-                common::unzip(&cache.join(file), dest)?;
+            Step::Extract { file } => {
+                common::extract_archive(&cache.join(file), dest)?;
                 break;
             }
             _ => {}
@@ -955,6 +981,11 @@ pub fn details(tokens: &StoreTokens, product_id: &str, language: &str) -> Result
     // cas, on reprend la bande-annonce Steam du même jeu.
     let mut trailer = String::new();
     let mut trailer_poster = String::new();
+    let mut youtube_trailer = expanded
+        .as_ref()
+        .and_then(|value| value.get("videos"))
+        .and_then(Value::as_array)
+        .and_then(|videos| youtube_video(videos));
     if let Some(videos) = expanded
         .as_ref()
         .and_then(|value| value.get("videos"))
@@ -964,6 +995,12 @@ pub fn details(tokens: &StoreTokens, product_id: &str, language: &str) -> Result
             trailer = url;
             trailer_poster = poster;
         }
+    }
+    if youtube_trailer.is_none() {
+        youtube_trailer = embedded
+            .get("videos")
+            .and_then(Value::as_array)
+            .and_then(|videos| youtube_video(videos));
     }
     let mut news = expanded
         .as_ref()
@@ -990,6 +1027,15 @@ pub fn details(tokens: &StoreTokens, product_id: &str, language: &str) -> Result
             trailer_poster = steam.trailer_poster.clone();
         }
     }
+    // GOG publie le plus souvent une page YouTube, que GStreamer ne lit pas
+    // directement. La fiche l'ouvre dans la fenêtre web de l'application :
+    // sans ce repli, le bouton de bande-annonce manquait pour ces jeux.
+    if trailer.is_empty() {
+        if let Some((url, poster)) = youtube_trailer {
+            trailer = url;
+            trailer_poster = poster;
+        }
+    }
     // GOG publie la liste des fonctions du jeu ; « Cloud saves » y figure
     // seulement pour les jeux qui l'utilisent.
     let cloud = embedded
@@ -1004,8 +1050,12 @@ pub fn details(tokens: &StoreTokens, product_id: &str, language: &str) -> Result
                     .unwrap_or(false)
             })
         });
+    let (icon, capsule, cover) = details_art(&value);
     Ok(StoreDetails {
         store: Store::Gog,
+        icon,
+        capsule,
+        cover,
         summary,
         description,
         trailer,
@@ -1034,6 +1084,31 @@ pub fn details(tokens: &StoreTokens, product_id: &str, language: &str) -> Result
         cloud,
         fetched: lapinux_core::util::now_unix(),
     })
+}
+
+fn details_art(value: &Value) -> (String, String, String) {
+    let link = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| {
+                value
+                    .pointer(&format!("/_links/{key}/href"))?
+                    .as_str()
+                    .filter(|url| !url.trim().is_empty())
+            })
+            .map(|url| {
+                if url.starts_with("//") {
+                    format!("https:{url}")
+                } else {
+                    url.to_string()
+                }
+            })
+            .unwrap_or_default()
+    };
+    (
+        link(&["icon", "iconImage"]),
+        link(&["horizontalCover", "image", "backgroundImage"]),
+        link(&["boxArtImage"]),
+    )
 }
 
 /// Accroche courte : le début du `lead` GOG, sans balises ni figure, coupé
@@ -1103,6 +1178,53 @@ fn direct_video(videos: &[Value]) -> Option<(String, String)> {
     None
 }
 
+/// Bande-annonce YouTube de GOG, quand aucune vidéo directe n'est publiée.
+/// La fiche l'ouvre dans sa fenêtre web ; GStreamer ne décode pas une page
+/// YouTube comme il décode les flux HLS de Steam.
+fn youtube_video(videos: &[Value]) -> Option<(String, String)> {
+    for video in videos {
+        let Some(url) = video
+            .get("video_url")
+            .and_then(Value::as_str)
+            .or_else(|| video.pointer("/_links/self/href").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let Some(id) = youtube_id(url) else {
+            continue;
+        };
+        let poster = video
+            .get("thumbnail_url")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                video
+                    .pointer("/_links/thumbnail/href")
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default()
+            .to_string();
+        return Some((format!("https://www.youtube.com/watch?v={id}"), poster));
+    }
+    None
+}
+
+fn youtube_id(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    let start = [
+        "youtube.com/embed/",
+        "youtube-nocookie.com/embed/",
+        "youtu.be/",
+        "youtube.com/watch?v=",
+    ]
+    .iter()
+    .find_map(|marker| lower.find(marker).map(|at| at + marker.len()))?;
+    let id: String = url[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        .collect();
+    (!id.is_empty()).then_some(id)
+}
+
 /// Découpe le journal HTML en annonces : chaque titre (`<h2>` à `<h4>`) ouvre
 /// une note, le texte qui le suit la remplit. Les titres portent souvent la
 /// date en fin de ligne (« Patch 2.5 Oct 22nd 2026 ») : elle quitte le titre
@@ -1145,7 +1267,7 @@ fn changelog_news(changelog: &str, site: &str) -> Vec<lapinux_core::stores::Stor
             continue;
         }
         items.push(lapinux_core::stores::StoreNews {
-                body: String::new(),
+            body: String::new(),
             title: if title.trim().is_empty() {
                 "Note de mise à jour".to_string()
             } else {
@@ -1192,7 +1314,12 @@ fn split_date(heading: &str) -> (String, Option<i64>) {
     let day_pos = [month_pos.checked_sub(1), Some(month_pos + 1)]
         .into_iter()
         .flatten()
-        .find(|index| words.get(*index).and_then(|word| day_number(word)).is_some())
+        .find(|index| {
+            words
+                .get(*index)
+                .and_then(|word| day_number(word))
+                .is_some()
+        })
         .or_else(|| {
             words
                 .iter()
@@ -1201,7 +1328,8 @@ fn split_date(heading: &str) -> (String, Option<i64>) {
                 .map(|(index, _)| index)
         });
     let year_pos = words.iter().enumerate().find_map(|(index, word)| {
-        (index != month_pos && Some(index) != day_pos && year_number(word).is_some()).then_some(index)
+        (index != month_pos && Some(index) != day_pos && year_number(word).is_some())
+            .then_some(index)
     });
     let (Some(day_pos), Some(year_pos)) = (day_pos, year_pos) else {
         return (clean_title(heading), None);
@@ -1215,7 +1343,9 @@ fn split_date(heading: &str) -> (String, Option<i64>) {
     let rest: Vec<&str> = words
         .iter()
         .enumerate()
-        .filter(|(position, _)| *position != month_pos && *position != day_pos && *position != year_pos)
+        .filter(|(position, _)| {
+            *position != month_pos && *position != day_pos && *position != year_pos
+        })
         .map(|(_, word)| *word)
         .collect();
     (clean_title(&rest.join(" ")), Some(date))
@@ -1308,7 +1438,9 @@ mod tests {
         assert!(link.url.starts_with("https://auth.gog.com/auth?"));
         assert!(link.url.contains(CLIENT_ID));
         // L'adresse de retour est encodée, sinon les `?` se mélangent.
-        assert!(link.url.contains("redirect_uri=https%3A%2F%2Fembed.gog.com"));
+        assert!(link
+            .url
+            .contains("redirect_uri=https%3A%2F%2Fembed.gog.com"));
         assert!(link.hint.contains("on_login_success"));
     }
 
@@ -1325,7 +1457,10 @@ mod tests {
         assert_eq!(game.store, Store::Gog);
         assert_eq!(game.store_id, "1207658691");
         assert_eq!(game.appid, store_appid(Store::Gog, "1207658691"));
-        assert_eq!(game.platforms, vec!["windows".to_string(), "linux".to_string()]);
+        assert_eq!(
+            game.platforms,
+            vec!["windows".to_string(), "linux".to_string()]
+        );
         assert!(game.cover.ends_with("logo.png"));
         // Un produit sans titre ne fait pas une entrée.
         assert!(store_game(&json!({"id": 1})).is_none());
@@ -1346,10 +1481,40 @@ mod tests {
     }
 
     #[test]
+    fn details_art_keeps_gog_formats_and_normalizes_links() {
+        let value = json!({ "_links": {
+            "iconImage": { "href": "//example.test/icon" },
+            "horizontalCover": { "href": "https://example.test/horizontal" },
+            "boxArtImage": { "href": "//example.test/cover" }
+        } });
+        assert_eq!(
+            details_art(&value),
+            (
+                "https://example.test/icon".into(),
+                "https://example.test/horizontal".into(),
+                "https://example.test/cover".into()
+            )
+        );
+        // Sans capsule horizontale, le bandeau large de la fiche reste un
+        // visuel publié : la galerie ne doit pas annoncer un format absent.
+        let fallback = json!({ "_links": {
+            "backgroundImage": { "href": "https://example.test/background" }
+        } });
+        assert_eq!(details_art(&fallback).1, "https://example.test/background");
+        assert_eq!(
+            details_art(&json!({})),
+            (String::new(), String::new(), String::new())
+        );
+    }
+
+    #[test]
     fn cloud_names_keep_the_game_folder_out_of_the_way() {
         // GOG range chaque jeu sous un dossier ; la fiche n'affiche que le
         // chemin relatif.
-        assert_eq!(strip_dir("Songs of Silence/save1.sav", "Songs of Silence"), "save1.sav");
+        assert_eq!(
+            strip_dir("Songs of Silence/save1.sav", "Songs of Silence"),
+            "save1.sav"
+        );
         assert_eq!(
             strip_dir("autre/save1.sav", "Songs of Silence"),
             "autre/save1.sav"
@@ -1401,7 +1566,10 @@ mod tests {
         assert_eq!(title, "Internal Update");
         assert_eq!(date, common::civil_seconds(2019, 3, 21));
         // Un titre sans date reste entier.
-        assert_eq!(split_date("Correctifs divers"), ("Correctifs divers".into(), None));
+        assert_eq!(
+            split_date("Correctifs divers"),
+            ("Correctifs divers".into(), None)
+        );
         assert_eq!(
             split_date("Patch January 2023)"),
             ("Patch January 2023".into(), None)
@@ -1411,7 +1579,10 @@ mod tests {
     #[test]
     fn the_lead_becomes_a_short_summary_and_screenshots_keep_their_size() {
         let lead = "<p>Première phrase de présentation.</p><p>Deuxième paragraphe.</p>";
-        assert_eq!(brief(lead), "Première phrase de présentation. Deuxième paragraphe.");
+        assert_eq!(
+            brief(lead),
+            "Première phrase de présentation. Deuxième paragraphe."
+        );
         let image = json!({
             "formatter_template_url": "https://cdn.example/{formatter}.png"
         });
@@ -1420,5 +1591,20 @@ mod tests {
             Some("https://cdn.example/1600.png".into())
         );
     }
-}
 
+    #[test]
+    fn a_youtube_trailer_becomes_a_watch_link() {
+        let videos = vec![json!({
+            "video_url": "https://www.youtube.com/embed/dCoXXJbZWTw?wmode=opaque&rel=0",
+            "thumbnail_url": "https://img.youtube.com/vi/dCoXXJbZWTw/hqdefault.jpg"
+        })];
+        assert!(direct_video(&videos).is_none());
+        assert_eq!(
+            youtube_video(&videos),
+            Some((
+                "https://www.youtube.com/watch?v=dCoXXJbZWTw".into(),
+                "https://img.youtube.com/vi/dCoXXJbZWTw/hqdefault.jpg".into()
+            ))
+        );
+    }
+}

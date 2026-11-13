@@ -5,8 +5,7 @@
 use crate::{Result, Shared};
 use lapinux_core::ipc::Envelope;
 use lapinux_core::model::{SaveEvent, SaveEventKind, SessionInfo};
-use lapinux_input::Profile;
-use lapinux_perf::mangohud;
+use lapinux_input::{InputService, Profile};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -29,7 +28,7 @@ impl Shared {
         self: &Arc<Self>,
         mut info: SessionInfo,
         session: lapinux_perf::Session,
-        wants_mapping: bool,
+        input: Option<lapinux_input::InputService>,
     ) {
         // KWin lit son autorisation de capture au démarrage : le fichier doit
         // exister avant la première partie, pas seulement au premier clic sur
@@ -59,8 +58,7 @@ impl Shared {
         // pas en mode imbriqué. La scène garde donc ce placement, mais sans
         // voile à révéler.
         if info.scene {
-            if let Err(err) =
-                lapinux_input::shortcut::prepare_splash_reveal(&config.launch.output)
+            if let Err(err) = lapinux_input::shortcut::prepare_splash_reveal(&config.launch.output)
             {
                 tracing::warn!("scène : placement de GameScope ({err})");
             }
@@ -68,6 +66,9 @@ impl Shared {
         // Les panneaux restent en autohide jusqu'à la fin de la partie :
         // l'overlay n'a plus à les toucher à chaque ouverture.
         let panels = lapinux_input::panels::PanelGuard::hide(&self.paths.data_dir);
+        // La trace part avant la première image : même un plantage immédiat
+        // laisse de quoi arrêter ce groupe au démarrage suivant.
+        self.write_session_journal(&info, &session);
         if let Ok(mut guard) = self.session.lock() {
             *guard = Some(SessionState {
                 info: info.clone(),
@@ -75,36 +76,40 @@ impl Shared {
                 _panels: panels,
             });
         }
+        // Le compositeur démarre au-dessus de l'écran pour permettre
+        // « illimité » à chaud : sans cette pose immédiate, une limite basse
+        // resterait sans effet jusqu'à la première image du jeu. Le nouveau
+        // passage à la première image reste un filet si GameScope tarde.
+        self.apply_launch_fps_limit(&info);
         if let Some(path) = scene_exit {
             let shared = Arc::clone(self);
             let started = info.started;
-            std::thread::spawn(move || {
-                loop {
-                    if !shared
-                        .session_info()
-                        .is_some_and(|current| current.started == started)
-                    {
-                        let _ = std::fs::remove_file(&path);
-                        return;
-                    }
-                    if path.is_file() {
-                        let _ = std::fs::remove_file(&path);
-                        tracing::info!("session : jeu terminé dans la scène");
-                        shared.kill_overlay();
-                        shared.kill_perf_hud();
-                        shared.kill_record_hud();
-                        shared.stop_recording_on_exit();
-                        if let Ok(mut guard) = shared.session.lock() {
-                            if let Some(state) = guard.as_mut() {
-                                if state.info.started == started {
-                                    state.info.window_gone = true;
-                                }
+            let appid = info.appid;
+            std::thread::spawn(move || loop {
+                if !shared
+                    .session_info()
+                    .is_some_and(|current| current.started == started)
+                {
+                    let _ = std::fs::remove_file(&path);
+                    return;
+                }
+                if path.is_file() {
+                    let _ = std::fs::remove_file(&path);
+                    tracing::info!("session : jeu terminé dans la scène");
+                    shared.kill_overlay();
+                    shared.kill_perf_hud();
+                    shared.kill_record_hud();
+                    shared.stop_recording_on_exit(appid);
+                    if let Ok(mut guard) = shared.session.lock() {
+                        if let Some(state) = guard.as_mut() {
+                            if state.info.started == started {
+                                state.info.window_gone = true;
                             }
                         }
-                        return;
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    return;
                 }
+                std::thread::sleep(Duration::from_millis(100));
             });
         }
         // Un flux PipeWire peut rester muet d'une session précédente, alors
@@ -119,9 +124,12 @@ impl Shared {
             std::thread::spawn(move || {
                 for _ in 0..10 {
                     if let Some(info) = audio.session_info() {
-                        if crate::captures::ensure_game_audio(&crate::launch::descendants(
-                            info.pid,
-                        )) {
+                        let pids = crate::launch::descendants(info.pid);
+                        if crate::captures::ensure_game_audio(&pids) {
+                            // Le niveau choisi la dernière fois revient avec le
+                            // flux : PipeWire, lui, garde le volume de la
+                            // session précédente, pas celui du jeu.
+                            audio.apply_remembered_volume(info.appid, &pids);
                             break;
                         }
                     }
@@ -167,11 +175,8 @@ impl Shared {
             shared.watch_achievement_unlocks(watched_appid, watched_started)
         });
 
-        let wants_pad_hotkey = !config.overlay.pad_hotkey.trim().is_empty();
-        if wants_mapping {
-            self.start_input(&info.input_profile, true);
-        } else if wants_pad_hotkey {
-            self.start_input(&info.input_profile, false);
+        if let Some(service) = input {
+            self.attach_input(service);
         }
         if let Err(err) = lapinux_input::shortcut::register(&config.overlay.hotkey) {
             tracing::warn!("menu rapide : {err}");
@@ -260,13 +265,12 @@ impl Shared {
         // Au démarrage, un lanceur peut fermer sa fenêtre avant que le jeu
         // n'ouvre la sienne : on ne conclut pas pendant les dix premières
         // secondes. Un jeu qui se ferme vraiment passe ensuite par ce chemin.
-        if !info.render_started
-            && lapinux_core::util::now_unix() - info.started < 10
-        {
+        if !info.render_started && lapinux_core::util::now_unix() - info.started < 10 {
             return;
         }
         let shared = Arc::clone(self);
         let started = info.started;
+        let appid = info.appid;
         // Après la première image, une fermeture est presque toujours
         // définitive : la grâce courte rend l'écran de fin immédiat. Avant
         // elle, on garde de la marge pour la fenêtre de chargement qui cède
@@ -316,7 +320,7 @@ impl Shared {
             let _ = std::fs::write(shared.paths.end_request(), b"1");
             // La vidéo s'arrête avec la fenêtre du jeu ; elle est finalisée
             // après le réveil de l'interface, qui n'attend pas le mixage.
-            shared.stop_recording_on_exit();
+            shared.stop_recording_on_exit(appid);
         });
     }
 
@@ -347,18 +351,63 @@ impl Shared {
         // Un jeu gelé par l'overlay doit pouvoir lire son SIGTERM : sinon il
         // resterait figé jusqu'au SIGKILL de secours.
         self.set_game_frozen(false);
+        let _save_guard = self
+            .save_operation
+            .lock()
+            .map_err(|_| lapinux_core::Error::Other("verrou de sauvegarde indisponible".into()))?;
         let Some(state) = self.take_session() else {
-            return Ok(Envelope::ok(&serde_json::json!({ "message": "aucune session" })));
+            return Ok(Envelope::ok(
+                &serde_json::json!({ "message": "aucune session" }),
+            ));
         };
         if let Ok(mut session) = state.session.lock() {
             session.terminate();
         }
         self.end_session(&state);
-        Ok(Envelope::ok(&serde_json::json!({ "message": "session arrêtée" })))
+        Ok(Envelope::ok(
+            &serde_json::json!({ "message": "session arrêtée" }),
+        ))
     }
 
     fn take_session(&self) -> Option<SessionState> {
         self.session.lock().ok().and_then(|mut guard| guard.take())
+    }
+
+    /// Trace de la partie en cours, à côté des journaux du daemon.
+    fn session_journal(&self) -> std::path::PathBuf {
+        self.paths.log_dir.join(SESSION_JOURNAL)
+    }
+
+    /// Note sur disque la partie qui démarre : pid du daemon, racine de son
+    /// groupe de processus, appid et préfixe Proton. Un daemon tué laisse
+    /// GameScope et Wine tourner, sans personne pour les arrêter.
+    fn write_session_journal(&self, info: &SessionInfo, session: &lapinux_perf::Session) {
+        let journal = serde_json::json!({
+            "daemon_pid": std::process::id(),
+            "pid": session.pid,
+            "appid": session.appid,
+            "prefix": session
+                .compat_data()
+                .map(|path| path.to_string_lossy().into_owned()),
+            "started": info.started,
+        });
+        let _ = std::fs::create_dir_all(&self.paths.log_dir);
+        let path = self.session_journal();
+        let temp = path.with_extension("json.tmp");
+        if std::fs::write(&temp, journal.to_string()).is_ok() {
+            let _ = std::fs::rename(&temp, &path);
+        }
+    }
+
+    /// Retire la trace de la partie : un arrêt normal ne laisse rien à
+    /// reprendre.
+    fn clear_session_journal(&self) {
+        let _ = std::fs::remove_file(self.session_journal());
+    }
+
+    /// Reprend la main sur une partie laissée par un daemon mort.
+    pub(crate) fn recover_orphan_session(&self) {
+        recover_session_at(&self.paths.log_dir);
     }
 
     /// Sortie de session, quel que soit le chemin (arrêt demandé ou jeu terminé).
@@ -405,7 +454,12 @@ impl Shared {
                 let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
                 if length > offset && file.seek(SeekFrom::Start(offset)).is_ok() {
                     let mut chunk = String::new();
-                    if file.by_ref().take(length - offset).read_to_string(&mut chunk).is_ok() {
+                    if file
+                        .by_ref()
+                        .take(length - offset)
+                        .read_to_string(&mut chunk)
+                        .is_ok()
+                    {
                         text.push_str(&chunk);
                         offset = length;
                     }
@@ -432,9 +486,7 @@ impl Shared {
             }
             // `Created swapchain` est écrit par la couche WSI de gamescope au
             // premier rendu Vulkan du jeu.
-            if game_text.contains("Created swapchain")
-                || game_text.contains("Creating swapchain")
-            {
+            if game_text.contains("Created swapchain") || game_text.contains("Creating swapchain") {
                 self.mark_render_started(started_at);
                 return;
             }
@@ -451,8 +503,7 @@ impl Shared {
                                 info.started == started_at && !info.render_started
                             })
                         };
-                        match crate::frames::watch_first_frame(&display, &belongs, &alive, tx)
-                        {
+                        match crate::frames::watch_first_frame(&display, &belongs, &alive, tx) {
                             Ok(true) => shared.mark_render_started(started_at),
                             Ok(false) => {}
                             Err(err) => tracing::debug!("première image X11 : {err}"),
@@ -485,7 +536,11 @@ impl Shared {
     /// Tient les bornes de cadence de la session à jour pendant la partie.
     fn watch_fps(self: &Arc<Self>, stats_path: PathBuf, started: i64, fps_cap: u32) {
         let alive_owner = Arc::clone(self);
-        let alive = || alive_owner.session_info().is_some_and(|info| info.started == started);
+        let alive = || {
+            alive_owner
+                .session_info()
+                .is_some_and(|info| info.started == started)
+        };
         let report = |stats: lapinux_core::model::FpsStats, series: &[u32], from: i64, to: i64| {
             if let Ok(mut guard) = self.session.lock() {
                 if let Some(state) = guard.as_mut() {
@@ -498,18 +553,18 @@ impl Shared {
                 }
             }
         };
-        crate::fps::watch_stats(&stats_path, &alive, &report, fps_cap);
-    }
-
-    /// Taille de l'image du jeu pour placer le HUD : la résolution de
-    /// lancement, celle que GameScope compose.
-    fn screen_size(&self) -> (u32, u32) {
-        let config = self.config_snapshot();
-        if config.launch.width >= 320 && config.launch.height >= 240 {
-            (config.launch.width, config.launch.height)
-        } else {
-            (1920, 1080)
-        }
+        // La limite suit les réglages à chaud : chaque échantillon relit
+        // celle de la session au lieu de garder celle du lancement.
+        let cap_owner = Arc::clone(self);
+        let cap = move || {
+            cap_owner
+                .session
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|state| state.info.fps_cap))
+                .unwrap_or(fps_cap)
+        };
+        crate::fps::watch_stats(&stats_path, &alive, &report, &cap);
     }
 
     fn mark_render_started(self: &Arc<Self>, started_at: i64) {
@@ -521,6 +576,7 @@ impl Shared {
             let _ = shared.spawn_perf_hud();
             let _ = shared.spawn_record_hud();
         });
+        let mut scene_start = None;
         if let Ok(mut guard) = self.session.lock() {
             let Some(state) = guard.as_mut() else {
                 return;
@@ -533,6 +589,19 @@ impl Shared {
                 "écran d'attente : première image de {} présentée",
                 state.info.name
             );
+            scene_start = state
+                .session
+                .lock()
+                .ok()
+                .and_then(|session| session.scene_start_path.clone());
+        }
+        // La scène est un client de GameScope placé au-dessus du jeu : tant
+        // qu'elle reste visible, elle couvre l'image du jeu. Ce marqueur lui
+        // demande de s'effacer dès la première image réelle.
+        if let Some(path) = scene_start {
+            if let Err(err) = std::fs::write(&path, b"1") {
+                tracing::warn!("scène : marqueur de première image ({err})");
+            }
         }
         // Filet de sécurité : certains jeux n'annoncent aucune fenêtre à KWin.
         // La première image est alors le seul signal de départ pour
@@ -550,34 +619,35 @@ impl Shared {
     ///
     /// C'est le même chemin que le panneau Performances : `debug_set_fps_limit`
     /// agit sur le compositeur déjà lancé, sans dépendre du calcul de `-r` ni
-    /// de la façon dont GameScope divise sa cadence au démarrage.
+    /// de la façon dont GameScope divise sa cadence au démarrage. La valeur 0
+    /// est appliquée comme les autres : c'est elle qui coupe réellement le
+    /// limiteur quand on choisit « illimité ».
     fn apply_launch_fps_limit(self: &Arc<Self>, info: &SessionInfo) {
-        if !info.gamescope || info.fps_cap == 0 {
+        if !info.gamescope {
             return;
         }
-        let target = info.clone();
+        let started = info.started;
         let shared = Arc::clone(self);
         std::thread::spawn(move || {
             for attempt in 0..12 {
                 std::thread::sleep(Duration::from_millis(if attempt == 0 { 400 } else { 300 }));
-                let alive = shared
+                // Relire la session à chaque essai : un changement fait dans
+                // l'overlay pendant l'attente ne doit pas être écrasé par la
+                // valeur du lancement.
+                let Some(target) = shared
                     .session_info()
-                    .is_some_and(|current| current.started == target.started);
-                if !alive {
+                    .filter(|current| current.started == started && current.gamescope)
+                else {
                     return;
-                }
+                };
                 match set_gamescope_fps_limit(&target, target.fps_cap) {
                     Ok(()) => {
-                        tracing::info!(
-                            "limite FPS {} : appliquée au lancement",
-                            target.fps_cap
-                        );
+                        tracing::info!("limite FPS {} : appliquée au lancement", target.fps_cap);
                         return;
                     }
-                    Err(err) if attempt == 11 => tracing::warn!(
-                        "limite FPS {} au lancement : {err}",
-                        target.fps_cap
-                    ),
+                    Err(err) if attempt == 11 => {
+                        tracing::warn!("limite FPS {} au lancement : {err}", target.fps_cap)
+                    }
                     Err(_) => {}
                 }
             }
@@ -585,6 +655,11 @@ impl Shared {
     }
 
     fn end_session(self: &Arc<Self>, state: &SessionState) {
+        // Le fichier de contrôle de la partie n'a plus de lecteur : il ne
+        // doit pas rester dans le dossier des journaux.
+        if let Some(control) = state.info.afmf_control.as_ref() {
+            let _ = std::fs::remove_file(control);
+        }
         // Le jeu n'est plus en cours : l'état « en jeu » quitte Steam avant
         // les opérations de sauvegarde, qui peuvent prendre plusieurs secondes.
         self.set_steam_playing(None);
@@ -611,7 +686,9 @@ impl Shared {
         // le voile de fin ne soit posé. L'interface la révélera elle-même à la
         // fermeture de l'écran de fin.
         // La vidéo se ferme avec le jeu : le fichier est gardé tel quel.
-        self.stop_recording_on_exit();
+        self.stop_recording_on_exit(state.info.appid);
+        // La partie est finie : plus rien à reprendre au démarrage suivant.
+        self.clear_session_journal();
         lapinux_input::shortcut::unwatch_game_window();
         lapinux_input::shortcut::unregister();
         self.record_playtime(&state.info);
@@ -629,46 +706,36 @@ impl Shared {
                     state.info.appid
                 );
             } else if game.store == lapinux_core::stores::Store::Steam {
-                cloud_saves = self
-                    .cloud_before
-                    .lock()
-                    .ok()
-                    .and_then(|slot| {
-                        slot.as_ref()
-                            .filter(|(appid, _)| *appid == state.info.appid)
-                            .map(|(_, saves)| !saves.files.is_empty())
-                    })
-                    .unwrap_or(false);
                 match self.sync_cloud_up(&game, state.info.appid) {
-                Ok((files, bytes, diff, present)) => {
-                    cloud_saves |= present;
-                    if let Some(diff) = diff {
-                        if let Ok(mut slot) = self.cloud_last.lock() {
-                            *slot = Some((state.info.appid, diff));
+                    Ok((files, bytes, diff, present)) => {
+                        cloud_saves |= present;
+                        if let Some(diff) = diff {
+                            if let Ok(mut slot) = self.cloud_last.lock() {
+                                *slot = Some((state.info.appid, diff));
+                            }
                         }
-                    }
-                    if let Ok(mut cache) = self.game_reads.lock() {
-                        cache.forget("cloud", state.info.appid);
-                    }
-                    self.forget_remote_sheet("cloud", state.info.appid);
-                    if files > 0 {
-                        tracing::info!(
+                        if let Ok(mut cache) = self.game_reads.lock() {
+                            cache.forget("cloud", state.info.appid);
+                        }
+                        self.forget_remote_sheet("cloud", state.info.appid);
+                        if files > 0 {
+                            tracing::info!(
                             "cloud : {files} sauvegarde(s) envoyée(s) après la partie de {} ({bytes} octets)",
                             state.info.appid
                         );
+                        }
                     }
-                }
                     Err(error) => tracing::warn!(
                         "cloud : envoi après la partie de {} ({error})",
                         state.info.appid
                     ),
                 }
             } else if game.settings.save_dir.is_some() {
-                // Jeu de boutique : seul ce que la partie a modifié repart,
-                // vers le cloud de sa boutique et non vers Steam.
+                // Un cloud seulement présent ne prouve pas que les progrès
+                // locaux y sont entièrement synchronisés.
                 match self.store_cloud_push_auto(state.info.appid) {
-                    Ok((files, bytes, present)) => {
-                        cloud_saves |= present;
+                    Ok((files, bytes, synchronized)) => {
+                        cloud_saves |= synchronized;
                         if files > 0 {
                             tracing::info!(
                                 "cloud {} : {files} sauvegarde(s) envoyée(s) après la partie de {} ({bytes} octets)",
@@ -691,15 +758,16 @@ impl Shared {
         // demande une copie locale pour tous.
         if let Ok(Some(game)) = self.store.game(state.info.appid) {
             let config = self.config_snapshot();
-            if config.general.saves_auto
-                && config.general.saves_skip_cloud
-                && cloud_saves
-            {
+            let saves_auto = game.settings.saves_auto(config.general.saves_auto);
+            let skip_cloud = game
+                .settings
+                .saves_skip_cloud(config.general.saves_skip_cloud);
+            if saves_auto && skip_cloud && cloud_saves {
                 tracing::info!(
                     "sauvegardes de {} : déjà dans le cloud, copie locale ignorée",
                     state.info.name
                 );
-            } else if config.general.saves_auto {
+            } else if saves_auto {
                 match crate::saves::backup(&game, &self.paths, &config) {
                     Ok(Some(snapshot)) => {
                         // Le journal garde la copie automatique : la fiche
@@ -778,6 +846,10 @@ impl Shared {
 
     pub(crate) fn finish_session(self: &Arc<Self>) {
         self.set_game_frozen(false);
+        let Ok(_save_guard) = self.save_operation.lock() else {
+            tracing::error!("fin de session : verrou de sauvegarde indisponible");
+            return;
+        };
         if let Some(state) = self.take_session() {
             self.end_session(&state);
         }
@@ -829,6 +901,11 @@ impl Shared {
             // de parties, et le fichier garde une taille bornée.
             if sessions.len() > 200 {
                 let excess = sessions.len() - 200;
+                // Leur journal part avec elles : sans cela, les fichiers
+                // s'accumuleraient alors que plus aucune carte ne les montre.
+                for session in &sessions[..excess] {
+                    self.remove_session_log(&session.log);
+                }
                 sessions.drain(0..excess);
             }
             let _ = self.store.set_json("sessions", &sessions);
@@ -843,6 +920,99 @@ impl Shared {
             stats.launches += 1;
             stats.total_seconds += played;
             let _ = self.store.set_json("stats", &stats);
+        }
+    }
+
+    /// Style de HUD effectif pour un jeu : son HUD nommé s'il en a choisi un,
+    /// sinon le HUD actif des réglages. La configuration est relue à chaque
+    /// lancement et à chaque application à chaud.
+    fn hud_style_for(
+        &self,
+        appid: u32,
+        config: &lapinux_core::config::Config,
+    ) -> lapinux_core::hud::HudStyle {
+        let settings = self
+            .store
+            .game(appid)
+            .ok()
+            .flatten()
+            .map(|game| game.settings)
+            .unwrap_or_default();
+        let mut style = config.capture.hud_style_for(settings.hud_style.as_deref());
+        style.badge.enabled = settings.record_badge(config.capture.record_badge);
+        style
+    }
+
+    /// Visibilité de la plaque et du badge pour un jeu : un choix explicite
+    /// dans sa fiche prime, sinon les réglages de capture globaux décident.
+    fn hud_prefs_for(&self, appid: u32, config: &lapinux_core::config::Config) -> (bool, bool) {
+        let settings = self
+            .store
+            .game(appid)
+            .ok()
+            .flatten()
+            .map(|game| game.settings)
+            .unwrap_or_default();
+        (
+            settings.hud_on_screen(config.capture.hud_on_screen),
+            settings.record_badge(config.capture.record_badge),
+        )
+    }
+
+    /// Style effectif de la partie en cours et identifiant du HUD propre au
+    /// jeu, s'il y en a un. Les réglages à chaud modifient ce style-là sans
+    /// changer le HUD actif global.
+    fn session_hud_style(
+        &self,
+        config: &lapinux_core::config::Config,
+    ) -> (lapinux_core::hud::HudStyle, Option<String>) {
+        let settings = self.session_info().and_then(|info| {
+            self.store
+                .game(info.appid)
+                .ok()
+                .flatten()
+                .map(|game| game.settings)
+        });
+        let selection = settings
+            .as_ref()
+            .and_then(|settings| settings.hud_style.clone());
+        let mut style = config.capture.hud_style_for(selection.as_deref());
+        if let Some(settings) = settings {
+            style.badge.enabled = settings.record_badge(config.capture.record_badge);
+        }
+        (style, selection)
+    }
+
+    /// Enregistre un style modifié à chaud : HUD du jeu si la fiche en impose
+    /// un, sinon HUD actif global.
+    fn save_hot_hud_style(
+        &self,
+        config: &mut lapinux_core::config::Config,
+        style: lapinux_core::hud::HudStyle,
+        game_style: Option<&str>,
+    ) {
+        if game_style.is_some() {
+            config.capture.update_hud_style(style);
+        } else {
+            config.capture.set_active_hud_style(style);
+        }
+    }
+
+    /// Retient le choix fait à chaud pour le jeu en cours : la prochaine
+    /// session de ce jeu garde l'interrupteur, même si le réglage global
+    /// change entre-temps.
+    fn remember_session_hud(&self, plate: Option<bool>, badge: Option<bool>) {
+        let Some(info) = self.session_info() else {
+            return;
+        };
+        if let Ok(Some(mut game)) = self.store.game(info.appid) {
+            if let Some(value) = plate {
+                game.settings.hud_on_screen = Some(value);
+            }
+            if let Some(value) = badge {
+                game.settings.record_badge = Some(value);
+            }
+            let _ = self.store.save_game(&game);
         }
     }
 
@@ -861,6 +1031,7 @@ impl Shared {
         }
         let exe = overlay_exe()?;
         let config = self.config_snapshot();
+        let hud_style = self.hud_style_for(info.appid, &config);
         let mut command = Command::new(exe);
         command.arg("overlay");
         // La plaque de performance a son propre processus : le menu ne la
@@ -874,7 +1045,7 @@ impl Shared {
             .arg(&info.input_profile)
             .arg("--profiles")
             .arg(
-                lapinux_input::list_profiles(&self.paths.data_dir)
+                lapinux_input::list_profiles(&self.paths.manettes_dir())
                     .into_iter()
                     .map(|profile| profile.name)
                     .collect::<Vec<_>>()
@@ -885,31 +1056,13 @@ impl Shared {
             .arg("--width")
             .arg(config.launch.width.to_string())
             .arg("--height")
-            .arg(config.launch.height.to_string())
-            .arg("--perf-hud-scale")
-            .arg(config.capture.hud_scale.to_string())
-            .arg("--hud-engine")
-            // Le moteur affiché est celui de la session en cours, pas le
-            // réglage global : un jeu qui a choisi la plaque native ne doit
-            // pas annoncer MangoHud parce qu'un autre jeu l'utilise.
-            .arg(if info.mangohud { "mangohud" } else { "native" })
-            .arg("--hud")
-            .arg(if info.hud_preset.is_empty() {
-                "off"
-            } else {
-                info.hud_preset.as_str()
-            });
-        // Le profil peut rester enregistré quand MangoHud est coupé : le
-        // drapeau dit l'état réel, indépendamment du nom du profil.
-        if info.mangohud {
-            command.arg("--hud-on");
-        }
+            .arg(config.launch.height.to_string());
         // La plaque native est un autre processus, mais le panneau doit
         // annoncer son état réel : sans ce drapeau, l'interrupteur paraissait
         // coupé alors que la plaque était bien affichée depuis le lancement.
         // Le drapeau ne fait que refléter l'état : `hud_only` empêche ce
         // processus de redessiner la plaque par-dessus celle du HUD.
-        if config.capture.hud_on_screen && !info.mangohud {
+        if self.hud_prefs_for(info.appid, &config).0 {
             command.arg("--perf-hud");
         }
         // La manette passe par le service d'entrée, qui connaît déjà ses
@@ -919,42 +1072,17 @@ impl Shared {
             command.arg("--nav-fifo").arg(path);
         }
         command
-            .arg("--hud-position")
-            .arg(if info.hud_position.is_empty() {
-                "top-left"
-            } else {
-                info.hud_position.as_str()
-            });
-        command
-            .arg("--hud-layout")
-            .arg(if info.hud_layout.is_empty() {
-                "block"
-            } else {
-                info.hud_layout.as_str()
-            });
-        if info.hud_graph {
-            command.arg("--hud-graph");
-        }
-        if info.hud_cores {
-            command.arg("--hud-cores");
-        }
-        command
-            .arg("--record-badge-position")
-            .arg(&config.capture.record_badge_position)
-            .arg("--record-badge-scale")
-            .arg(config.capture.record_badge_scale.to_string());
-        if config.capture.record_badge {
-            command.arg("--record-badge");
-        }
+            .arg("--hud-style")
+            .arg(serde_json::to_string(&hud_style).unwrap_or_default())
+            .arg("--hud-styles")
+            .arg(serde_json::to_string(&config.capture.hud_custom).unwrap_or_default());
         command
             .arg("--appid")
             .arg(info.appid.to_string())
             .arg("--captures")
             .arg(config.capture.videos_dir());
         if !config.launch.output.trim().is_empty() {
-            command
-                .arg("--output")
-                .arg(config.launch.output.trim());
+            command.arg("--output").arg(config.launch.output.trim());
         }
         // Visuel de tête du panneau : la jaquette déjà en cache, sans réseau.
         let art = self.paths.art_dir();
@@ -962,7 +1090,7 @@ impl Shared {
         // La bannière large passe en premier : la petite capsule 231 px
         // pixeliserait une fois agrandie dans la carte de tête.
         let capsule = [
-            covers.join(format!("custom-{}.jpg", info.appid)),
+            self.paths.existing_custom_cover_path(info.appid),
             art.join(format!("sgdb-hero-{}.jpg", info.appid)),
             art.join(format!("hero-{}.jpg", info.appid)),
             art.join(format!("steam-capsule-{}.jpg", info.appid)),
@@ -1033,11 +1161,9 @@ impl Shared {
         let config = self.config_snapshot();
         // Ce processus ne dessine que la plaque de chiffres. Le badge
         // d'enregistrement a le sien (`spawn_record_hud`) : couper l'un ne
-        // touche pas l'autre. Un jeu qui a MangoHud ne reçoit jamais la plaque
-        // native en plus, même si l'interrupteur global est resté allumé.
-        // Le mode performance coupe aussi cette plaque, sans toucher aux
-        // réglages globaux.
-        if info.performance || !config.capture.hud_on_screen || info.mangohud {
+        // touche pas l'autre. Le mode performance coupe aussi cette plaque,
+        // sans toucher aux réglages globaux.
+        if info.performance || !self.hud_prefs_for(info.appid, &config).0 {
             return Ok(());
         }
         // La plaque ne doit apparaître qu'une fois le jeu réellement à
@@ -1055,11 +1181,10 @@ impl Shared {
             }
         }
         let exe = overlay_exe()?;
+        let hud_style = self.hud_style_for(info.appid, &config);
         let log = crate::logs::open_shared(&self.paths, "overlay.log", "plaque de performance")
             .map_err(lapinux_core::Error::Io)?;
-        // La plaque reprend les réglages du panneau Performances : profil,
-        // ancrage, disposition, courbe et barres par cœur. Ils arrivent aussi
-        // à chaud par la session, une fois la partie lancée.
+        // La plaque reprend le style complet du panneau Performances.
         let mut command = Command::new(exe);
         command.arg("overlay").arg("--hud-only").arg("--perf-hud");
         command
@@ -1071,36 +1196,12 @@ impl Shared {
             .arg(config.launch.width.to_string())
             .arg("--height")
             .arg(config.launch.height.to_string())
-            .arg("--perf-hud-scale")
-            .arg(config.capture.hud_scale.to_string())
-            .arg("--hud")
-            .arg(if info.hud_preset.is_empty() {
-                "essential"
-            } else {
-                info.hud_preset.as_str()
-            })
-            .arg("--hud-position")
-            .arg(if info.hud_position.is_empty() {
-                "top-left"
-            } else {
-                info.hud_position.as_str()
-            })
-            .arg("--hud-layout")
-            .arg(if info.hud_layout.is_empty() {
-                "block"
-            } else {
-                info.hud_layout.as_str()
-            })
             .arg("--appid")
-            .arg(info.appid.to_string());
+            .arg(info.appid.to_string())
+            .arg("--hud-style")
+            .arg(serde_json::to_string(&hud_style).unwrap_or_default());
         if let Some(output) = hud_output(&info, &config.launch.output) {
             command.arg("--output").arg(output);
-        }
-        if info.hud_graph {
-            command.arg("--hud-graph");
-        }
-        if info.hud_cores {
-            command.arg("--hud-cores");
         }
         let child = command
             .stdin(std::process::Stdio::null())
@@ -1115,6 +1216,20 @@ impl Shared {
         Ok(())
     }
 
+    /// Recharge les deux surfaces du HUD après un changement fait dans les
+    /// réglages, sans redémarrer le jeu. Les processus ne sont recréés que si
+    /// une partie est en cours : hors jeu, le prochain lancement lira la
+    /// configuration enregistrée.
+    pub(crate) fn reload_hud_surfaces(self: &Arc<Self>) {
+        if self.session_info().is_none() {
+            return;
+        }
+        self.kill_perf_hud();
+        self.kill_record_hud();
+        let _ = self.spawn_perf_hud();
+        let _ = self.spawn_record_hud();
+    }
+
     /// Badge d'enregistrement : sa propre surface, son propre processus. Il
     /// ne partage ni la vie ni les réglages de la plaque de performance.
     fn spawn_record_hud(self: &Arc<Self>) -> Result<()> {
@@ -1122,7 +1237,7 @@ impl Shared {
             return Ok(());
         };
         let config = self.config_snapshot();
-        if !config.capture.record_badge {
+        if !self.hud_prefs_for(info.appid, &config).1 {
             return Ok(());
         }
         if !info.render_started || (!info.gamescope && !info.window_shown) {
@@ -1136,6 +1251,7 @@ impl Shared {
             }
         }
         let exe = overlay_exe()?;
+        let hud_style = self.hud_style_for(info.appid, &config);
         let log = crate::logs::open_shared(&self.paths, "overlay.log", "badge d'enregistrement")
             .map_err(lapinux_core::Error::Io)?;
         let mut command = Command::new(exe);
@@ -1143,10 +1259,6 @@ impl Shared {
             .arg("overlay")
             .arg("--hud-only")
             .arg("--record-badge")
-            .arg("--record-badge-position")
-            .arg(&config.capture.record_badge_position)
-            .arg("--record-badge-scale")
-            .arg(config.capture.record_badge_scale.to_string())
             .arg("--game")
             .arg(&info.name)
             .arg("--width")
@@ -1154,7 +1266,9 @@ impl Shared {
             .arg("--height")
             .arg(config.launch.height.to_string())
             .arg("--appid")
-            .arg(info.appid.to_string());
+            .arg(info.appid.to_string())
+            .arg("--hud-style")
+            .arg(serde_json::to_string(&hud_style).unwrap_or_default());
         if let Some(output) = hud_output(&info, &config.launch.output) {
             command.arg("--output").arg(output);
         }
@@ -1352,9 +1466,10 @@ impl Shared {
 
     pub fn toggle_overlay(self: &Arc<Self>) -> Result<Envelope> {
         let running = {
-            let mut guard = self.overlay.lock().map_err(|_| {
-                lapinux_core::Error::Other("verrou overlay indisponible".into())
-            })?;
+            let mut guard = self
+                .overlay
+                .lock()
+                .map_err(|_| lapinux_core::Error::Other("verrou overlay indisponible".into()))?;
             match guard.as_mut() {
                 Some(child) => match child.try_wait() {
                     Ok(None) => true,
@@ -1375,21 +1490,74 @@ impl Shared {
         }
     }
 
-    fn start_input(self: &Arc<Self>, profile_name: &str, remap: bool) {
+    fn start_input(self: &Arc<Self>, appid: u32, profile_name: &str, remap: bool) {
+        if let Some(service) = self.prepare_input(appid, profile_name, remap) {
+            self.attach_input(service);
+        }
+    }
+
+    /// Prépare le service d'entrée sans le rattacher à une session. Le pad
+    /// virtuel doit exister avant le jeu : avec les sources physiques masquées,
+    /// un jeu qui n'ajoute pas les manettes à chaud ne verrait sinon aucune
+    /// manette pendant toute la partie.
+    pub(crate) fn prepare_input(
+        &self,
+        appid: u32,
+        profile_name: &str,
+        remap: bool,
+    ) -> Option<InputService> {
         let config = self.config_snapshot();
-        let mut profile = lapinux_input::load_profile(&self.paths.data_dir, profile_name)
-            .unwrap_or_default();
+        // La sélection de l'onglet Steam Input est la source prioritaire : le
+        // profil Steam actif est converti en mappings Lapinux pour un lancement
+        // direct. Le TOML reste le repli quand aucun profil Steam n'est actif.
+        let mut profile = self
+            .active_steam_input_profile(appid)
+            .and_then(|path| {
+                let mapped = lapinux_steam::steam_mapping::load(&path);
+                if mapped.is_some() {
+                    tracing::info!(
+                        "Steam Input : profil {} utilisé sans client Steam",
+                        path.display()
+                    );
+                } else {
+                    tracing::warn!(
+                        "Steam Input : profil {} illisible, repli sur {profile_name}",
+                        path.display()
+                    );
+                }
+                mapped
+            })
+            .unwrap_or_else(|| {
+                lapinux_input::load_profile(&self.paths.data_dir, profile_name).unwrap_or_default()
+            });
         profile.deadzone = config.input.deadzone;
         profile.curve = config.input.stick_curve;
         profile.hotkey_chord = split_chord(&config.overlay.pad_hotkey);
+        let grab_devices = self
+            .store
+            .game(appid)
+            .ok()
+            .flatten()
+            .map(|game| game.settings.grab_devices(config.input.grab_devices))
+            .unwrap_or(config.input.grab_devices);
         let started = if remap {
-            lapinux_input::InputService::start(profile, config.input.grab_devices)
+            lapinux_input::InputService::start(profile, grab_devices)
         } else {
             lapinux_input::InputService::start_hotkeys(profile)
         };
-        let Ok(mut service) = started else {
-            return;
-        };
+        match started {
+            Ok(service) => {
+                tracing::info!("entrée : service prêt avant le lancement");
+                Some(service)
+            }
+            Err(err) => {
+                tracing::warn!("entrée : service non démarré ({err})");
+                None
+            }
+        }
+    }
+
+    fn attach_input(self: &Arc<Self>, mut service: InputService) {
         // Le service vit avec la session : le thread s'arrête quand elle se termine
         // et libère immédiatement le grab des manettes.
         let shared = Arc::clone(self);
@@ -1402,6 +1570,9 @@ impl Shared {
                     Ok(lapinux_input::InputMsg::Nav(nav)) => {
                         shared.send_overlay_nav(nav);
                     }
+                    Ok(lapinux_input::InputMsg::Error(error)) => {
+                        tracing::warn!("entrée : {error}");
+                    }
                     Ok(_) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if shared.session_info().is_none() {
@@ -1413,45 +1584,6 @@ impl Shared {
             }
             service.stop();
         });
-    }
-
-    /// Masque ou remontre le HUD du jeu en réécrivant sa configuration
-    /// MangoHud puis en la faisant recharger.
-    ///
-    /// `mangohudctl` ne joint pas toujours un HUD lancé dans un bac à sable :
-    /// ce fichier-ci est celui que MangoHud relit à chaud, et c'est donc le
-    /// seul chemin fiable pour retirer le HUD de la vidéo.
-    pub(crate) fn set_game_hud(&self, visible: bool) -> bool {
-        let Some(info) = self.session_info() else {
-            return false;
-        };
-        let profile = if info.hud_preset.trim().is_empty() {
-            "full".to_string()
-        } else {
-            info.hud_preset.clone()
-        };
-        let mut settings = mangohud::preset_settings_at(
-            &profile,
-            Some(info.fps_cap),
-            &info.hud_position,
-        );
-        settings.enabled = visible && info.mangohud;
-        settings.horizontal = layout_is_inline(&info.hud_layout);
-        settings.frame_timing = info.hud_graph;
-        settings.cpu_cores = info.hud_cores;
-        settings.screen = Some(self.screen_size());
-        if mangohud::write_config(&self.paths.config_dir, info.appid, &settings).is_err() {
-            return false;
-        }
-        if let Some(ctl) = lapinux_core::paths::which("mangohudctl") {
-            let _ = Command::new(ctl)
-                .args(["set", "reload_config", "true"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-        true
     }
 
     /// Relit ou applique le volume du flux audio de la partie en cours.
@@ -1473,56 +1605,27 @@ impl Shared {
         }
     }
 
+    /// Réapplique le volume retenu pour ce jeu dès que son flux existe.
+    /// Appelé une fois par partie, juste après la levée de sourdine : un jeu
+    /// relancé repart au niveau choisi au lieu du volume laissé par PipeWire.
+    pub(crate) fn apply_remembered_volume(self: &Arc<Self>, appid: u32, pids: &[u32]) {
+        let saved = self
+            .store
+            .game(appid)
+            .ok()
+            .flatten()
+            .and_then(|game| game.settings.volume);
+        let Some(saved) = saved else {
+            return;
+        };
+        match crate::captures::set_game_volume(pids, saved) {
+            Ok(value) => tracing::info!("volume du jeu restauré : {:.0} %", value * 100.0),
+            Err(error) => tracing::debug!("volume du jeu non restauré : {error}"),
+        }
+    }
+
     pub fn overlay_action(self: &Arc<Self>, action: &str) -> Result<Envelope> {
         let mut message = String::new();
-        // Le moteur du HUD se choisit depuis Performances. La plaque native
-        // peut être relancée tout de suite ; MangoHud, lui, est injecté au
-        // lancement du jeu et attend la partie suivante.
-        if let Some(engine) = action.strip_prefix("hud_engine:") {
-            let mangohud = engine.trim() == "mangohud";
-            let appid = self.session_info().map(|state| state.appid);
-            let mut config = self.config_snapshot();
-            config.capture.hud_on_screen = !mangohud;
-            config.launch.mangohud = mangohud;
-            let _ = self.save_config(config);
-            if let Some(appid) = appid {
-                if let Ok(Some(mut game)) = self.store.game(appid) {
-                    // Le choix vaut aussi pour la prochaine partie : sans ce
-                    // drapeau, un ancien réglage MangoHud du jeu reprenait le
-                    // dessus sur le moteur natif choisi ici.
-                    game.settings.mangohud = Some(mangohud);
-                    let _ = self.store.save_game(&game);
-                }
-            }
-            if mangohud {
-                // La plaque native ne doit pas rester en place pendant que le
-                // jeu annonce MangoHud ; celui-ci prendra la main au prochain
-                // lancement, comme le dit le message.
-                self.kill_perf_hud();
-                if let Ok(mut guard) = self.session.lock() {
-                    if let Some(state) = guard.as_mut() {
-                        state.info.mangohud = true;
-                    }
-                }
-                message = "MangoHud : actif au prochain lancement".into();
-            } else {
-                // Retire MangoHud de la partie en cours avant de remettre la
-                // plaque native : les deux ne doivent jamais coexister.
-                let _ = self.set_game_hud(false);
-                let _ = lapinux_perf::mangohud::set_display(false);
-                if let Ok(mut guard) = self.session.lock() {
-                    if let Some(state) = guard.as_mut() {
-                        state.info.mangohud = false;
-                    }
-                }
-                self.kill_perf_hud();
-                let _ = self.spawn_perf_hud();
-                message = "plaque native affichée".into();
-            }
-            return Ok(Envelope::ok(&serde_json::json!({ "message": message })));
-        }
-        // La taille de la plaque native s'applique à chaud : le processus de
-        // HUD est relancé avec la nouvelle échelle.
         // Volume du flux du jeu, depuis le menu rapide. Le changement est
         // appliqué à chaud et ne touche aucun autre son du bureau.
         if let Some(value) = action.strip_prefix("game_volume:") {
@@ -1536,6 +1639,11 @@ impl Shared {
             return match crate::captures::set_game_volume(&pids, volume) {
                 Ok(value) => {
                     message = format!("volume du jeu : {:.0} %", value * 100.0);
+                    // Le niveau est retenu pour les parties suivantes : le
+                    // prochain lancement repartira de là.
+                    if let Err(error) = self.remember_volume(info.appid, value) {
+                        tracing::warn!("volume du jeu non retenu : {error}");
+                    }
                     Ok(Envelope::ok(&serde_json::json!({ "message": message })))
                 }
                 Err(error) => Ok(Envelope::err(error)),
@@ -1552,11 +1660,49 @@ impl Shared {
             };
             return self.steam_social_message(steam_id, text);
         }
+        // Invitation dans le lobby créé par le jeu, depuis le bouton de la
+        // fiche d'un ami dans l'overlay.
+        if let Some(body) = action.strip_prefix("invite:") {
+            let Ok(steam_id) = body.trim().parse::<u64>() else {
+                return Ok(Envelope::err("SteamID d'ami invalide"));
+            };
+            return self.steam_lobby_invite(steam_id);
+        }
+        // Style complet envoyé par l'overlay : couleurs, éléments, unités,
+        // ordre, ancrage et badge. Il est enregistré, lié au jeu en cours et
+        // appliqué immédiatement en relançant les surfaces du HUD, sans
+        // redémarrer le jeu.
+        if let Some(body) = action.strip_prefix("hud_style:") {
+            let Some(mut style) = serde_json::from_str::<lapinux_core::hud::HudStyle>(body).ok()
+            else {
+                return Ok(Envelope::err("style de HUD illisible"));
+            };
+            style.normalize();
+            let mut config = self.config_snapshot();
+            let id = config.capture.set_active_hud_style(style.clone());
+            let _ = self.save_config(config);
+            if let Some(info) = self.session_info() {
+                if let Ok(Some(mut game)) = self.store.game(info.appid) {
+                    game.settings.hud_style = Some(id.clone());
+                    let _ = self.store.save_game(&game);
+                }
+            }
+            self.kill_perf_hud();
+            let _ = self.spawn_perf_hud();
+            self.kill_record_hud();
+            let _ = self.spawn_record_hud();
+            return Ok(Envelope::ok(&serde_json::json!({
+                "message": format!("HUD « {} » appliqué", style.name),
+                "id": id,
+            })));
+        }
         if let Some(scale) = action.strip_prefix("hud_scale:") {
             if let Ok(value) = scale.trim().parse::<f32>() {
                 let value = value.clamp(0.75, 2.0);
                 let mut config = self.config_snapshot();
-                config.capture.hud_scale = value;
+                let (mut style, game_style) = self.session_hud_style(&config);
+                style.scale = value;
+                self.save_hot_hud_style(&mut config, style, game_style.as_deref());
                 let _ = self.save_config(config);
                 self.kill_perf_hud();
                 let _ = self.spawn_perf_hud();
@@ -1570,29 +1716,10 @@ impl Shared {
         // Le badge d'enregistrement a son propre processus et reste intact.
         if let Some(show) = action.strip_prefix("hud_visible:") {
             let show = show.trim() != "0";
-            let appid = self.session_info().map(|state| state.appid);
+            self.remember_session_hud(Some(show), None);
             let mut config = self.config_snapshot();
             config.capture.hud_on_screen = show;
-            // La plaque native est le moteur par défaut quand on la rallume.
-            config.launch.mangohud = false;
             let _ = self.save_config(config);
-            if let Some(appid) = appid {
-                if let Ok(Some(mut game)) = self.store.game(appid) {
-                    // Un réglage MangoHud propre au jeu ne doit pas ressurgir
-                    // au prochain lancement après avoir choisi la plaque.
-                    game.settings.mangohud = Some(false);
-                    let _ = self.store.save_game(&game);
-                }
-            }
-            // L'interrupteur est global : MangoHud et la plaque sont coupés
-            // ensemble, puis seule la plaque est éventuellement rallumée.
-            let _ = self.set_game_hud(false);
-            let _ = lapinux_perf::mangohud::set_display(false);
-            if let Ok(mut guard) = self.session.lock() {
-                if let Some(state) = guard.as_mut() {
-                    state.info.mangohud = false;
-                }
-            }
             self.kill_perf_hud();
             if show {
                 let _ = self.spawn_perf_hud();
@@ -1617,10 +1744,13 @@ impl Shared {
                 .unwrap_or(1.0)
                 .clamp(0.65, 2.0);
             let mut config = self.config_snapshot();
-            config.capture.record_badge = enabled;
-            config.capture.record_badge_position = position;
-            config.capture.record_badge_scale = scale;
+            let (mut style, game_style) = self.session_hud_style(&config);
+            style.badge.enabled = enabled;
+            style.badge.position = position.clone();
+            style.badge.scale = scale;
+            self.save_hot_hud_style(&mut config, style, game_style.as_deref());
             let _ = self.save_config(config);
+            self.remember_session_hud(None, Some(enabled));
             self.kill_record_hud();
             if enabled {
                 let _ = self.spawn_record_hud();
@@ -1653,37 +1783,61 @@ impl Shared {
                 "message": "arrêt de l'enregistrement demandé",
             })));
         }
+        // Génération d'images de la couche afmf-linux : le multiplicateur est
+        // écrit dans le fichier privé de la session, que la couche relit à
+        // chaque image. Aucun redémarrage, et un retour à 0 coupe la
+        // génération en repartant d'un historique frais au retour.
+        if let Some(value) = action.strip_prefix("afmf:") {
+            let Ok(multiplier) = value.trim().parse::<u32>() else {
+                return Ok(Envelope::err("multiplicateur de génération invalide"));
+            };
+            if !lapinux_core::config::AFMF_MULTIPLIERS.contains(&multiplier) {
+                return Ok(Envelope::err("multiplicateur de génération invalide"));
+            }
+            let target = self.session.lock().ok().and_then(|guard| {
+                guard.as_ref().and_then(|state| {
+                    state
+                        .info
+                        .afmf_control
+                        .as_ref()
+                        .map(|control| (control.clone(), state.info.appid))
+                })
+            });
+            let Some((control, appid)) = target else {
+                return Ok(Envelope::err("génération d'images inactive pour ce jeu"));
+            };
+            if let Err(error) = crate::steam::steam_launch::write_afmf_multiplier(&control, multiplier)
+            {
+                return Ok(Envelope::err(format!("fichier de contrôle : {error}")));
+            }
+            if let Ok(mut guard) = self.session.lock() {
+                if let Some(state) = guard.as_mut() {
+                    state.info.afmf_multiplier = Some(multiplier);
+                }
+            }
+            // Le choix suit le jeu : la prochaine partie repart de là.
+            if appid != 0 {
+                if let Ok(Some(mut game)) = self.store.game(appid) {
+                    game.settings.afmf_multiplier = Some(multiplier);
+                    let _ = self.store.save_game(&game);
+                }
+            }
+            message = if multiplier == 0 {
+                "génération d'images arrêtée".to_string()
+            } else {
+                format!("génération d'images ×{multiplier}")
+            };
+            return Ok(Envelope::ok(&serde_json::json!({
+                "message": message,
+                "multiplier": multiplier,
+            })));
+        }
         if action.starts_with("fps_cap:") {
             if let Ok(value) = action.trim_start_matches("fps_cap:").parse::<u32>() {
                 let mut target = None;
                 if let Ok(mut guard) = self.session.lock() {
                     if let Some(state) = guard.as_mut() {
                         state.info.fps_cap = value;
-                        // Changer la limite ne doit pas perdre le profil,
-                        // l'ancrage ni le graphique choisis dans l'onglet
-                        // Performances.
-                        let profile = if state.info.hud_preset.trim().is_empty() {
-                            "full".to_string()
-                        } else {
-                            state.info.hud_preset.clone()
-                        };
-                        let mut settings = mangohud::preset_settings_at(
-                            &profile,
-                            Some(value),
-                            &state.info.hud_position,
-                        );
-                        settings.enabled = state.info.mangohud;
-                        // La couche corrigée de Lapinux place les neuf
-                        // ancrages en ligne comme en bloc.
-                        settings.horizontal = layout_is_inline(&state.info.hud_layout);
-                        settings.frame_timing = state.info.hud_graph;
-                        settings.cpu_cores = state.info.hud_cores;
-                        settings.screen = Some(self.screen_size());
-                        let _ = mangohud::write_config(
-                            &self.paths.config_dir,
-                            state.info.appid,
-                            &settings,
-                        );
                         // La limite suit aussi le jeu : le prochain lancement
                         // repart de cette valeur au lieu de celle des réglages.
                         if let Ok(Some(mut game)) = self.store.game(state.info.appid) {
@@ -1716,126 +1870,18 @@ impl Shared {
                     format!("limite FPS {value} appliquée")
                 };
             }
-        } else if let Some(spec) = action.strip_prefix("hud:") {
-            // Format complet : `hud:<0|1>:<profil>:<position>:<disposition>:<graphique>`.
-            // L'ancien `hud:<profil>` reste accepté pour une instance déjà
-            // lancée, et garde alors l'ancrage et le graphique courants.
-            let mut applied = String::new();
-            let mut stop_native = false;
-            let mut drop_native_config = false;
-            if let Ok(mut guard) = self.session.lock() {
-                if let Some(state) = guard.as_mut() {
-                    if let Some((enabled, profile, position, layout, graph, cores)) =
-                        parse_hud_spec(
-                            spec,
-                            &state.info.hud_preset,
-                            &state.info.hud_position,
-                            layout_is_inline(&state.info.hud_layout),
-                            state.info.hud_graph,
-                            state.info.hud_cores,
-                        )
-                    {
-                        let mut settings = mangohud::preset_settings_at(
-                            &profile,
-                            Some(state.info.fps_cap),
-                            &position,
-                        );
-                        settings.enabled = enabled;
-                        settings.horizontal = layout;
-                        settings.frame_timing = graph;
-                        settings.cpu_cores = cores;
-                        settings.screen = Some(self.screen_size());
-                        state.info.hud_preset = profile.clone();
-                        state.info.hud_position = position.clone();
-                        state.info.hud_layout = if settings.horizontal {
-                            "inline"
-                        } else {
-                            "block"
-                        }
-                        .to_string();
-                        state.info.hud_graph = graph;
-                        state.info.hud_cores = cores;
-                        let was_mangohud = state.info.mangohud;
-                        state.info.mangohud = enabled;
-                        stop_native = enabled;
-                        // En activant MangoHud, la plaque native s'efface. En
-                        // le coupant, elle ne doit pas réapparaître toute
-                        // seule alors que l'utilisateur a demandé « coupé ».
-                        drop_native_config = enabled || was_mangohud;
-                        let _ = mangohud::write_config(
-                            &self.paths.config_dir,
-                            state.info.appid,
-                            &settings,
-                        );
-                        // Le profil, l'ancrage et la disposition suivent le
-                        // jeu : le prochain lancement écrit la même
-                        // configuration MangoHud.
-                        if let Ok(Some(mut game)) = self.store.game(state.info.appid) {
-                            game.settings.hud_preset = Some(profile.clone());
-                            game.settings.hud_position = Some(position.clone());
-                            game.settings.hud_layout = Some(state.info.hud_layout.clone());
-                            game.settings.hud_graph = Some(graph);
-                            game.settings.hud_cores = Some(cores);
-                            game.settings.mangohud = Some(enabled);
-                            let _ = self.store.save_game(&game);
-                        }
-                        applied = format!(
-                            "MangoHud {} · {} · {} · {} · graphique {} · cœurs {}",
-                            if enabled { "activé" } else { "coupé" },
-                            profile_label(&profile),
-                            position_label(&position),
-                            layout_label(layout),
-                            if graph { "activé" } else { "coupé" },
-                            if cores { "activés" } else { "coupés" }
-                        );
-                    }
-                }
-            }
-            if drop_native_config {
-                let mut config = self.config_snapshot();
-                config.capture.hud_on_screen = false;
-                let _ = self.save_config(config);
-            }
-            if stop_native {
-                self.kill_perf_hud();
-            }
-            message = if applied.is_empty() {
-                "MangoHud : aucun jeu en cours".to_string()
-            } else {
-                // MangoHud relit le fichier à chaud ; le réglage est aussi
-                // enregistré pour le prochain lancement.
-                format!("{applied} : appliqué")
-            };
         } else if action == "hud_cut" {
-            // Le bouton « tout couper » : MangoHud s'éteint, la plaque est
-            // retirée, sans toucher au reste de la configuration.
-            let appid = self.session_info().map(|state| state.appid);
-            let hidden = self.set_game_hud(false);
-            let _ = lapinux_perf::mangohud::set_display(false);
+            // Le bouton « tout couper » retire les deux surfaces du HUD sans
+            // toucher au reste de la configuration.
+            self.remember_session_hud(Some(false), Some(false));
             let mut config = self.config_snapshot();
             config.capture.hud_on_screen = false;
-            config.launch.mangohud = false;
             let _ = self.save_config(config);
-            if let Some(appid) = appid {
-                if let Ok(Some(mut game)) = self.store.game(appid) {
-                    game.settings.mangohud = Some(false);
-                    let _ = self.store.save_game(&game);
-                }
-            }
-            if let Ok(mut guard) = self.session.lock() {
-                if let Some(state) = guard.as_mut() {
-                    state.info.mangohud = false;
-                }
-            }
             self.kill_perf_hud();
             self.kill_record_hud();
-            message = if hidden {
-                "HUD coupés".into()
-            } else {
-                "plaque coupée".to_string()
-            };
+            message = "HUD coupés".into();
         } else if action == "profile_next" || action.starts_with("profile_select:") {
-            let profiles = lapinux_input::list_profiles(&self.paths.data_dir);
+            let profiles = lapinux_input::list_profiles(&self.paths.manettes_dir());
             if !profiles.is_empty() {
                 let session = self.session_info();
                 let current = session
@@ -1865,7 +1911,7 @@ impl Shared {
                             state.info.input_profile = next.clone();
                         }
                     }
-                    self.start_input(&next, true);
+                    self.start_input(appid.unwrap_or(0), &next, true);
                     // Le profil choisi dans l'overlay suit le jeu : la
                     // prochaine partie repart de ce choix au lieu de revenir
                     // au défaut.
@@ -1884,18 +1930,17 @@ impl Shared {
             let protons = self.protons_cached();
             if !protons.is_empty() {
                 let session = self.session_info();
-                let current = session
-                    .as_ref()
-                    .map(|state| state.proton.clone())
-                    .unwrap_or_default();
                 let appid = session.as_ref().map(|state| state.appid);
+                // Une ancienne commande d'overlay peut encore demander un choix
+                // pour le prochain lancement ; ne jamais modifier la version
+                // effectivement utilisée par la session en cours.
+                let current = appid
+                    .and_then(|id| self.store.game(id).ok().flatten())
+                    .and_then(|game| game.settings.proton)
+                    .or_else(|| session.as_ref().map(|state| state.proton.clone()))
+                    .unwrap_or_default();
                 let index = protons.iter().position(|p| p.name == current).unwrap_or(0);
                 let next = protons[(index + 1) % protons.len()].name.clone();
-                if let Ok(mut guard) = self.session.lock() {
-                    if let Some(state) = guard.as_mut() {
-                        state.info.proton = next.clone();
-                    }
-                }
                 // Le jeu tourne déjà avec l'ancien Proton : le choix ne peut
                 // pas s'appliquer à chaud, mais il doit au moins survivre à
                 // la session et être utilisé au prochain lancement.
@@ -1920,81 +1965,6 @@ impl Shared {
     }
 }
 
-/// Lit une action MangoHud de l'overlay :
-/// `enabled:profil:position:disposition:graphique`. Sans profil, l'ancien
-/// format `hud:<profil>` garde le profil, l'ancrage, la disposition et le
-/// graphique de la session ; `off` coupe sans oublier le choix courant.
-fn parse_hud_spec(
-    spec: &str,
-    current_profile: &str,
-    current_position: &str,
-    current_layout: bool,
-    current_graph: bool,
-    current_cores: bool,
-) -> Option<(bool, String, String, bool, bool, bool)> {
-    let parts: Vec<&str> = spec.split(':').filter(|part| !part.is_empty()).collect();
-    match parts.as_slice() {
-        [flag, profile, position, layout, graph, cores] => Some((
-            matches!(*flag, "1" | "on" | "true"),
-            normalize_profile(profile),
-            mangohud::normalize_position(position),
-            layout_is_inline(layout),
-            matches!(*graph, "1" | "on" | "true"),
-            matches!(*cores, "1" | "on" | "true"),
-        )),
-        // Format d'avant la ligne des cœurs : on garde le choix courant.
-        [flag, profile, position, layout, graph] => Some((
-            matches!(*flag, "1" | "on" | "true"),
-            normalize_profile(profile),
-            mangohud::normalize_position(position),
-            layout_is_inline(layout),
-            matches!(*graph, "1" | "on" | "true"),
-            current_cores,
-        )),
-        // Format d'avant le graphique : on garde le choix courant.
-        [flag, profile, position, layout] => Some((
-            matches!(*flag, "1" | "on" | "true"),
-            normalize_profile(profile),
-            mangohud::normalize_position(position),
-            layout_is_inline(layout),
-            current_graph,
-            current_cores,
-        )),
-        // Ancien format sans disposition : on garde les choix courants.
-        [flag, profile, position] => Some((
-            matches!(*flag, "1" | "on" | "true"),
-            normalize_profile(profile),
-            mangohud::normalize_position(position),
-            current_layout,
-            current_graph,
-            current_cores,
-        )),
-        [profile] => {
-            let position = mangohud::normalize_position(current_position);
-            if profile.eq_ignore_ascii_case("off") {
-                Some((
-                    false,
-                    normalize_profile(current_profile),
-                    position,
-                    current_layout,
-                    current_graph,
-                    current_cores,
-                ))
-            } else {
-                Some((
-                    true,
-                    normalize_profile(profile),
-                    position,
-                    current_layout,
-                    current_graph,
-                    current_cores,
-                ))
-            }
-        }
-        _ => None,
-    }
-}
-
 /// Change la limite de FPS d'un GameScope déjà lancé. `gamescopectl` parle
 /// au compositeur par son socket Wayland ; la commande debug applique la
 /// nouvelle limite et le cycle de rafraîchissement sans relancer le jeu.
@@ -2014,26 +1984,183 @@ pub(crate) fn overlay_exe() -> Result<std::path::PathBuf> {
             return Ok(path);
         }
     }
-    lapinux_core::paths::which("lapinux")
-        .ok_or_else(|| lapinux_core::Error::Other(format!("binaire de l'overlay introuvable ({text})")))
+    lapinux_core::paths::which("lapinux").ok_or_else(|| {
+        lapinux_core::Error::Other(format!("binaire de l'overlay introuvable ({text})"))
+    })
+}
+
+/// Nom de la trace de la partie en cours. Elle porte le pid du daemon qui a
+/// lancé la session et la racine de son groupe de processus : un daemon tué
+/// laisse GameScope, Wine et la scène tourner, et le suivant s'en sert pour
+/// les arrêter.
+const SESSION_JOURNAL: &str = "session.json";
+
+/// Vrai quand ce pid est bien la racine d'une session lancée par Lapinux : un
+/// pid réutilisé par un autre programme ne doit jamais être arrêté.
+fn session_group_belongs_to_lapinux(pid: u32) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let cmdline = String::from_utf8_lossy(&raw);
+    let args: Vec<&str> = cmdline.split('\0').filter(|arg| !arg.is_empty()).collect();
+    // GameScope est la racine la plupart du temps ; `bwrap` l'enveloppe quand
+    // la session est confinée, et la scène est un client de GameScope.
+    args.iter()
+        .any(|arg| *arg == "gamescope" || arg.ends_with("/gamescope"))
+        || (args
+            .first()
+            .is_some_and(|arg| arg.ends_with("lapinux"))
+            && args.iter().any(|arg| *arg == "scene"))
+}
+
+/// Arrête le groupe d'une session orpheline : GameScope, `bwrap`, la scène et
+/// le jeu partagent le groupe créé par `setsid`. Rend `true` quand un groupe a
+/// été visé.
+fn stop_session_group(pid: u32) -> bool {
+    if !crate::captures::process_is_alive(pid) || !session_group_belongs_to_lapinux(pid) {
+        return false;
+    }
+    let group = -(pid as i32);
+    unsafe {
+        libc::kill(group, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if !crate::captures::process_is_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    unsafe {
+        libc::kill(group, libc::SIGKILL);
+    }
+    true
+}
+
+/// Reprise d'une partie orpheline : le groupe de la session est arrêté, puis
+/// les processus Proton détachés dans le préfixe, et les marqueurs de la
+/// partie morte sont retirés.
+fn recover_session_at(log_dir: &std::path::Path) {
+    let path = log_dir.join(SESSION_JOURNAL);
+    let Ok(raw) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(journal) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    let previous = journal["daemon_pid"].as_u64().unwrap_or(0) as u32;
+    if previous == std::process::id()
+        || (previous != 0 && crate::captures::process_is_alive(previous))
+    {
+        return;
+    }
+    let pid = journal["pid"].as_u64().unwrap_or(0) as u32;
+    let appid = journal["appid"].as_u64().unwrap_or(0) as u32;
+    let prefix = journal["prefix"].as_str().unwrap_or_default().to_string();
+    tracing::warn!("partie orpheline (daemon {previous}, session {pid}, appid {appid}) : reprise");
+    let group = stop_session_group(pid);
+    if !prefix.is_empty() {
+        // `wineserver` et les `winedevice.exe` quittent la session du jeu : le
+        // signal au groupe ne les atteint pas, seul leur environnement les
+        // identifie.
+        lapinux_perf::session::reap_prefix(std::path::Path::new(&prefix));
+    }
+    // Les marqueurs et le tube de la partie morte n'ont plus de lecteur : le
+    // fichier de fin de scène ferait croire à une partie terminée au prochain
+    // lancement.
+    for entry in std::fs::read_dir(log_dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stale = appid != 0
+            && (name.starts_with(&format!("scene-{appid}-"))
+                || name.starts_with(&format!("fps-{appid}-")));
+        if stale || name == crate::captures::RECORDER_JOURNAL {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    tracing::info!(
+        "session : restes de la partie précédente arrêtés ({})",
+        if group {
+            "groupe de la session"
+        } else {
+            "groupe déjà sorti"
+        }
+    );
+    let _ = std::fs::remove_file(&path);
 }
 
 fn set_gamescope_fps_limit(info: &SessionInfo, value: u32) -> std::result::Result<(), String> {
     let ctl = lapinux_core::paths::which("gamescopectl")
         .ok_or_else(|| "gamescopectl introuvable".to_string())?;
-    let display = gamescope_display(info).unwrap_or_else(|| "gamescope-0".into());
-    let output = Command::new(ctl)
-        .env("GAMESCOPE_WAYLAND_DISPLAY", &display)
-        .arg("debug_set_fps_limit")
-        .arg(value.to_string())
-        .output()
-        .map_err(|e| format!("gamescopectl : {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let error = String::from_utf8_lossy(&output.stderr);
-        Err(format!("gamescopectl : {}", error.trim()))
+    // La socket attendue est celle que les descendants annoncent, mais leur
+    // environnement n'est pas toujours lisible (/proc d'un processus confiné).
+    // Les sockets présentes dans le dossier d'exécution servent alors de
+    // repli : sans elles, la limite à chaud échouait en silence et la valeur
+    // ne partait qu'au lancement suivant.
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
+        });
+    let candidates = gamescope_display_candidates(gamescope_display(info), &runtime_dir);
+    let mut last_error = String::from("aucune socket GameScope");
+    for display in candidates {
+        let mut command = Command::new(&ctl);
+        command
+            .env("GAMESCOPE_WAYLAND_DISPLAY", &display)
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .arg("debug_set_fps_limit")
+            .arg(value.to_string());
+        let output = command
+            .output()
+            .map_err(|e| format!("gamescopectl : {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        last_error = if error.is_empty() {
+            format!("gamescopectl : {display} injoignable")
+        } else {
+            error
+        };
     }
+    Err(format!("gamescopectl : {last_error}"))
+}
+
+/// Sockets GameScope à essayer, la plus récente d'abord : celle annoncée par le
+/// jeu, puis celles du dossier d'exécution (une session tuée peut laisser
+/// `gamescope-0` derrière elle).
+fn gamescope_display_candidates(
+    discovered: Option<String>,
+    runtime_dir: &std::path::Path,
+) -> Vec<String> {
+    let mut found: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(runtime_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Les verrous et les sockets `-ei` ne parlent pas le protocole de
+            // contrôle : `gamescopectl` s'y connecterait pour rien.
+            if !name.starts_with("gamescope-") || name.ends_with("-ei") || name.ends_with(".lock")
+            {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            Some((modified, name))
+        })
+        .collect();
+    found.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut candidates: Vec<String> = discovered.into_iter().collect();
+    for (_, name) in found {
+        if !candidates.contains(&name) {
+            candidates.push(name);
+        }
+    }
+    candidates
 }
 
 /// Nom du socket Wayland de GameScope, lu dans l'environnement d'un de ses
@@ -2056,52 +2183,6 @@ fn gamescope_display(info: &SessionInfo) -> Option<String> {
         }
     }
     None
-}
-
-fn layout_is_inline(text: &str) -> bool {
-    matches!(
-        text.trim().to_ascii_lowercase().as_str(),
-        "inline" | "line" | "horizontal" | "ligne"
-    )
-}
-
-fn layout_label(inline: bool) -> &'static str {
-    if inline {
-        "En ligne"
-    } else {
-        "En bloc"
-    }
-}
-
-fn normalize_profile(profile: &str) -> String {
-    match profile.trim().to_ascii_lowercase().as_str() {
-        "simple" => "simple".into(),
-        "full" | "detailed" => "full".into(),
-        _ => "essential".into(),
-    }
-}
-
-fn profile_label(profile: &str) -> &'static str {
-    match profile {
-        "simple" => "Simple",
-        "full" => "Détaillée",
-        _ => "Basique",
-    }
-}
-
-fn position_label(position: &str) -> &'static str {
-    match position {
-        "top-left" => "haut gauche",
-        "top-center" => "haut centre",
-        "top-right" => "haut droite",
-        "middle-left" => "milieu gauche",
-        "middle-center" => "centre",
-        "middle-right" => "milieu droite",
-        "bottom-left" => "bas gauche",
-        "bottom-center" => "bas centre",
-        "bottom-right" => "bas droite",
-        _ => "haut gauche",
-    }
 }
 
 /// Le processus `root` et tous ses descendants, lus dans `/proc`. La fenêtre
@@ -2278,7 +2359,8 @@ fn take_screenshot(
     // de la fenêtre active prendrait le menu rapide ou le bureau.
     if let Some(info) = session {
         let _ = lapinux_input::shortcut::focus_window(&descendants(info.pid));
-    }    let dir = capture.images_dir();
+    }
+    let dir = capture.images_dir();
     std::fs::create_dir_all(&dir).ok();
     let _ = std::fs::write(dir.join(lapinux_core::captures::MARKER), b"");
 
@@ -2307,12 +2389,7 @@ fn take_screenshot(
             if window {
                 command.arg("-a");
             }
-            let status = command
-                .arg("-b")
-                .arg("-n")
-                .arg("-o")
-                .arg(&path)
-                .status();
+            let status = command.arg("-b").arg("-n").arg("-o").arg(&path).status();
             if matches!(status, Ok(s) if s.success()) {
                 return format!(
                     "capture {} : {}",
@@ -2341,45 +2418,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hud_spec_reads_graph_and_keeps_old_formats() {
-        let full = parse_hud_spec(
-            "1:full:top-center:inline:1:1",
-            "essential",
-            "top-left",
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(full.0, true);
-        assert_eq!(full.1, "full");
-        assert_eq!(full.2, "top-center");
-        assert!(full.3);
-        assert!(full.4);
-        assert!(full.5);
+    fn une_partie_orpheline_est_abandonnee_et_ses_marqueurs_retires() {
+        let dir = tempfile::tempdir().unwrap();
+        // Des marqueurs de la partie morte, et la trace d'un daemon disparu.
+        let scene = dir.path().join("scene-1636440-1794581527.exit");
+        let fifo = dir.path().join("fps-1636440-1794581527.fifo");
+        std::fs::write(&scene, b"1").unwrap();
+        std::fs::write(&fifo, b"").unwrap();
+        let journal = serde_json::json!({
+            "daemon_pid": 0,
+            "pid": 0,
+            "appid": 1636440,
+            "prefix": "",
+            "started": 0,
+        });
+        std::fs::write(dir.path().join(SESSION_JOURNAL), journal.to_string()).unwrap();
+        recover_session_at(dir.path());
+        assert!(!scene.exists());
+        assert!(!fifo.exists());
+        assert!(!dir.path().join(SESSION_JOURNAL).exists());
+    }
 
-        let old = parse_hud_spec(
-            "1:simple:bottom-right",
-            "full",
-            "top-left",
-            false,
-            true,
-            true,
-        )
-        .unwrap();
-        assert_eq!(old.1, "simple");
-        assert_eq!(old.2, "bottom-right");
-        assert!(!old.3);
-        // L'ancien format sans graphique conserve le réglage courant.
-        assert!(old.4);
-        assert!(old.5);
+    #[test]
+    fn la_trace_d_une_partie_vivante_est_laissee() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = serde_json::json!({
+            "daemon_pid": std::process::id(),
+            "pid": 0,
+            "appid": 0,
+            "prefix": "",
+            "started": 0,
+        });
+        let path = dir.path().join(SESSION_JOURNAL);
+        std::fs::write(&path, journal.to_string()).unwrap();
+        recover_session_at(dir.path());
+        assert!(path.is_file(), "le daemon en cours garde sa trace");
+    }
 
-        let legacy = parse_hud_spec("off", "full", "top-left", true, true, true).unwrap();
-        assert!(!legacy.0);
-        assert_eq!(legacy.1, "full");
-        assert_eq!(legacy.3, true);
-        assert_eq!(legacy.4, true);
-        assert_eq!(legacy.5, true);
+    #[test]
+    fn la_socket_annoncee_prime_et_les_autres_suivent() {
+        // Sans environnement lisible, la limite à chaud doit retrouver la
+        // socket de la session parmi celles du dossier d'exécution.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gamescope-0"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.path().join("gamescope-1"), b"").unwrap();
+        std::fs::write(dir.path().join("gamescope-1.lock"), b"").unwrap();
+        std::fs::write(dir.path().join("gamescope-1-ei"), b"").unwrap();
+        let expected = vec!["gamescope-1".to_string(), "gamescope-0".to_string()];
+        assert_eq!(
+            gamescope_display_candidates(Some("gamescope-1".into()), dir.path()),
+            expected
+        );
+        assert_eq!(gamescope_display_candidates(None, dir.path()), expected);
+    }
+
+    #[test]
+    fn un_pid_etranger_n_est_jamais_pris_pour_une_session() {
+        // Le processus de test n'est pas GameScope ni la scène.
+        assert!(!session_group_belongs_to_lapinux(std::process::id()));
+        assert!(!session_group_belongs_to_lapinux(0));
+        assert!(!session_group_belongs_to_lapinux(999_999));
     }
 }
 

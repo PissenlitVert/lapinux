@@ -154,9 +154,9 @@ impl Webview {
             return None;
         }
         Some(if self.loading {
-            "Chargement de la page…".to_string()
+            lapinux_core::i18n::t("webview.loading").to_string()
         } else {
-            format!("Fenêtre ouverte · {}", host_of(&self.url))
+            lapinux_core::i18n::t_fmt("webview.opened", &[host_of(&self.url).to_string()])
         })
     }
 
@@ -224,8 +224,12 @@ fn spawn(paths: &LapinuxPaths, url: &str, title: &str) -> Result<Session, String
     let script: PathBuf = dir.join("window.py");
     if std::fs::write(&script, HELPER).is_err() {
         let fallback = std::env::temp_dir().join("lapinux-webview.py");
-        std::fs::write(&fallback, HELPER)
-            .map_err(|error| format!("hôte WebKit non installable ({error})"))?;
+        std::fs::write(&fallback, HELPER).map_err(|error| {
+            lapinux_core::i18n::t_args(
+                "webview.host_not_installable",
+                &[("error", &error.to_string())],
+            )
+        })?;
         return spawn_with(&fallback, url, title, paths);
     }
     spawn_with(&script, url, title, paths)
@@ -297,11 +301,11 @@ fn spawn_with(
         .map_err(|error| format!("python3 introuvable ({error})"))?;
     let Some(stdin) = child.stdin.take() else {
         let _ = child.kill();
-        return Err("entrée de la fenêtre indisponible".into());
+        return Err(lapinux_core::i18n::t("webview.input_unavailable").into());
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
-        return Err("sortie de la fenêtre indisponible".into());
+        return Err(lapinux_core::i18n::t("webview.output_unavailable").into());
     };
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

@@ -54,8 +54,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn limit_allocator_arenas() {
     extern "C" {
-        fn mallopt(param: std::os::raw::c_int, value: std::os::raw::c_int)
-            -> std::os::raw::c_int;
+        fn mallopt(param: std::os::raw::c_int, value: std::os::raw::c_int) -> std::os::raw::c_int;
     }
     const M_ARENA_MAX: std::os::raw::c_int = -8;
     // SAFETY: seul `M_ARENA_MAX` est réglé, avec une valeur positive, une fois
@@ -85,7 +84,7 @@ fn init_logging() {
 fn run_scene(args: &[String]) -> i32 {
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
         eprintln!(
-            "usage : lapinux scene [--name NOM] [--width L] [--height H] [--backdrop IMAGE] [--cover IMAGE] [--end-secondes N] [--exit-file FICHIER] -- COMMANDE [ARGS...]"
+            "usage : lapinux scene [--name NOM] [--width L] [--height H] [--backdrop IMAGE] [--cover IMAGE] [--end-secondes N] [--exit-file FICHIER] [--start-file FICHIER] -- COMMANDE [ARGS...]"
         );
         return 2;
     };
@@ -96,6 +95,7 @@ fn run_scene(args: &[String]) -> i32 {
     let mut backdrop = None;
     let mut end_seconds = 4.0_f32;
     let mut exit_file = None;
+    let mut start_file = None;
     let mut index = 0;
     while index < separator {
         match args[index].as_str() {
@@ -155,6 +155,14 @@ fn run_scene(args: &[String]) -> i32 {
                 exit_file = Some(std::path::PathBuf::from(value));
                 index += 2;
             }
+            "--start-file" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("scene : --start-file attend un chemin");
+                    return 2;
+                };
+                start_file = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
             other => {
                 eprintln!("scene : option inconnue « {other} »");
                 return 2;
@@ -175,6 +183,7 @@ fn run_scene(args: &[String]) -> i32 {
         command,
         end_seconds,
         exit_file,
+        start_file,
     }) {
         Ok(()) => 0,
         Err(err) => {
@@ -203,7 +212,9 @@ fn run_daemon() -> i32 {
 /// secondes plus tard : s'il survit, la session est morte en route et le
 /// lancement suivant passe par le rendu logiciel.
 fn wayland_marker() -> std::path::PathBuf {
-    LapinuxPaths::discover().data_dir.join("gui-wayland-crashed")
+    LapinuxPaths::discover()
+        .data_dir
+        .join("gui-wayland-crashed")
 }
 
 /// Deuxième jeu de bibliothèques EGL/GLX, celui du pilote libre.

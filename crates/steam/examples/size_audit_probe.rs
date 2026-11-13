@@ -13,7 +13,7 @@ use lapinux_steam::session;
 use lapinux_steam::vdf;
 use steamroom::apps::AccessToken;
 use steamroom::depot::{AppId, DepotId, PackageId};
-use steamroom::types::key_value::{KvValue, KeyValue};
+use steamroom::types::key_value::{KeyValue, KvValue};
 use steamroom_client::login::LoginBuilder;
 
 fn number(value: Option<&KeyValue>) -> Option<u64> {
@@ -55,7 +55,8 @@ fn library_roots() -> Vec<PathBuf> {
         }
     }
     // Bibliothèque gérée par Lapinux, lue dans sa configuration.
-    if let Ok(text) = std::fs::read_to_string(Path::new(&home).join(".config/lapinux/config.toml")) {
+    if let Ok(text) = std::fs::read_to_string(Path::new(&home).join(".config/lapinux/config.toml"))
+    {
         if let Some(line) = text
             .lines()
             .find(|line| line.trim_start().starts_with("library_root"))

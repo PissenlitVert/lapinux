@@ -107,7 +107,11 @@ fn parse_kscreen(raw: &str) -> Option<Vec<DisplayInfo>> {
             .and_then(|ids| ids.first())
             .and_then(id_of);
         let mode = current
-            .and_then(|id| modes.iter().find(|mode| mode.get("id").and_then(id_of).as_deref() == Some(id.as_str())))
+            .and_then(|id| {
+                modes
+                    .iter()
+                    .find(|mode| mode.get("id").and_then(id_of).as_deref() == Some(id.as_str()))
+            })
             .or_else(|| {
                 preferred.and_then(|id| {
                     modes

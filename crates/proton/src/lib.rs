@@ -25,10 +25,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub use install::{extract, install_from_url, verify_sha512};
 pub use launch::{build, render_plan, umu_run_path, LaunchOptions, LaunchPlan};
-pub use prefix::{prefix_name, prefix_name_for, prefix_path};
 pub use prefix::{
     ensure as ensure_prefix, initialize as initialize_prefix, is_initialized, prefix_for,
     reset as reset_prefix,
 };
+pub use prefix::{prefix_name, prefix_name_for, prefix_path};
 pub use releases::{all_releases, fetch_releases, parse_releases, ProtonSource, SOURCES};
 pub use scan::{find, recommended, scan};

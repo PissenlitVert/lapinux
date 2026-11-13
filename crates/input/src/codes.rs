@@ -93,12 +93,13 @@ pub const KEY_F12: u16 = 88;
 pub const KEY_LEFTMETA: u16 = 125;
 pub const KEY_RIGHTMETA: u16 = 126;
 
-pub const BTN_TABLE: [(&str, u16); 14] = [
+pub const BTN_TABLE: [(&str, u16); 36] = [
     ("BTN_SOUTH", BTN_SOUTH),
     ("BTN_EAST", BTN_EAST),
     ("BTN_NORTH", BTN_NORTH),
     ("BTN_WEST", BTN_WEST),
     ("BTN_Z", BTN_Z),
+    ("BTN_C", BTN_C),
     ("BTN_TL", BTN_TL),
     ("BTN_TR", BTN_TR),
     ("BTN_TL2", BTN_TL2),
@@ -108,6 +109,27 @@ pub const BTN_TABLE: [(&str, u16); 14] = [
     ("BTN_MODE", BTN_MODE),
     ("BTN_THUMBL", BTN_THUMBL),
     ("BTN_THUMBR", BTN_THUMBR),
+    ("BTN_BASE", BTN_BASE),
+    ("BTN_THUMB", BTN_THUMB),
+    ("BTN_THUMB2", BTN_THUMB2),
+    ("BTN_GRIPL", BTN_GRIPL),
+    ("BTN_GRIPR", BTN_GRIPR),
+    ("BTN_GRIPL2", BTN_GRIPL2),
+    ("BTN_GRIPR2", BTN_GRIPR2),
+    ("BTN_TRIGGER_HAPPY1", BTN_TRIGGER_HAPPY1),
+    ("BTN_TRIGGER_HAPPY2", BTN_TRIGGER_HAPPY2),
+    ("BTN_TRIGGER_HAPPY3", BTN_TRIGGER_HAPPY3),
+    ("BTN_TRIGGER_HAPPY4", BTN_TRIGGER_HAPPY4),
+    ("BTN_TRIGGER_HAPPY5", BTN_TRIGGER_HAPPY5),
+    ("BTN_TRIGGER_HAPPY6", BTN_TRIGGER_HAPPY6),
+    ("BTN_TRIGGER_HAPPY7", BTN_TRIGGER_HAPPY7),
+    ("BTN_TRIGGER_HAPPY8", BTN_TRIGGER_HAPPY8),
+    ("BTN_TRIGGER_HAPPY9", BTN_TRIGGER_HAPPY9),
+    ("BTN_TRIGGER_HAPPY10", BTN_TRIGGER_HAPPY10),
+    ("BTN_DPAD_UP", BTN_DPAD_UP),
+    ("BTN_DPAD_DOWN", BTN_DPAD_DOWN),
+    ("BTN_DPAD_LEFT", BTN_DPAD_LEFT),
+    ("BTN_DPAD_RIGHT", BTN_DPAD_RIGHT),
 ];
 
 pub const AXIS_TABLE: [(&str, u16); 14] = [
@@ -156,7 +178,7 @@ pub const KEY_ALIASES: [(&str, u16); 25] = [
 ];
 
 /// Noms courts utilisés dans les réglages (`Guide`, `A`, `LB`…).
-pub const BUTTON_ALIASES: [(&str, u16); 18] = [
+pub const BUTTON_ALIASES: [(&str, u16); 32] = [
     ("A", BTN_SOUTH),
     ("B", BTN_EAST),
     ("X", BTN_NORTH),
@@ -175,6 +197,20 @@ pub const BUTTON_ALIASES: [(&str, u16); 18] = [
     ("GUIDE", BTN_MODE),
     ("PS", BTN_MODE),
     ("HOME", BTN_MODE),
+    ("L3", BTN_THUMBL),
+    ("R3", BTN_THUMBR),
+    ("THUMB_LEFT", BTN_THUMBL),
+    ("THUMB_RIGHT", BTN_THUMBR),
+    ("SOUTH", BTN_SOUTH),
+    ("EAST", BTN_EAST),
+    ("NORTH", BTN_WEST),
+    ("WEST", BTN_NORTH),
+    ("BUMPER_LEFT", BTN_TL),
+    ("BUMPER_RIGHT", BTN_TR),
+    ("TRIGGER_LEFT", BTN_TL2),
+    ("TRIGGER_RIGHT", BTN_TR2),
+    ("VIEW", BTN_SELECT),
+    ("MENU", BTN_START),
 ];
 
 pub fn button_name(code: u16) -> Option<&'static str> {
@@ -190,7 +226,11 @@ pub fn button_code(name: &str) -> Option<u16> {
     BUTTON_ALIASES
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(&upper))
-        .or_else(|| BTN_TABLE.iter().find(|(n, _)| n.eq_ignore_ascii_case(&upper)))
+        .or_else(|| {
+            BTN_TABLE
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&upper))
+        })
         .map(|(_, code)| *code)
 }
 
@@ -306,6 +346,9 @@ mod tests {
         assert_eq!(button_code(" guide "), Some(BTN_MODE));
         assert_eq!(button_code("LB"), Some(BTN_TL));
         assert_eq!(button_code("Start"), Some(BTN_START));
+        assert_eq!(button_code("L3"), Some(BTN_THUMBL));
+        assert_eq!(button_code("R3"), Some(BTN_THUMBR));
+        assert_eq!(button_code("north"), Some(BTN_WEST));
         assert_eq!(key_code("meta"), Some(KEY_LEFTMETA));
         assert_eq!(key_code("shift"), Some(KEY_LEFTSHIFT));
         assert_eq!(key_code("Tab"), Some(KEY_TAB));
@@ -360,7 +403,11 @@ mod tests {
                 is_pad_button(code),
                 "0x{code:03x} doit rester un bouton de manette"
             );
-            assert_ne!(button_label(code), "?", "0x{code:03x} doit avoir un libellé");
+            assert_ne!(
+                button_label(code),
+                "?",
+                "0x{code:03x} doit avoir un libellé"
+            );
         }
     }
 }

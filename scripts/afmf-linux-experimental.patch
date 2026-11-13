@@ -1,0 +1,1489 @@
+diff --git a/shaders/afmf_interpolate.comp b/shaders/afmf_interpolate.comp
+index ef047a3..51e804b 100644
+--- a/shaders/afmf_interpolate.comp
++++ b/shaders/afmf_interpolate.comp
+@@ -43,6 +43,7 @@ layout(push_constant) uniform Params {
+     float max_motion;    // |v| above which the flow is not trusted, in output pixels
+     float flow_scale;    // output pixels per flow-resolution pixel (1 or 2)
+     float hud_threshold; // a pixel equal in both frames within this, on a moving block, is HUD: kept as is (0 = off)
++    float phase;
+ } p;
+ 
+ const int SCD_SCENE_CHANGE_SLOT = 0;
+@@ -99,9 +100,8 @@ void main()
+         }
+     }
+     if (trusted) {
+-        vec2 half_v = 0.5 * v;
+-        vec4 from_cur = texture(u_cur, (y - half_v) * inv_size);
+-        vec4 from_prev = texture(u_prev, (y + half_v) * inv_size);
++        vec4 from_cur = texture(u_cur, (y - (1.0 - p.phase) * v) * inv_size);
++        vec4 from_prev = texture(u_prev, (y + p.phase * v) * inv_size);
+         // The two warps agree where the vector is right and the content exists in both
+         // frames; where they disagree (a wrong vector, a silhouette whose blocks carry the
+         // background's motion, a background uncovered from behind a passing object) averaging
+@@ -113,11 +113,11 @@ void main()
+         float level = 0.5 * (dot(from_cur.rgb, vec3(1.0 / 3.0)) + dot(from_prev.rgb, vec3(1.0 / 3.0)));
+         float disagreement = max(diff.r, max(diff.g, diff.b)) / (level + 0.05);
+         float unmoved = smoothstep(0.15, 0.6, disagreement);
+-        colour = 0.5 * (from_cur + from_prev);
++        colour = mix(from_prev, from_cur, p.phase);
+         if (unmoved > 0.0) /* exactly zero wherever the warps agree, which is nearly everywhere */
+             colour = mix(colour, texelFetch(u_cur, pix, 0), unmoved);
+     } else if (p.fallback == 1) {
+-        colour = 0.5 * (texture(u_cur, y * inv_size) + texture(u_prev, y * inv_size));
++        colour = mix(texture(u_prev, y * inv_size), texture(u_cur, y * inv_size), p.phase);
+     } else {
+         colour = texture(u_prev, y * inv_size);
+     }
+diff --git a/src/config.c b/src/config.c
+index 696f9fe..6dc2ecb 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -90,6 +90,10 @@ static void init(void)
+     long performance = AFMF_PERFORMANCE_AUTO;
+     long profile = 0;
+     long async = 1;
++    /* Presenting from the layer's own queue on a thread of its own: the hook then returns as soon
++     * as the application's semaphores are consumed, instead of waiting for the pacing hold and both
++     * presents. Off by hand only to compare the two paths. */
++    long threaded = 1;
+     /* Pacing holds the real frame back by half a frame time so the generated one lands halfway,
+      * as the driver-level implementation does (its documented 4-5 ms of added latency at 120 fps). */
+     long pacing = 1;
+@@ -141,6 +145,7 @@ static void init(void)
+     ok = read_choice("AFMF_FAST_MOTION_RESPONSE", responses, 2, &fast_motion) && ok;
+     ok = read_bounded("AFMF_PROFILE", 0, 1, &profile) && ok;
+     ok = read_bounded("AFMF_ASYNC", 0, 1, &async) && ok;
++    ok = read_bounded("AFMF_THREADED", 0, 1, &threaded) && ok;
+     ok = read_bounded("AFMF_PACING", 0, 1, &pacing) && ok;
+     ok = read_choice("AFMF_PERFORMANCE_MODE", performance_modes, 3, &performance) && ok;
+     ok = read_choice("AFMF_PRESENT_MODE", present_modes, 2, &present_mode) && ok;
+@@ -164,7 +169,14 @@ static void init(void)
+     const char *dump_dir = getenv("AFMF_DUMP_DIR");
+     g_config.dump_dir = dump_dir != NULL && *dump_dir != '\0' ? strdup(dump_dir) : NULL;
+     g_config.profile = profile != 0 || log_level >= AFMF_LOG_DEBUG;
++    /* Lapinux's experimental live control requires the validated inline path.
++     * Do not let an inherited AFMF_ASYNC value select an unvalidated queue. */
++    /* The lapinux live-control variable used to force the inline path. The present hook now
++     * drains the queued presents before it touches the swapchain itself (a multiplier change
++     * or a disable), which was the reason for that restriction: the control works with the
++     * layer's own queue too. */
+     g_config.async = async != 0;
++    g_config.threaded = threaded != 0;
+     g_config.pacing = pacing != 0;
+     g_config.passive = gamescope != 0 && process_is_gamescope();
+     g_config.present_mode = (enum afmf_present_mode)present_mode;
+diff --git a/src/config.h b/src/config.h
+index 0e6f30c..abbdb0d 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -36,6 +36,7 @@ struct afmf_config {
+     const char *dump_dir;        /* AFMF_DUMP_DIR: where the first generated frames are written as PPM */
+     bool profile;                /* AFMF_PROFILE=1 (or AFMF_LOG=3): GPU time per pass, logged periodically */
+     bool async;                  /* AFMF_ASYNC=0 keeps the work on the application's queue */
++    bool threaded;               /* AFMF_THREADED=0 presents inline even on the layer's own queue */
+     bool pacing;                 /* AFMF_PACING=0 presents the real frame right behind the generated one */
+     bool passive;                /* AFMF_GAMESCOPE=1 and this process is Gamescope itself: pass-through */
+     enum afmf_present_mode present_mode; /* AFMF_PRESENT_MODE: auto | keep */
+diff --git a/src/framegen.c b/src/framegen.c
+index 37098a7..3bb9391 100644
+--- a/src/framegen.c
++++ b/src/framegen.c
+@@ -119,6 +119,10 @@ static const char *blocker_for(struct afmf_device *dev, struct afmf_framegen *fg
+     if (!afmf_framegen_format_supports(dev, fg->out_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
+         !afmf_framegen_format_supports(dev, fg->color_format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+         return "device lacks storage or filtered sampling for the swapchain format";
++    if (fg->out_format != swapchain_format &&
++        (!afmf_framegen_format_supports(dev, fg->out_format, VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
++         !afmf_framegen_format_supports(dev, swapchain_format, VK_FORMAT_FEATURE_BLIT_DST_BIT)))
++        return "device cannot blit between the interpolation format and the swapchain format";
+     if (half && !fg->ingest_direct &&
+         !afmf_framegen_format_supports(dev, downsample_variants[fg->half].format,
+                                        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+diff --git a/src/framegen.h b/src/framegen.h
+index 9ee4438..8cfba82 100644
+--- a/src/framegen.h
++++ b/src/framegen.h
+@@ -54,8 +54,8 @@ void afmf_framegen_set_family(struct afmf_device *dev, struct afmf_framegen *fg,
+  * `current_index` and `target_index` are the images' indices in the swapchain (the direct paths
+  * select their views by them). */
+ void afmf_framegen_record(struct afmf_device *dev, struct afmf_framegen *fg, VkCommandBuffer cmd,
+-                          uint32_t slot, VkImage current, uint32_t current_index, VkImage target,
+-                          uint32_t target_index);
++                          uint32_t slot, VkImage current, uint32_t current_index,
++                          const VkImage *targets, const uint32_t *target_indices, uint32_t target_count);
+ 
+ /* Pyramid levels the search uses from now on, between 5 and what the swapchain was set up with;
+  * fewer levels cost less and reach shorter motion. The governor lowers it under GPU contention. */
+diff --git a/src/framegen_format.c b/src/framegen_format.c
+index a151f09..8e37192 100644
+--- a/src/framegen_format.c
++++ b/src/framegen_format.c
+@@ -7,6 +7,7 @@
+  * luma pass should read the values. False for formats without a variant. */
+ bool afmf_framegen_describe_format(VkFormat swapchain_format, struct afmf_framegen *fg)
+ {
++    fg->blit_target = false;
+     switch (swapchain_format) {
+     case VK_FORMAT_R8G8B8A8_UNORM:
+     case VK_FORMAT_R8G8B8A8_SRGB:
+@@ -25,6 +26,15 @@ bool afmf_framegen_describe_format(VkFormat swapchain_format, struct afmf_frameg
+         fg->out_format = swapchain_format;
+         fg->variant = VARIANT_RGB10A2;
+         break;
++    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++        /* Même mot 10-10-10-2 que A2B10G10R10, R et B inversés, et le pilote n'offre aucune
++         * écriture storage sur ce format : la trame est interpolée en A2B10G10R10 puis
++         * blittée dans la cible, un blit convertissant par nom de composante. */
++        fg->color_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++        fg->out_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++        fg->variant = VARIANT_RGB10A2;
++        fg->blit_target = true;
++        break;
+     case VK_FORMAT_R16G16B16A16_SFLOAT:
+         fg->color_format = swapchain_format;
+         fg->out_format = swapchain_format;
+@@ -54,7 +64,8 @@ bool afmf_framegen_format_supports(const struct afmf_device *dev, VkFormat forma
+ }
+ 
+ /* The interpolate variant that stores into a view of the swapchain's own format, or VARIANT_COUNT
+- * when none can (sRGB formats take no storage writes; B8G8R8A8 has no SPIR-V format). */
++ * when none can (sRGB formats take no storage writes; B8G8R8A8 has no SPIR-V format and takes
++ * shaderStorageImageWriteWithoutFormat; A2R10G10B10 takes no storage writes at all). */
+ enum variant afmf_framegen_direct_variant_for(const struct afmf_device *dev, VkFormat swapchain_format)
+ {
+     if (!afmf_framegen_format_supports(dev, swapchain_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+diff --git a/src/framegen_internal.h b/src/framegen_internal.h
+index 7b3130b..3a54ac8 100644
+--- a/src/framegen_internal.h
++++ b/src/framegen_internal.h
+@@ -127,6 +127,7 @@ struct afmf_framegen {
+     VkFormat color_format; /* UNORM sibling of the swapchain format: same bytes, no sRGB decode */
+     VkFormat out_format;
+     VkFormat swapchain_format;
++    bool blit_target; /* swapchain format differs in channel order from the ring: blit, not copy */
+     enum variant variant;
+     /* Direct output (AFMF_DIRECT_OUTPUT): the interpolator writes the swapchain image through a
+      * storage view per image, with an interpolate set per (parity, image); `output` is unused. */
+diff --git a/src/framegen_passes.h b/src/framegen_passes.h
+index c4fac6e..e58dad9 100644
+--- a/src/framegen_passes.h
++++ b/src/framegen_passes.h
+@@ -36,6 +36,7 @@ struct interpolate_push {
+     float max_motion;
+     float flow_scale;
+     float hud_threshold;
++    float phase;
+ };
+ 
+ struct downsample_push {
+@@ -53,7 +54,7 @@ struct ingest_push {
+ 
+ /* The GLSL side declares the same members in the same order; a member added on one side only
+  * would read the next one's bytes. */
+-_Static_assert(sizeof(struct interpolate_push) == 28, "interpolate push constants");
++_Static_assert(sizeof(struct interpolate_push) == 32, "interpolate push constants");
+ _Static_assert(sizeof(struct downsample_push) == 16, "downsample push constants");
+ _Static_assert(sizeof(struct ingest_push) == 24, "ingest push constants");
+ 
+diff --git a/src/framegen_record.c b/src/framegen_record.c
+index 174db32..e15628d 100644
+--- a/src/framegen_record.c
++++ b/src/framegen_record.c
+@@ -108,6 +108,21 @@ void afmf_framegen_copy_whole(struct afmf_device *dev, VkCommandBuffer cmd, VkIm
+     dev->fns.cmd_copy_image(cmd, src, src_layout, dst, dst_layout, 1, &region);
+ }
+ 
++/* Same job across two formats of the same 32-bit layout (A2R10G10B10 target, A2B10G10R10 ring):
++ * a blit converts by component name where a copy would keep the bits and swap red with blue. */
++void afmf_framegen_blit_whole(struct afmf_device *dev, VkCommandBuffer cmd, VkImage src,
++                              VkImageLayout src_layout, VkImage dst, VkImageLayout dst_layout,
++                              VkExtent2D extent)
++{
++    VkImageBlit region = {
++        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++    };
++    region.srcOffsets[1] = (VkOffset3D){(int32_t)extent.width, (int32_t)extent.height, 1};
++    region.dstOffsets[1] = region.srcOffsets[1];
++    dev->fns.cmd_blit_image(cmd, src, src_layout, dst, dst_layout, 1, &region, VK_FILTER_NEAREST);
++}
++
+ void afmf_framegen_set_levels(struct afmf_framegen *fg, uint32_t levels)
+ {
+     fg->levels = levels < 5u ? 5u : levels > fg->max_levels ? fg->max_levels : levels;
+@@ -121,7 +136,7 @@ uint32_t afmf_framegen_max_levels(const struct afmf_framegen *fg)
+ /* Records the interpolated frame with `set` (which names the output image). */
+ void afmf_framegen_record_interpolate(struct afmf_device *dev, struct afmf_framegen *fg,
+                                       VkCommandBuffer cmd, uint32_t slot, VkDescriptorSet set,
+-                                      enum variant variant)
++                                      enum variant variant, float phase)
+ {
+     const struct afmf_framegen_pipelines *pl = dev->framegen_pipelines;
+     uint32_t out_w = fg->extent.width, out_h = fg->extent.height;
+@@ -133,6 +148,7 @@ void afmf_framegen_record_interpolate(struct afmf_device *dev, struct afmf_frame
+         .flow_scale = (float)fg->flow_scale,
+         /* One 8-bit level: HUD text is drawn after anti-aliasing and repeats exactly. */
+         .hud_threshold = afmf_config_get()->hud_detect ? 1.0f / 255.0f : 0.0f,
++        .phase = phase,
+     };
+     dev->fns.cmd_push_constants(cmd, pl->layouts[PASS_INTERPOLATE], VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                 (uint32_t)sizeof push, &push);
+@@ -197,7 +213,5 @@ void afmf_framegen_record_flow(struct afmf_device *dev, struct afmf_framegen *fg
+         }
+     }
+ 
+-    /* The frame in between, into fg->output. */
+-    if (companion && !fg->direct)
+-        afmf_framegen_record_interpolate(dev, fg, cmd, slot, fg->sets[p][SET_INTERPOLATE], fg->variant);
++    /* Interpolation is recorded separately for each requested phase. */
+ }
+diff --git a/src/framegen_record.h b/src/framegen_record.h
+index 14c86c7..514dea9 100644
+--- a/src/framegen_record.h
++++ b/src/framegen_record.h
+@@ -10,9 +10,25 @@ void afmf_framegen_write_constants(struct afmf_framegen *fg, uint32_t slot, uint
+ void afmf_framegen_copy_whole(struct afmf_device *dev, VkCommandBuffer cmd, VkImage src,
+                               VkImageLayout src_layout, VkImage dst, VkImageLayout dst_layout,
+                               VkExtent2D extent);
++void afmf_framegen_blit_whole(struct afmf_device *dev, VkCommandBuffer cmd, VkImage src,
++                              VkImageLayout src_layout, VkImage dst, VkImageLayout dst_layout,
++                              VkExtent2D extent);
++
++/* Whole frame into `dst`: a copy when the target has the ring's channel order, a blit when the
++ * swapchain format swaps red and blue. */
++static inline void afmf_framegen_copy_or_blit(struct afmf_device *dev,
++                                              const struct afmf_framegen *fg, VkCommandBuffer cmd,
++                                              VkImage src, VkImageLayout src_layout, VkImage dst,
++                                              VkImageLayout dst_layout, VkExtent2D extent)
++{
++    if (fg->blit_target)
++        afmf_framegen_blit_whole(dev, cmd, src, src_layout, dst, dst_layout, extent);
++    else
++        afmf_framegen_copy_whole(dev, cmd, src, src_layout, dst, dst_layout, extent);
++}
+ void afmf_framegen_record_interpolate(struct afmf_device *dev, struct afmf_framegen *fg,
+                                       VkCommandBuffer cmd, uint32_t slot, VkDescriptorSet set,
+-                                      enum variant variant);
++                                      enum variant variant, float phase);
+ void afmf_framegen_record_flow(struct afmf_device *dev, struct afmf_framegen *fg, VkCommandBuffer cmd,
+                                uint32_t slot, uint32_t p, uint32_t levels, bool companion);
+ 
+diff --git a/src/framegen_record_frame.c b/src/framegen_record_frame.c
+index 5920902..5c3f7c1 100644
+--- a/src/framegen_record_frame.c
++++ b/src/framegen_record_frame.c
+@@ -101,24 +101,28 @@ static void record_dump(struct afmf_device *dev, struct afmf_framegen *fg, VkCom
+ }
+ 
+ void afmf_framegen_record(struct afmf_device *dev, struct afmf_framegen *fg, VkCommandBuffer cmd,
+-                          uint32_t slot, VkImage current, uint32_t current_index, VkImage target,
+-                          uint32_t target_index)
++                          uint32_t slot, VkImage current, uint32_t current_index,
++                          const VkImage *targets, const uint32_t *target_indices, uint32_t target_count)
+ {
+     const struct afmf_framegen_pipelines *pl = dev->framegen_pipelines;
+     uint32_t levels = fg->levels;
+     uint32_t p = fg->frame_index & 1u;
+     uint32_t w = fg->of_extent.width, h = fg->of_extent.height; /* optical flow dimensions */
+-    bool companion = target != VK_NULL_HANDLE;
++    bool companion = target_count > 0;
+ 
+     /* The direct paths keep one view per swapchain image: an index past them is a broken
+      * caller, not a case to fall back from (the copy fallback would leave the luma unwritten,
+      * or copy from an output image that direct output never creates). */
+-    if ((fg->ingest_direct && current_index >= fg->target_count) ||
+-        (fg->direct && companion && target_index >= fg->target_count)) {
+-        AFMF_ERR("frame %u / target %u outside the %u swapchain images: nothing recorded",
+-                 current_index, target_index, fg->target_count);
++    if (fg->ingest_direct && current_index >= fg->target_count) {
++        AFMF_ERR("frame %u outside the %u swapchain images", current_index, fg->target_count);
+         return;
+     }
++    for (uint32_t n = 0; n < target_count; n++) {
++        if (fg->direct && target_indices[n] >= fg->target_count) {
++            AFMF_ERR("target %u outside the %u swapchain images", target_indices[n], fg->target_count);
++            return;
++        }
++    }
+ 
+     if (!fg->initialized)
+         afmf_framegen_initialize(dev, fg, cmd);
+@@ -150,8 +154,8 @@ void afmf_framegen_record(struct afmf_device *dev, struct afmf_framegen *fg, VkC
+                       fg->ingest_sets[p * fg->target_count + current_index], NULL, 0,
+                       (ingest_w + 7) / 8, (ingest_h + 7) / 8, 1);
+     } else {
+-        afmf_framegen_copy_whole(dev, cmd, current, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-                                 fg->color[p].image, VK_IMAGE_LAYOUT_GENERAL, fg->extent);
++        afmf_framegen_copy_or_blit(dev, fg, cmd, current, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                   fg->color[p].image, VK_IMAGE_LAYOUT_GENERAL, fg->extent);
+         afmf_sync(dev, cmd);
+     }
+     if (fg->flow_scale > 1 && !fg->ingest_direct) {
+@@ -171,19 +175,25 @@ void afmf_framegen_record(struct afmf_device *dev, struct afmf_framegen *fg, VkC
+ 
+     /* 3. The frame in between, into the target: written by the interpolator itself (direct
+      *    output, target in GENERAL) or copied from fg->output (target in TRANSFER_DST). */
+-    if (companion) {
++    for (uint32_t n = 0; n < target_count; n++) {
++        float phase = (float)(n + 1u) / (float)(target_count + 1u);
+         if (fg->direct) {
+             afmf_framegen_record_interpolate(dev, fg, cmd, slot,
+-                                             fg->direct_sets[p * fg->target_count + target_index],
+-                                             fg->direct_variant);
++                fg->direct_sets[p * fg->target_count + target_indices[n]], fg->direct_variant, phase);
+         } else {
+-            afmf_sync(dev, cmd); /* the copy engine reads what the dispatch wrote */
+-            afmf_framegen_copy_whole(dev, cmd, fg->output.image, VK_IMAGE_LAYOUT_GENERAL, target,
+-                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, fg->extent);
++            afmf_framegen_record_interpolate(dev, fg, cmd, slot, fg->sets[p][SET_INTERPOLATE], fg->variant, phase);
++            afmf_sync(dev, cmd);
++            afmf_framegen_copy_or_blit(dev, fg, cmd, fg->output.image, VK_IMAGE_LAYOUT_GENERAL,
++                                       targets[n], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                                       fg->extent);
+             afmf_framegen_profiler_mark(dev, fg, cmd, slot, STAGE_OUTPUT);
+         }
+-        if (afmf_framegen_dump_pending(fg))
+-            record_dump(dev, fg, cmd, p, target);
++        const char *dump_index = getenv("AFMF_TEST_DUMP_INDEX");
++        long wanted = dump_index != NULL ? strtol(dump_index, NULL, 10) : -1;
++        if ((wanted < 0 ? n + 1u == target_count : (uint32_t)wanted == n) &&
++            afmf_framegen_dump_pending(fg))
++            record_dump(dev, fg, cmd, p, targets[n]);
++        afmf_sync(dev, cmd); /* next output must not race its copy */
+     }
+ 
+     fg->frame_index++;
+diff --git a/src/layer.c b/src/layer.c
+index 90a3665..0c63e28 100644
+--- a/src/layer.c
++++ b/src/layer.c
+@@ -30,7 +30,7 @@ static VKAPI_ATTR void VKAPI_CALL afmf_DestroySwapchainKHR(VkDevice device, VkSw
+ {
+     struct afmf_device *dev = afmf_device_find(dispatch_key(device));
+     if (dev == NULL || dev->fns.destroy_swapchain == NULL) {
+-        AFMF_ERR("vkDestroySwapchainKHR on device %p without VK_KHR_swapchain", (void *)device);
++        AFMF_ERR("vkDestroySwapchainKHR on device 0x%llx without VK_KHR_swapchain", AFMF_HANDLE(device));
+         return;
+     }
+     afmf_swapchain_destroy(dev, swapchain, alloc);
+@@ -80,7 +80,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL afmf_QueuePresentKHR(VkQueue queue,
+ {
+     struct afmf_device *dev = afmf_device_find(dispatch_key(queue));
+     if (dev == NULL || dev->fns.queue_present == NULL) {
+-        AFMF_ERR("vkQueuePresentKHR on queue %p of an unknown device", (void *)queue);
++        AFMF_ERR("vkQueuePresentKHR on queue 0x%llx of an unknown device", AFMF_HANDLE(queue));
+         return VK_ERROR_DEVICE_LOST;
+     }
+     return afmf_swapchain_present(dev, queue, info);
+@@ -106,7 +106,7 @@ static VkResult create_surface_logged(VkInstance instance, const char *fn_name,
+         return VK_ERROR_EXTENSION_NOT_PRESENT;
+     VkResult res = next(instance, info, alloc, out);
+     if (res == VK_SUCCESS)
+-        AFMF_INFO("surface %p created: %s", (void *)*out, platform);
++        AFMF_INFO("surface 0x%llx created: %s", AFMF_HANDLE(*out), platform);
+     return res;
+ }
+ 
+diff --git a/src/layer.h b/src/layer.h
+index 67d4012..8ff78a1 100644
+--- a/src/layer.h
++++ b/src/layer.h
+@@ -32,6 +32,7 @@ struct afmf_device_fns {
+     PFN_vkEndCommandBuffer end_command_buffer;
+     PFN_vkCmdPipelineBarrier cmd_pipeline_barrier;
+     PFN_vkCmdCopyImage cmd_copy_image;
++    PFN_vkCmdBlitImage cmd_blit_image;
+     PFN_vkQueueSubmit queue_submit;
+     PFN_vkQueueSubmit2 queue_submit2;
+     PFN_vkQueueSubmit2KHR queue_submit2_khr;
+diff --git a/src/layer_device.c b/src/layer_device.c
+index 81ab9f8..c262fd0 100644
+--- a/src/layer_device.c
++++ b/src/layer_device.c
+@@ -200,24 +200,24 @@ VKAPI_ATTR VkResult VKAPI_CALL afmf_CreateDevice(VkPhysicalDevice physical_devic
+         afmf_framegen_pipelines_prepare(dev);
+ 
+     if (dev->async_queue != VK_NULL_HANDLE && !dev->async_shared)
+-        AFMF_INFO("device %p created, VK_KHR_swapchain %s, layer queue on family %u (%s priority)",
+-                  (void *)*out, dev->fns.queue_present != NULL ? "enabled" : "not enabled",
++        AFMF_INFO("device 0x%llx created, VK_KHR_swapchain %s, layer queue on family %u (%s priority)",
++                  AFMF_HANDLE(*out), dev->fns.queue_present != NULL ? "enabled" : "not enabled",
+                   dev->async_family, dev->async_high_priority ? "high" : "normal");
+     else if (dev->async_queue != VK_NULL_HANDLE)
+-        AFMF_INFO("device %p created, VK_KHR_swapchain %s, no spare compute queue: sharing the "
++        AFMF_INFO("device 0x%llx created, VK_KHR_swapchain %s, no spare compute queue: sharing the "
+                   "application's queue %u of family %u",
+-                  (void *)*out, dev->fns.queue_present != NULL ? "enabled" : "not enabled",
++                  AFMF_HANDLE(*out), dev->fns.queue_present != NULL ? "enabled" : "not enabled",
+                   async_index, dev->async_family);
+     else
+-        AFMF_INFO("device %p created, VK_KHR_swapchain %s, no compute queue to use: working on "
++        AFMF_INFO("device 0x%llx created, VK_KHR_swapchain %s, no compute queue to use: working on "
+                   "the presenting queue",
+-                  (void *)*out, dev->fns.queue_present != NULL ? "enabled" : "not enabled");
++                  AFMF_HANDLE(*out), dev->fns.queue_present != NULL ? "enabled" : "not enabled");
+     for (uint32_t i = 0; i < info->queueCreateInfoCount; i++)
+-        AFMF_DEBUG("device %p: application asked for %u queue(s) in family %u", (void *)*out,
++        AFMF_DEBUG("device 0x%llx: application asked for %u queue(s) in family %u", AFMF_HANDLE(*out),
+                    info->pQueueCreateInfos[i].queueCount,
+                    info->pQueueCreateInfos[i].queueFamilyIndex);
+-    AFMF_DEBUG("device %p: %s, subgroups of %u lanes (operations 0x%x in stages 0x%x)",
+-               (void *)*out, properties.deviceName, dev->subgroup.subgroupSize,
++    AFMF_DEBUG("device 0x%llx: %s, subgroups of %u lanes (operations 0x%x in stages 0x%x)",
++               AFMF_HANDLE(*out), properties.deviceName, dev->subgroup.subgroupSize,
+                dev->subgroup.supportedOperations, dev->subgroup.supportedStages);
+     return VK_SUCCESS;
+ }
+diff --git a/src/layer_device_fns.c b/src/layer_device_fns.c
+index 8de7f02..3d54d05 100644
+--- a/src/layer_device_fns.c
++++ b/src/layer_device_fns.c
+@@ -29,6 +29,7 @@ bool afmf_load_device_fns(struct afmf_device *dev, PFN_vkGetDeviceProcAddr next_
+     LOAD_DEVICE_FN(end_command_buffer, vkEndCommandBuffer);
+     LOAD_DEVICE_FN(cmd_pipeline_barrier, vkCmdPipelineBarrier);
+     LOAD_DEVICE_FN(cmd_copy_image, vkCmdCopyImage);
++    LOAD_DEVICE_FN(cmd_blit_image, vkCmdBlitImage);
+     LOAD_DEVICE_FN(queue_submit, vkQueueSubmit);
+     LOAD_DEVICE_FN(queue_submit2, vkQueueSubmit2);
+     LOAD_DEVICE_FN(queue_submit2_khr, vkQueueSubmit2KHR);
+@@ -84,7 +85,8 @@ bool afmf_load_device_fns(struct afmf_device *dev, PFN_vkGetDeviceProcAddr next_
+            f->create_fence && f->destroy_fence && f->wait_for_fences && f->reset_fences &&
+            f->create_command_pool && f->destroy_command_pool && f->allocate_command_buffers &&
+            f->begin_command_buffer && f->end_command_buffer && f->cmd_pipeline_barrier &&
+-           f->cmd_copy_image && f->queue_submit && f->queue_wait_idle && f->device_wait_idle &&
++           f->cmd_copy_image && f->cmd_blit_image && f->queue_submit && f->queue_wait_idle &&
++           f->device_wait_idle &&
+            f->create_shader_module &&
+            f->destroy_shader_module && f->create_descriptor_set_layout &&
+            f->destroy_descriptor_set_layout && f->create_pipeline_layout &&
+diff --git a/src/layer_device_queues.c b/src/layer_device_queues.c
+index 836dbbf..9022b5a 100644
+--- a/src/layer_device_queues.c
++++ b/src/layer_device_queues.c
+@@ -159,8 +159,8 @@ void afmf_device_record_queue(struct afmf_device *dev, VkQueue queue, uint32_t f
+             dev->queues[dev->queue_count].family = family;
+             dev->queue_count++;
+         } else {
+-            AFMF_WARN("more queues handed out than VkDeviceCreateInfo declared; ignoring %p",
+-                      (void *)queue);
++            AFMF_WARN("more queues handed out than VkDeviceCreateInfo declared; ignoring 0x%llx",
++                      AFMF_HANDLE(queue));
+         }
+     }
+     pthread_mutex_unlock(&dev->lock);
+diff --git a/src/layer_instance.c b/src/layer_instance.c
+index 8fb02e1..ac957ae 100644
+--- a/src/layer_instance.c
++++ b/src/layer_instance.c
+@@ -33,6 +33,25 @@ VKAPI_ATTR VkResult VKAPI_CALL afmf_CreateInstance(const VkInstanceCreateInfo *i
+         return VK_ERROR_INITIALIZATION_FAILED;
+ 
+     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
++
++    /* The flow shaders need Vulkan 1.1 subgroups, which the device reports only for an
++     * instance created at 1.1 or later. An application that asks for 1.0 calls nothing the
++     * layer would break by asking the driver for 1.1 instead; without this every such
++     * application would fall back to repeated frames. */
++    VkApplicationInfo raised_app;
++    VkInstanceCreateInfo raised_info;
++    if (info->pApplicationInfo != NULL && info->pApplicationInfo->apiVersion != 0 &&
++        info->pApplicationInfo->apiVersion < VK_API_VERSION_1_1) {
++        uint32_t asked = info->pApplicationInfo->apiVersion;
++        raised_app = *info->pApplicationInfo;
++        raised_app.apiVersion = VK_API_VERSION_1_1;
++        raised_info = *info;
++        raised_info.pApplicationInfo = &raised_app;
++        info = &raised_info;
++        AFMF_DEBUG("instance asked for Vulkan %u.%u; requesting 1.1 for the flow shaders",
++                   VK_API_VERSION_MAJOR(asked), VK_API_VERSION_MINOR(asked));
++    }
++
+     VkResult res = next_create(info, alloc, out);
+     if (res != VK_SUCCESS)
+         return res;
+@@ -81,7 +100,7 @@ VKAPI_ATTR VkResult VKAPI_CALL afmf_CreateInstance(const VkInstanceCreateInfo *i
+ 
+     /* Which display sockets the process can see: a Wine process without WAYLAND_DISPLAY falls
+      * back to X11 whatever PROTON_ENABLE_WAYLAND says, and the surface line later shows it. */
+-    AFMF_INFO("layer active on instance %p (WAYLAND_DISPLAY %s, DISPLAY %s)", (void *)*out,
++    AFMF_INFO("layer active on instance 0x%llx (WAYLAND_DISPLAY %s, DISPLAY %s)", AFMF_HANDLE(*out),
+               getenv("WAYLAND_DISPLAY") != NULL ? "set" : "unset",
+               getenv("DISPLAY") != NULL ? "set" : "unset");
+     return VK_SUCCESS;
+@@ -94,7 +113,7 @@ VKAPI_ATTR void VKAPI_CALL afmf_DestroyInstance(VkInstance instance, const VkAll
+ 
+     struct afmf_instance *inst = afmf_instance_take(dispatch_key(instance));
+     if (inst == NULL) {
+-        AFMF_ERR("vkDestroyInstance on instance %p the layer never created", (void *)instance);
++        AFMF_ERR("vkDestroyInstance on instance 0x%llx the layer never created", AFMF_HANDLE(instance));
+         return;
+     }
+     inst->destroy_instance(instance, alloc);
+diff --git a/src/layer_internal.h b/src/layer_internal.h
+index 1e1a711..0f10b2a 100644
+--- a/src/layer_internal.h
++++ b/src/layer_internal.h
+@@ -17,10 +17,6 @@
+ 
+ #define AFMF_EXPORT __attribute__((visibility("default")))
+ 
+-/* Handle logging casts VkSwapchainKHR to void*, which only holds on 64-bit builds. A 32-bit layer
+- * (for 32-bit DXVK titles) is a separate build target, not this one. */
+-_Static_assert(sizeof(void *) == 8, "64-bit builds only");
+-
+ struct afmf_instance {
+     void *key;
+     VkInstance handle;
+diff --git a/src/layer_queue.c b/src/layer_queue.c
+index 502eb1c..b0b51ed 100644
+--- a/src/layer_queue.c
++++ b/src/layer_queue.c
+@@ -111,7 +111,7 @@ VKAPI_ATTR void VKAPI_CALL afmf_DestroyDevice(VkDevice device, const VkAllocatio
+ 
+     struct afmf_device *dev = afmf_device_take(dispatch_key(device));
+     if (dev == NULL) {
+-        AFMF_ERR("vkDestroyDevice on device %p the layer never created", (void *)device);
++        AFMF_ERR("vkDestroyDevice on device 0x%llx the layer never created", AFMF_HANDLE(device));
+         return;
+     }
+     afmf_swapchain_forget_all(dev);
+diff --git a/src/log.h b/src/log.h
+index b838148..b5a1cbf 100644
+--- a/src/log.h
++++ b/src/log.h
+@@ -16,6 +16,12 @@ enum afmf_log_level {
+ /* Writes one line to stderr when `level` is enabled by AFMF_LOG. Safe from any thread. */
+ void afmf_log(enum afmf_log_level level, const char *fmt, ...) AFMF_PRINTF(2, 3);
+ 
++/* Handles are logged through their numeric value: with 32-bit pointers, VkSwapchainKHR and
++ * VkSurfaceKHR are uint64_t, so a cast to void* would truncate them. The same expression also
++ * covers dispatchable handles, which stay pointers on both builds. */
++#define AFMF_HANDLE(handle) ((unsigned long long)(uintptr_t)(handle))
++#define AFMF_HANDLE_FMT "0x%llx"
++
+ #define AFMF_ERR(...) afmf_log(AFMF_LOG_ERROR, __VA_ARGS__)
+ #define AFMF_WARN(...) afmf_log(AFMF_LOG_WARN, __VA_ARGS__)
+ #define AFMF_INFO(...) afmf_log(AFMF_LOG_INFO, __VA_ARGS__)
+diff --git a/src/swapchain.c b/src/swapchain.c
+index a387d01..87bd053 100644
+--- a/src/swapchain.c
++++ b/src/swapchain.c
+@@ -6,7 +6,8 @@
+ 
+ /* The application's present, with the generated frame in front of it when one could be made. */
+ VkResult afmf_sc_present_generated(struct afmf_device *dev, struct afmf_swapchain *sc, VkQueue queue,
+-                                   uint32_t family, const VkPresentInfoKHR *info, uint64_t ordinal)
++                                   uint32_t family, const VkPresentInfoKHR *info, uint64_t ordinal,
++                                   uint32_t multiplier)
+ {
+     const struct afmf_device_fns *f = &dev->fns;
+     uint32_t i = info->pImageIndices[0];
+@@ -23,10 +24,18 @@ VkResult afmf_sc_present_generated(struct afmf_device *dev, struct afmf_swapchai
+         return afmf_device_queue_present(dev, queue, info);
+     }
+ 
+-    struct afmf_present_job job = {.real_image = i, .ordinal = ordinal};
+-    bool threaded = afmf_sc_presenter_start(sc) && afmf_sc_job_from_chain(sc, info, &job);
++    struct afmf_present_job job = {.real_image = i, .ordinal = ordinal, .multiplier = multiplier};
++    /* The background presenter needs a queue of its own: from the application's queue its
++     * presents would race the application's own submissions, and a deferred real present can be
++     * overtaken by the next acquire. Only `async` (dedicated family, swapchain shared with it)
++     * takes this path. `afmf_sc_presenter_start` returns false otherwise, and the frame falls
++     * back inline below. */
++    bool threaded = sc->async && afmf_config_get()->threaded;
++    /* Inline presents must not overtake a frame still queued for the presenter (a disable, a
++     * multiplier change, a swapchain teardown): they wait for the queue to empty first. On the
++     * threaded path the queue is what keeps the application's thread free, so it is left alone. */
+     if (!threaded)
+-        afmf_sc_presenter_drain(sc); /* a chain the threads cannot carry: inline, but in order */
++        afmf_sc_presenter_drain(sc);
+ 
+     struct timespec t_start, t_present, t_companion, t_real, t_end;
+     (void)clock_gettime(CLOCK_MONOTONIC, &t_start);
+@@ -34,6 +43,11 @@ VkResult afmf_sc_present_generated(struct afmf_device *dev, struct afmf_swapchai
+     uint32_t slot_index = sc->slot_index;
+     sc->slot_index = (sc->slot_index + 1) % sc->image_count;
+ 
++    /* Nothing is consumed from the application yet: a failed start leaves the frame whole for
++     * the inline path below. */
++    if (threaded && !afmf_sc_presenter_start(sc))
++        threaded = false;
++
+     if (threaded) {
+         /* A slot comes round again after image_count frames, and the presentation thread waits
+          * on its fence for the pacing: that frame has to be done before the work thread resets
+@@ -108,11 +122,9 @@ VkResult afmf_sc_present_generated(struct afmf_device *dev, struct afmf_swapchai
+         afmf_sc_gen_disable(sc, "layer submission failed");
+         return afmf_device_queue_present(dev, queue, info);
+     }
+-    bool generate = job.generate;
+-    uint32_t j = job.companion_image;
+-
+     (void)clock_gettime(CLOCK_MONOTONIC, &t_present);
+-    if (generate) {
++    for (uint32_t n = 0; n < job.generated_count; n++) {
++        uint32_t j = job.companion_images[n];
+         VkPresentInfoKHR companion = {
+             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+             .waitSemaphoreCount = 1,
+@@ -123,8 +135,16 @@ VkResult afmf_sc_present_generated(struct afmf_device *dev, struct afmf_swapchai
+         };
+         VkResult presented = f->queue_present(work_queue, &companion);
+         if (presented < 0)
+-            AFMF_DEBUG("swapchain %p: generated present returned %d", (void *)sc->handle,
++            AFMF_DEBUG("swapchain 0x%llx: generated present returned %d", AFMF_HANDLE(sc->handle),
+                        (int)presented);
++        if (job.hold_ns > 0) {
++            struct timespec delay = {
++                .tv_sec = (time_t)(job.hold_ns / 1000000000ull),
++                .tv_nsec = (long)(job.hold_ns % 1000000000ull),
++            };
++            while (nanosleep(&delay, &delay) != 0 && errno == EINTR)
++                ;
++        }
+     }
+     (void)clock_gettime(CLOCK_MONOTONIC, &t_companion);
+ 
+@@ -138,7 +158,7 @@ VkResult afmf_sc_present_generated(struct afmf_device *dev, struct afmf_swapchai
+      * chain the layer cannot carry, it goes out as the application wrote it. */
+     VkSwapchainPresentModeInfoEXT mode_copy;
+     const VkBaseInStructure *head = info->pNext;
+-    if (sc->fifo_to_mailbox && head != NULL &&
++    if (sc->forced_mailbox && head != NULL &&
+         head->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT) {
+         const VkSwapchainPresentModeInfoEXT *m = (const VkSwapchainPresentModeInfoEXT *)head;
+         if (m->swapchainCount >= 1 && m->pPresentModes != NULL) {
+@@ -156,7 +176,7 @@ VkResult afmf_sc_present_generated(struct afmf_device *dev, struct afmf_swapchai
+         }
+     }
+     res = f->queue_present(work_queue, &real);
+-    if (sc->async)
++    if (sc->async || (dev->async_shared && work_queue == dev->async_queue))
+         pthread_mutex_unlock(&dev->async_lock);
+     (void)clock_gettime(CLOCK_MONOTONIC, &t_real);
+ 
+@@ -194,7 +214,25 @@ VkResult afmf_swapchain_present(struct afmf_device *dev, VkQueue queue, const Vk
+ 
+     uint64_t ordinal = afmf_sc_update_cadence(dev, sc);
+     uint32_t family;
+-    if (!sc->gen_enabled || !afmf_device_queue_family(dev, queue, &family))
++    if (!sc->gen_enabled || !afmf_device_queue_family(dev, queue, &family)) {
++        /* Same ordering rule as a disabled multiplier: nothing may pass a queued present. */
++        afmf_sc_presenter_drain(sc);
+         return afmf_device_queue_present(dev, queue, info);
+-    return afmf_sc_present_generated(dev, sc, queue, family, info, ordinal);
++    }
++    uint32_t multiplier = afmf_sc_requested_multiplier();
++    if (multiplier == 0) {
++        /* A later enable must first capture a fresh real frame, rather than interpolate
++         * against stale history from before the disabled period. The frames already queued for
++         * the presenter go out first: this present bypasses the queue and would otherwise reach
++         * the swapchain before them. */
++        afmf_sc_presenter_drain(sc);
++        pthread_mutex_lock(&sc->job_lock);
++        sc->have_history = false;
++        pthread_mutex_unlock(&sc->job_lock);
++        wsi_take(sc);
++        VkResult res = afmf_device_queue_present(dev, queue, info);
++        wsi_give(sc);
++        return res;
++    }
++    return afmf_sc_present_generated(dev, sc, queue, family, info, ordinal, multiplier);
+ }
+diff --git a/src/swapchain_cadence.c b/src/swapchain_cadence.c
+index 5a309ec..f22790c 100644
+--- a/src/swapchain_cadence.c
++++ b/src/swapchain_cadence.c
+@@ -38,17 +38,18 @@ uint64_t afmf_sc_update_cadence(struct afmf_device *dev, struct afmf_swapchain *
+         /* Where the application's thread waits (the hook: with AFMF_PROFILE this is the number
+          * that says whether the layer costs the game host time), then the layer's two threads. */
+ #define STATS_LINE                                                                                \
+-    "swapchain %p: %" PRIu64 " presents, %" PRIu64 " generated, %" PRIu64 " no free image; "    \
++    "swapchain 0x%llx: %" PRIu64 " presents, %" PRIu64 " generated, %" PRIu64 " no free image; "    \
+     "%.2f ms between presents (%.0f real fps); in the hook %.0f us per present; work thread: "  \
+     "slot fence %.0f, acquire %.0f, record %.0f, submit %.0f; presentation thread: present "     \
+     "generated %.0f, present real %.0f, refill %.0f, gpu done +%.2f ms, pacing hold %.2f ms; "  \
+-    "governor step %u"
++    "governor step %u; modes off=%" PRIu64 " x2=%" PRIu64 " x3=%" PRIu64 " x4=%" PRIu64
+ #define STATS_ARGS                                                                                \
+-    (void *)sc->handle, sc->present_count, sc->generated, sc->skipped_no_image, frame_ms,       \
++    AFMF_HANDLE(sc->handle), sc->present_count, sc->generated, sc->skipped_no_image, frame_ms,       \
+         1e3 / frame_ms, 1e3 * sc->hook_ms / n, 1e3 * sc->fence_ms / n, 1e3 * sc->acquire_ms / n, \
+         1e3 * sc->record_ms / n, 1e3 * sc->submit_ms / n, 1e3 * sc->present_ms / n,             \
+         1e3 * sc->present_real_ms / n, 1e3 * sc->refill_ms / n, sc->gpu_delay_ms / n,           \
+-        sc->hold_ms / n, sc->governor_step
++        sc->hold_ms / n, sc->governor_step, sc->generated_by_mode[0], sc->generated_by_mode[2],   \
++        sc->generated_by_mode[3], sc->generated_by_mode[4]
+         pthread_mutex_lock(&sc->job_lock); /* the threads' counters */
+         if (afmf_config_get()->profile)
+             AFMF_INFO(STATS_LINE, STATS_ARGS);
+@@ -113,8 +114,8 @@ bool afmf_sc_governor_allows(struct afmf_swapchain *sc, double last_delay_ms, ui
+         if (sc->fg != NULL)
+             afmf_framegen_set_levels(sc->fg, sc->governor_step >= 1 ? 5u
+                                                                     : afmf_framegen_max_levels(sc->fg));
+-        AFMF_INFO("swapchain %p: governor step %u (generated frame ready %.0f%% into the frame): %s",
+-                  (void *)sc->handle, sc->governor_step, 100.0 * ratio,
++        AFMF_INFO("swapchain 0x%llx: governor step %u (generated frame ready %.0f%% into the frame): %s",
++                  AFMF_HANDLE(sc->handle), sc->governor_step, 100.0 * ratio,
+                   sc->governor_step == 0   ? "every frame, full search"
+                   : sc->governor_step == 1 ? "every frame, five search levels"
+                   : sc->governor_step == 2 ? "one companion in two"
+@@ -137,22 +138,18 @@ void afmf_sc_spare_refill(struct afmf_device *dev, struct afmf_swapchain *sc, ui
+ {
+     if (sc->spare_valid)
+         return;
+-    VkResult res = dev->fns.acquire_next_image(dev->handle, sc->handle, timeout, VK_NULL_HANDLE,
++    VkResult res = dev->fns.acquire_next_image(dev->handle, sc->handle, timeout, sc->spare_semaphore,
+                                                sc->spare_fence, &sc->spare_image);
+     sc->spare_valid = res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR;
+ }
+ 
+-/* Hands out the spare for this frame's companion once the presentation engine has released it;
+- * false leaves it for the next frame (or means there was none to be had). Only the acquire and
+- * the spare's state need the swapchain lock: the fence wait runs without it, so the presentation
+- * thread keeps presenting meanwhile. The thread only refills once `spare_valid` drops, so the
+- * fence is reset before that, and never raced. */
+-bool afmf_sc_spare_take(struct afmf_device *dev, struct afmf_swapchain *sc, uint32_t *image)
++/* Hands out an acquired spare and its semaphore; the GPU submission waits for the
++ * presentation engine to release it. */
++bool afmf_sc_spare_take(struct afmf_device *dev, struct afmf_swapchain *sc, uint32_t *image,
++                        VkSemaphore *available, VkFence *acquired, uint64_t wait_ns)
+ {
+-    /* AFMF_ACQUIRE_TIMEOUT_US bounds the whole wait for a released image: the acquire, in
+-     * slices so the presentation thread keeps its turn (its presents are what free images),
+-     * then the release fence. */
+-    uint64_t left = afmf_config_get()->acquire_timeout_ns;
++    /* Acquire in slices so the presentation thread can submit presents that free images. */
++    uint64_t left = wait_ns;
+     bool valid;
+     uint32_t spare;
+     for (;;) {
+@@ -168,14 +165,14 @@ bool afmf_sc_spare_take(struct afmf_device *dev, struct afmf_swapchain *sc, uint
+     }
+     if (!valid)
+         return false;
+-    /* The release fence gets at least a slice even when the acquire spent the whole budget:
+-     * the image is there, and a companion is worth a millisecond of the work thread. */
+-    uint64_t fence_wait = left > AFMF_ACQUIRE_SLICE_NS ? left : AFMF_ACQUIRE_SLICE_NS;
+-    if (dev->fns.wait_for_fences(dev->handle, 1, &sc->spare_fence, VK_TRUE, fence_wait) != VK_SUCCESS)
+-        return false;
+-    (void)dev->fns.reset_fences(dev->handle, 1, &sc->spare_fence);
+     wsi_take(sc);
+     sc->spare_valid = false;
++    VkSemaphore fresh = *available;
++    *available = sc->spare_semaphore;
++    sc->spare_semaphore = fresh;
++    VkFence fresh_fence = *acquired;
++    *acquired = sc->spare_fence;
++    sc->spare_fence = fresh_fence;
+     wsi_give(sc);
+     *image = spare;
+     return true;
+diff --git a/src/swapchain_create.c b/src/swapchain_create.c
+index 153530c..733d3d8 100644
+--- a/src/swapchain_create.c
++++ b/src/swapchain_create.c
+@@ -15,6 +15,12 @@ static const char *generation_blocker(const struct afmf_device *dev,
+     if (dev->ifns.get_surface_capabilities == NULL ||
+         dev->ifns.get_surface_capabilities(dev->physical_device, info->surface, caps) != VK_SUCCESS)
+         return "surface capabilities unavailable";
++    AFMF_DEBUG("swapchain request: %ux%u, format %d, present mode %d, %u images (surface min %u, "
++               "max %u), usage 0x%x, extra %u",
++               info->imageExtent.width, info->imageExtent.height, (int)info->imageFormat,
++               (int)info->presentMode, info->minImageCount, caps->minImageCount,
++               caps->maxImageCount, (unsigned)caps->supportedUsageFlags,
++               afmf_config_get()->extra_images);
+     if (info->imageArrayLayers != 1)
+         return "layered swapchain";
+     if (info->presentMode == VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR ||
+@@ -22,8 +28,10 @@ static const char *generation_blocker(const struct afmf_device *dev,
+         return "shared present mode";
+     if ((caps->supportedUsageFlags & copy_usage) != copy_usage)
+         return "surface images cannot be copied";
+-    if (caps->maxImageCount != 0 &&
+-        info->minImageCount + afmf_config_get()->extra_images > caps->maxImageCount)
++    /* Gamescope's surface caps the count tightly (8 with a 4-image request): ask for as many
++     * extra images as it allows rather than hand the game a pass-through swapchain. One spare
++     * is enough to run, and ×3/×4 take what the ring can hold. */
++    if (caps->maxImageCount != 0 && info->minImageCount >= caps->maxImageCount)
+         return "no room for the extra images";
+     return NULL;
+ }
+@@ -72,7 +80,7 @@ VkResult afmf_swapchain_create(struct afmf_device *dev, const VkSwapchainCreateI
+     VkPresentModeKHR chain_modes[AFMF_MAX_PRESENT_MODES];
+     uint32_t chain_mode_count = 0;
+     bool async = false;
+-    bool fifo_to_mailbox = false;
++    bool forced_mailbox = false;
+     bool storage_usage = false;
+     bool sampled_usage = false;
+     if (blocker == NULL) {
+@@ -99,16 +107,19 @@ VkResult afmf_swapchain_create(struct afmf_device *dev, const VkSwapchainCreateI
+                           (int)info->imageFormat);
+         }
+         /* Every present takes a refresh slot in FIFO and the layer doubles the presents: a game
+-         * above half the refresh rate loses real frames (120 at 165 Hz -> 82). MAILBOX shows the
+-         * latest frame and drops the excess instead, which is what the doubling needs. */
++         * above half the refresh rate loses real frames (120 at 165 Hz -> 82). IMMEDIATE has the
++         * opposite problem: the presentation engine keeps the queue full and never hands an image
++         * back, so the companions starve after a few thousand presents. MAILBOX shows the latest
++         * frame and drops the excess instead, which is what the doubling needs either way. */
+         if (afmf_config_get()->present_mode == AFMF_PRESENT_AUTO &&
+             (info->presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+-             info->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
++             info->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
++             info->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) &&
+             afmf_sc_surface_offers(dev, info->surface, VK_PRESENT_MODE_MAILBOX_KHR)) {
+             if (afmf_sc_chain_allows_mailbox(dev, info->surface, info->pNext, chain_storage,
+                                              chain_modes, &chain_mode_count, &patched.pNext)) {
+                 patched.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+-                fifo_to_mailbox = true;
++                forced_mailbox = true;
+             } else {
+                 AFMF_INFO("swapchain create chain carries a structure the layer cannot copy: "
+                           "present mode %d kept",
+@@ -118,8 +129,22 @@ VkResult afmf_swapchain_create(struct afmf_device *dev, const VkSwapchainCreateI
+         patched.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+         /* Generated frames are presented from images of the same swapchain; the presentation
+          * engine keeps a few queued, so one extra is not enough to find one free at present time. */
+-        patched.minImageCount += afmf_config_get()->extra_images;
+-        async = share_with_layer_queue(dev, info, &patched, families);
++        /* Three companions for ×4 plus one spare for the next present: a swapchain sized for ×2
++         * leaves ×3/×4 without a free image at present time. The count is capped by what the
++         * surface offers; a live multiplier above what fits simply gets fewer companions. */
++        uint32_t extra = afmf_config_get()->extra_images;
++        if (extra < AFMF_MAX_COMPANIONS + 1u)
++            extra = AFMF_MAX_COMPANIONS + 1u;
++        if (caps.maxImageCount != 0 && info->minImageCount + extra > caps.maxImageCount) {
++            extra = caps.maxImageCount - info->minImageCount;
++            AFMF_INFO("swapchain: %u extra image(s) only (the surface allows %u in total)", extra,
++                      caps.maxImageCount);
++        }
++        patched.minImageCount += extra;
++        /* A deferred present on an application's queue can be overtaken by its next
++         * acquire/submit. Use the inline path for shared queues; only a dedicated queue
++         * may use the background presenter. */
++        async = !dev->async_shared && share_with_layer_queue(dev, info, &patched, families);
+     }
+ 
+     VkResult res = dev->fns.create_swapchain(dev->handle, &patched, alloc, out);
+@@ -137,7 +162,7 @@ VkResult afmf_swapchain_create(struct afmf_device *dev, const VkSwapchainCreateI
+     sc->format = info->imageFormat;
+     sc->extent = info->imageExtent;
+     sc->present_mode = patched.presentMode;
+-    sc->fifo_to_mailbox = fifo_to_mailbox;
++    sc->forced_mailbox = forced_mailbox;
+     sc->storage_usage = storage_usage;
+     sc->sampled_usage = sampled_usage;
+     memcpy(sc->allowed_modes, chain_modes, chain_mode_count * sizeof *chain_modes);
+@@ -162,12 +187,12 @@ VkResult afmf_swapchain_create(struct afmf_device *dev, const VkSwapchainCreateI
+         sc->gen_enabled = true;
+         VkResult gen = afmf_sc_gen_init(dev, sc);
+         if (gen != VK_SUCCESS) {
+-            AFMF_WARN("swapchain %p: generation resources failed (VkResult %d); pass-through",
+-                      (void *)sc->handle, (int)gen);
++            AFMF_WARN("swapchain 0x%llx: generation resources failed (VkResult %d); pass-through",
++                      AFMF_HANDLE(sc->handle), (int)gen);
+             afmf_sc_gen_teardown(dev, sc);
+         }
+     } else {
+-        AFMF_INFO("swapchain %p: pass-through (%s)", (void *)sc->handle, blocker);
++        AFMF_INFO("swapchain 0x%llx: pass-through (%s)", AFMF_HANDLE(sc->handle), blocker);
+     }
+ 
+     pthread_mutex_lock(&dev->lock);
+@@ -175,9 +200,9 @@ VkResult afmf_swapchain_create(struct afmf_device *dev, const VkSwapchainCreateI
+     dev->swapchains = sc;
+     pthread_mutex_unlock(&dev->lock);
+ 
+-    AFMF_INFO("swapchain %p created: %ux%u, format %d, present mode %d (app asked %d), %u images "
++    AFMF_INFO("swapchain 0x%llx created: %ux%u, format %d, present mode %d (app asked %d), %u images "
+               "(app asked %u), generation %s%s",
+-              (void *)sc->handle, sc->extent.width, sc->extent.height, (int)sc->format,
++              AFMF_HANDLE(sc->handle), sc->extent.width, sc->extent.height, (int)sc->format,
+               (int)sc->present_mode, (int)info->presentMode, sc->image_count, sc->min_image_count,
+               sc->gen_enabled ? "on" : "off", sc->async ? " (layer queue)" : "");
+     return VK_SUCCESS;
+diff --git a/src/swapchain_destroy.c b/src/swapchain_destroy.c
+index 6ce08b5..35259ed 100644
+--- a/src/swapchain_destroy.c
++++ b/src/swapchain_destroy.c
+@@ -4,10 +4,12 @@
+ 
+ static void report_and_free(struct afmf_device *dev, struct afmf_swapchain *sc)
+ {
+-    AFMF_INFO("swapchain %p destroyed after %" PRIu64 " presents: %" PRIu64 " generated, %" PRIu64
++    AFMF_INFO("Lapinux modes generated: off=%" PRIu64 " x2=%" PRIu64 " x3=%" PRIu64 " x4=%" PRIu64,
++              sc->generated_by_mode[0], sc->generated_by_mode[2], sc->generated_by_mode[3], sc->generated_by_mode[4]);
++    AFMF_INFO("swapchain 0x%llx destroyed after %" PRIu64 " presents: %" PRIu64 " generated, %" PRIu64
+               " skipped (%" PRIu64 " no free image, %" PRIu64 " no history, %" PRIu64
+               " held back by the governor)",
+-              (void *)sc->handle, sc->present_count, sc->generated,
++              AFMF_HANDLE(sc->handle), sc->present_count, sc->generated,
+               sc->skipped_no_image + sc->skipped_no_history + sc->reduced_frames,
+               sc->skipped_no_image, sc->skipped_no_history, sc->reduced_frames);
+     afmf_sc_gen_teardown(dev, sc);
+@@ -46,7 +48,7 @@ void afmf_swapchain_destroy(struct afmf_device *dev, VkSwapchainKHR swapchain,
+         if (sc != NULL)
+             report_and_free(dev, sc);
+         else
+-            AFMF_WARN("destroying swapchain %p the layer never saw", (void *)swapchain);
++            AFMF_WARN("destroying swapchain 0x%llx the layer never saw", AFMF_HANDLE(swapchain));
+     }
+     dev->fns.destroy_swapchain(dev->handle, swapchain, alloc);
+ }
+@@ -68,7 +70,7 @@ void afmf_swapchain_forget_all(struct afmf_device *dev)
+ 
+     while (sc != NULL) {
+         struct afmf_swapchain *next = sc->next;
+-        AFMF_WARN("swapchain %p still alive at device destruction", (void *)sc->handle);
++        AFMF_WARN("swapchain 0x%llx still alive at device destruction", AFMF_HANDLE(sc->handle));
+         report_and_free(dev, sc);
+         sc = next;
+     }
+diff --git a/src/swapchain_internal.h b/src/swapchain_internal.h
+index 9f76d80..198c197 100644
+--- a/src/swapchain_internal.h
++++ b/src/swapchain_internal.h
+@@ -45,14 +45,17 @@
+ /* Bytes and present modes a copied create chain may need. */
+ #define AFMF_CHAIN_BYTES 1024u
+ #define AFMF_MAX_PRESENT_MODES 8u
++/* Images generated between two of the application's frames: ×4 is the widest multiplier. */
++#define AFMF_MAX_COMPANIONS 3u
+ 
+ /* One frame handed to the presentation thread: the generated image first, the real one after
+  * the pacing delay, each with what the application's pNext chain carried that survives being
+  * copied (present id, per-present mode). */
+ struct afmf_present_job {
+     uint32_t real_image;
+-    uint32_t companion_image;
+-    bool generate;
++    uint32_t multiplier;
++    uint32_t companion_images[AFMF_MAX_COMPANIONS];
++    uint32_t generated_count;
+     uint64_t ordinal;         /* this present's number, for the governor's one-in-n cadence */
+     struct timespec arrival;
+     uint64_t hold_ns;         /* half a frame: the real frame goes out this long after the generated one is ready */
+@@ -85,6 +88,9 @@ struct afmf_frame_job {
+ struct afmf_slot {
+     VkCommandBuffer cmd;
+     VkFence fence;
++    VkSemaphore acquire[3];
++    VkFence acquire_fences[3];
++    uint32_t acquired;
+     bool pending;
+ };
+ 
+@@ -93,7 +99,7 @@ struct afmf_swapchain {
+     VkFormat format;
+     VkExtent2D extent;
+     VkPresentModeKHR present_mode; /* the swapchain's, after the layer's rewrite */
+-    bool fifo_to_mailbox;          /* the application asked for FIFO; per-present modes are rewritten too */
++    bool forced_mailbox;           /* FIFO or IMMEDIATE replaced by MAILBOX; per-present modes are rewritten too */
+     /* The per-present modes the swapchain allows (VK_EXT_swapchain_maintenance1) after the
+      * rewrite: the application's list cut down to what is compatible with MAILBOX. Empty when
+      * the application gave no list. */
+@@ -130,10 +136,12 @@ struct afmf_swapchain {
+      * in the hook cost the application that whole period (measured: 5.1-5.9 ms at 165 Hz). */
+     bool spare_valid;
+     uint32_t spare_image;
+-    VkFence spare_fence; /* signalled once the presentation engine has released spare_image */
++    VkSemaphore spare_semaphore; /* GPU-side dependency on the acquire */
++    VkFence spare_fence; /* tracks completion even if the spare is never submitted */
+ 
+     uint64_t present_count;
+     uint64_t generated;
++    uint64_t generated_by_mode[5];
+     uint64_t skipped_no_image;
+     uint64_t skipped_no_history;
+     struct timespec last_present;
+diff --git a/src/swapchain_parts.h b/src/swapchain_parts.h
+index 8a3a028..b0206f0 100644
+--- a/src/swapchain_parts.h
++++ b/src/swapchain_parts.h
+@@ -17,18 +17,20 @@ bool afmf_sc_chain_allows_mailbox(const struct afmf_device *dev, VkSurfaceKHR su
+ 
+ /* swapchain_record.c */
+ VkResult afmf_sc_record_frame(struct afmf_device *dev, struct afmf_swapchain *sc, VkCommandBuffer cmd,
+-                              uint32_t slot, uint32_t i, bool generate, uint32_t j);
++                              uint32_t slot, uint32_t i, const uint32_t *indices, uint32_t count);
+ 
+ /* swapchain_cadence.c */
+ uint64_t afmf_sc_update_cadence(struct afmf_device *dev, struct afmf_swapchain *sc);
+ bool afmf_sc_governor_allows(struct afmf_swapchain *sc, double last_delay_ms, uint64_t ordinal);
+ void afmf_sc_spare_refill(struct afmf_device *dev, struct afmf_swapchain *sc, uint64_t timeout);
+-bool afmf_sc_spare_take(struct afmf_device *dev, struct afmf_swapchain *sc, uint32_t *image);
++bool afmf_sc_spare_take(struct afmf_device *dev, struct afmf_swapchain *sc, uint32_t *image,
++                        VkSemaphore *available, VkFence *acquired, uint64_t wait_ns);
+ 
+ /* swapchain_presenter.c */
+ void *afmf_sc_presenter_main(void *arg);
+ 
+ /* swapchain_worker.c */
++uint32_t afmf_sc_requested_multiplier(void);
+ VkResult afmf_sc_frame_generate(struct afmf_device *dev, struct afmf_swapchain *sc, VkQueue queue,
+                                 uint32_t slot_index, const VkSemaphore *waits, uint32_t wait_count,
+                                 bool threaded, struct afmf_present_job *job);
+@@ -45,4 +47,5 @@ bool afmf_sc_job_from_chain(const struct afmf_swapchain *sc, const VkPresentInfo
+ 
+ /* swapchain.c */
+ VkResult afmf_sc_present_generated(struct afmf_device *dev, struct afmf_swapchain *sc, VkQueue queue,
+-                                   uint32_t family, const VkPresentInfoKHR *info, uint64_t ordinal);
++                                   uint32_t family, const VkPresentInfoKHR *info, uint64_t ordinal,
++                                   uint32_t multiplier);
+diff --git a/src/swapchain_present_chain.c b/src/swapchain_present_chain.c
+index 08a27f1..61c5b0a 100644
+--- a/src/swapchain_present_chain.c
++++ b/src/swapchain_present_chain.c
+@@ -40,7 +40,7 @@ bool afmf_sc_job_from_chain(const struct afmf_swapchain *sc, const VkPresentInfo
+             job->present_mode = m->pPresentModes[0];
+             /* The swapchain was moved to MAILBOX at creation: a switch back to FIFO would bring
+              * the halved rate back, and a mode outside the cut-down list is invalid. */
+-            if (sc->fifo_to_mailbox) {
++            if (sc->forced_mailbox) {
+                 bool allowed = false;
+                 for (uint32_t k = 0; k < sc->allowed_mode_count && !allowed; k++)
+                     allowed = sc->allowed_modes[k] == job->present_mode;
+diff --git a/src/swapchain_presenter.c b/src/swapchain_presenter.c
+index eeeabce..ee79521 100644
+--- a/src/swapchain_presenter.c
++++ b/src/swapchain_presenter.c
+@@ -114,10 +114,12 @@ void *afmf_sc_presenter_main(void *arg)
+         bool draining = sc->presenter_stop;
+ 
+         VkResult first = VK_SUCCESS;
+-        if (job.generate) {
++        for (uint32_t n = 0; n < job.generated_count; n++) {
+             pthread_mutex_unlock(&sc->job_lock);
+-            first = present_one(dev, sc, job.companion_image, sc->sem_generated[job.companion_image],
+-                                &job, false);
++            uint32_t image = job.companion_images[n];
++            VkResult result = present_one(dev, sc, image, sc->sem_generated[image], &job, false);
++            if (first == VK_SUCCESS || result < 0)
++                first = result;
+             /* Hold the real frame back so the generated one gets its half of the interval. The
+              * generated frame cannot show before its GPU work is done, and under contention that
+              * is milliseconds after the present call: the half frame counts from there, capped at
+@@ -132,7 +134,7 @@ void *afmf_sc_presenter_main(void *arg)
+                 if (delay_ms < 0.0)
+                     delay_ms = 0.0;
+                 uint64_t delay_ns = (uint64_t)(delay_ms * 1e6);
+-                uint64_t hold = job.hold_ns + (delay_ns < job.hold_ns ? delay_ns : job.hold_ns);
++                uint64_t hold = job.hold_ns * (uint64_t)(n + 1u) + (delay_ns < job.hold_ns ? delay_ns : job.hold_ns);
+                 timespec_add_ns(&until, hold);
+                 pthread_mutex_lock(&sc->job_lock);
+                 sc->gpu_delay_ms += delay_ms;
+diff --git a/src/swapchain_record.c b/src/swapchain_record.c
+index 2b8d651..fce63bf 100644
+--- a/src/swapchain_record.c
++++ b/src/swapchain_record.c
+@@ -39,8 +39,10 @@ static void copy_whole(const struct afmf_device *dev, VkCommandBuffer cmd, VkIma
+  * a copy of the history image into j. Image i arrives in PRESENT_SRC (the application's
+  * obligation) and is handed back in PRESENT_SRC. */
+ VkResult afmf_sc_record_frame(struct afmf_device *dev, struct afmf_swapchain *sc, VkCommandBuffer cmd,
+-                              uint32_t slot, uint32_t i, bool generate, uint32_t j)
++                              uint32_t slot, uint32_t i, const uint32_t *indices, uint32_t count)
+ {
++    bool generate = count > 0;
++    uint32_t j = generate ? indices[0] : 0;
+     VkCommandBufferBeginInfo begin = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+@@ -49,7 +51,7 @@ VkResult afmf_sc_record_frame(struct afmf_device *dev, struct afmf_swapchain *sc
+     if (res != VK_SUCCESS)
+         return res;
+ 
+-    const VkPipelineStageFlags top = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
++    const VkPipelineStageFlags top = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+     const VkPipelineStageFlags transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+     const VkPipelineStageFlags bottom = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+ 
+@@ -68,13 +70,14 @@ VkResult afmf_sc_record_frame(struct afmf_device *dev, struct afmf_swapchain *sc
+         VkPipelineStageFlags reader = ingest ? compute : transfer;
+         image_barrier(dev, cmd, sc->images[i], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, read, 0, read_access,
+                       top, reader);
+-        if (generate)
+-            image_barrier(dev, cmd, sc->images[j], VK_IMAGE_LAYOUT_UNDEFINED, written, 0, write, top,
+-                          writer);
+-        afmf_framegen_record(dev, sc->fg, cmd, slot, sc->images[i], i,
+-                             generate ? sc->images[j] : VK_NULL_HANDLE, j);
+-        if (generate)
+-            image_barrier(dev, cmd, sc->images[j], written, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, write, 0,
++        VkImage targets[3];
++        for (uint32_t n = 0; n < count; n++) {
++            targets[n] = sc->images[indices[n]];
++            image_barrier(dev, cmd, targets[n], VK_IMAGE_LAYOUT_UNDEFINED, written, 0, write, top, writer);
++        }
++        afmf_framegen_record(dev, sc->fg, cmd, slot, sc->images[i], i, targets, indices, count);
++        for (uint32_t n = 0; n < count; n++)
++            image_barrier(dev, cmd, targets[n], written, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, write, 0,
+                           writer, bottom);
+         image_barrier(dev, cmd, sc->images[i], read, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, read_access, 0,
+                       reader, bottom);
+diff --git a/src/swapchain_resources.c b/src/swapchain_resources.c
+index 52e99a0..deb9097 100644
+--- a/src/swapchain_resources.c
++++ b/src/swapchain_resources.c
+@@ -82,10 +82,17 @@ VkResult afmf_sc_gen_init(struct afmf_device *dev, struct afmf_swapchain *sc)
+             res = dev->fns.create_semaphore(dev->handle, &semaphore, NULL, &sc->sem_app[i]);
+         if (res == VK_SUCCESS)
+             res = dev->fns.create_fence(dev->handle, &fence, NULL, &sc->slots[i].fence);
++        for (uint32_t n = 0; n < 3 && res == VK_SUCCESS; n++) {
++            res = dev->fns.create_semaphore(dev->handle, &semaphore, NULL, &sc->slots[i].acquire[n]);
++            if (res == VK_SUCCESS)
++                res = dev->fns.create_fence(dev->handle, &fence, NULL, &sc->slots[i].acquire_fences[n]);
++        }
+         if (res != VK_SUCCESS)
+             return res;
+     }
+-    res = dev->fns.create_fence(dev->handle, &fence, NULL, &sc->spare_fence);
++    res = dev->fns.create_semaphore(dev->handle, &semaphore, NULL, &sc->spare_semaphore);
++    if (res == VK_SUCCESS)
++        res = dev->fns.create_fence(dev->handle, &fence, NULL, &sc->spare_fence);
+     if (res != VK_SUCCESS)
+         return res;
+     if (afmf_config_get()->interpolate)
+@@ -104,7 +111,12 @@ bool afmf_sc_ensure_pool(struct afmf_device *dev, struct afmf_swapchain *sc, uin
+         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+     if (family >= dev->queue_family_count ||
+         (dev->queue_families[family].queueFlags & copy_capable) == 0) {
+-        AFMF_WARN("swapchain %p: presenting queue family %u cannot copy images", (void *)sc->handle,
++        AFMF_WARN("swapchain 0x%llx: presenting queue family %u cannot copy images", AFMF_HANDLE(sc->handle),
++                  family);
++        return false;
++    }
++    if (sc->fg != NULL && !(dev->queue_families[family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
++        AFMF_WARN("swapchain 0x%llx: presenting queue family %u cannot run interpolation", AFMF_HANDLE(sc->handle),
+                   family);
+         return false;
+     }
+@@ -125,7 +137,7 @@ bool afmf_sc_ensure_pool(struct afmf_device *dev, struct afmf_swapchain *sc, uin
+         .commandBufferCount = 1,
+     };
+     if (dev->set_loader_data == NULL) {
+-        AFMF_WARN("swapchain %p: loader offered no pfnSetDeviceLoaderData", (void *)sc->handle);
++        AFMF_WARN("swapchain 0x%llx: loader offered no pfnSetDeviceLoaderData", AFMF_HANDLE(sc->handle));
+         return false;
+     }
+     for (uint32_t i = 0; i < sc->image_count; i++) {
+@@ -157,18 +169,23 @@ void afmf_sc_gen_teardown(struct afmf_device *dev, struct afmf_swapchain *sc)
+                 (void)f->wait_for_fences(dev->handle, 1, &slot->fence, VK_TRUE, UINT64_MAX);
+             if (slot->fence != VK_NULL_HANDLE)
+                 f->destroy_fence(dev->handle, slot->fence, NULL);
++            for (uint32_t n = 0; n < 3; n++) {
++                if (n < slot->acquired)
++                    (void)f->wait_for_fences(dev->handle, 1, &slot->acquire_fences[n], VK_TRUE, UINT64_MAX);
++                if (slot->acquire[n] != VK_NULL_HANDLE)
++                    f->destroy_semaphore(dev->handle, slot->acquire[n], NULL);
++                if (slot->acquire_fences[n] != VK_NULL_HANDLE)
++                    f->destroy_fence(dev->handle, slot->acquire_fences[n], NULL);
++            }
+         }
+     }
+-    if (sc->spare_fence != VK_NULL_HANDLE) {
+-        /* A spare never presented still has its release pending; bounded, a compositor that never
+-         * answers must not hang the application's teardown. */
+-        if (sc->spare_valid &&
+-            f->wait_for_fences(dev->handle, 1, &sc->spare_fence, VK_TRUE, 1000000000ull) != VK_SUCCESS)
+-            AFMF_WARN("swapchain %p: spare image never released", (void *)sc->handle);
++    if (sc->spare_valid)
++        (void)f->wait_for_fences(dev->handle, 1, &sc->spare_fence, VK_TRUE, UINT64_MAX);
++    if (sc->spare_fence != VK_NULL_HANDLE)
+         f->destroy_fence(dev->handle, sc->spare_fence, NULL);
+-        sc->spare_fence = VK_NULL_HANDLE;
+-        sc->spare_valid = false;
+-    }
++    if (sc->spare_semaphore != VK_NULL_HANDLE)
++        f->destroy_semaphore(dev->handle, sc->spare_semaphore, NULL);
++    sc->spare_semaphore = VK_NULL_HANDLE;
+     if (sc->pool != VK_NULL_HANDLE)
+         f->destroy_command_pool(dev->handle, sc->pool, NULL); /* frees the command buffers */
+     afmf_framegen_destroy(dev, sc->fg);
+@@ -205,7 +222,7 @@ void afmf_sc_gen_teardown(struct afmf_device *dev, struct afmf_swapchain *sc)
+  * engine, so the resources stay until the swapchain is destroyed. */
+ void afmf_sc_gen_disable(struct afmf_swapchain *sc, const char *why)
+ {
+-    AFMF_WARN("swapchain %p: %s; pass-through from now on", (void *)sc->handle, why);
++    AFMF_WARN("swapchain 0x%llx: %s; pass-through from now on", AFMF_HANDLE(sc->handle), why);
+     afmf_sc_presenter_stop(sc);
+     sc->gen_enabled = false;
+ }
+diff --git a/src/swapchain_threads.c b/src/swapchain_threads.c
+index 6359013..3aba79b 100644
+--- a/src/swapchain_threads.c
++++ b/src/swapchain_threads.c
+@@ -36,14 +36,14 @@ bool afmf_sc_presenter_start(struct afmf_swapchain *sc)
+         return false;
+     if (!sc->presenter_running) {
+         if (pthread_create(&sc->presenter, NULL, afmf_sc_presenter_main, sc) != 0) {
+-            AFMF_WARN("swapchain %p: no presentation thread; presenting inline", (void *)sc->handle);
++            AFMF_WARN("swapchain 0x%llx: no presentation thread; presenting inline", AFMF_HANDLE(sc->handle));
+             sc->presenter_stop = true; /* do not retry every frame */
+             return false;
+         }
+         sc->presenter_running = true;
+     }
+     if (pthread_create(&sc->worker, NULL, afmf_sc_worker_main, sc) != 0) {
+-        AFMF_WARN("swapchain %p: no work thread; presenting inline", (void *)sc->handle);
++        AFMF_WARN("swapchain 0x%llx: no work thread; presenting inline", AFMF_HANDLE(sc->handle));
+         sc->worker_stop = true;
+         return false;
+     }
+diff --git a/src/swapchain_worker.c b/src/swapchain_worker.c
+index 21d50b4..125332c 100644
+--- a/src/swapchain_worker.c
++++ b/src/swapchain_worker.c
+@@ -2,6 +2,44 @@
+  * here, so the hook only consumes the application's semaphores and queues. */
+ 
+ #include "swapchain_internal.h"
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++/* The owner-only control file is written atomically by the session controller. */
++uint32_t afmf_sc_requested_multiplier(void)
++{
++    const char *path = getenv("AFMF_LAPINUX_CONTROL");
++    if (path == NULL || path[0] == '\0')
++        return 2;
++    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
++    if (fd < 0) {
++        AFMF_DEBUG("control file %s unreadable: %s", path, strerror(errno));
++        return 0;
++    }
++    struct stat st;
++    char value[2];
++    ssize_t n = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == getuid()
++        && (st.st_mode & 0077) == 0 ? read(fd, value, sizeof value) : -1;
++    (void)close(fd);
++    static uint32_t logged = UINT32_MAX;
++    static uint32_t last_valid = 0;
++    uint32_t multiplier = last_valid;
++    if (n != 1 || (value[0] != '0' && value[0] != '2' && value[0] != '3' && value[0] != '4')) {
++        /* Caught between a writer's truncation and its write: keep what it last said rather
++         * than drop to off and throw the history away. A removed file means the session ended,
++         * which is not this case and reads as 0 above. */
++        AFMF_DEBUG("control file %s unreadable this frame: %zd bytes", path, n);
++    } else {
++        multiplier = (uint32_t)(value[0] - '0');
++        last_valid = multiplier;
++    }
++    if (multiplier != logged) {
++        AFMF_DEBUG("control file %s: multiplier %u", path, multiplier);
++        logged = multiplier;
++    }
++    return multiplier;
++}
+ 
+ /* The frame's work behind the hook: the slot's fence, the governor, the spare, recording and
+  * the submission, which waits on `waits` (the application's semaphores inline; from the work
+@@ -23,21 +61,43 @@ VkResult afmf_sc_frame_generate(struct afmf_device *dev, struct afmf_swapchain *
+         (void)f->reset_fences(dev->handle, 1, &slot->fence);
+         slot->pending = false;
+     }
++    for (uint32_t n = 0; n < slot->acquired; n++) {
++        (void)f->wait_for_fences(dev->handle, 1, &slot->acquire_fences[n], VK_TRUE, UINT64_MAX);
++        (void)f->reset_fences(dev->handle, 1, &slot->acquire_fences[n]);
++    }
++    slot->acquired = 0;
+     (void)clock_gettime(CLOCK_MONOTONIC, &t_fence);
+ 
+     /* The image the generated frame goes into: the spare, if the presentation engine has one
+      * for us; otherwise this frame simply gets no companion, the application never waits. */
+-    bool generate = false;
+-    uint32_t j = 0;
++    uint32_t count = 0;
++    uint32_t images[3] = {0};
++    uint32_t multiplier = job->multiplier;
+     pthread_mutex_lock(&sc->job_lock);
+     bool allowed = afmf_sc_governor_allows(sc, sc->last_delay_ms, job->ordinal);
+     bool have_history = sc->have_history;
+     if (!have_history)
+         sc->skipped_no_history++;
+     pthread_mutex_unlock(&sc->job_lock);
+-    if (have_history && allowed) {
+-        generate = afmf_sc_spare_take(dev, sc, &j);
+-        if (!generate) {
++    if (have_history && allowed && multiplier >= 2 && sc->fg != NULL) {
++        /* The first companion is taken without waiting: the spare ring holds one a frame ahead.
++         * ×3 and ×4 need two or three at once, and the presentation engine releases the next one
++         * only as the earlier companions reach the display, so those get half a frame to appear
++         * (capped: a slow engine must not stall the game for longer). */
++        uint64_t frame_ns = (uint64_t)(sc->frame_ms_ema * 1e6);
++        uint64_t budget = frame_ns / 2ull;
++        if (budget > 2000000ull)
++            budget = 2000000ull;
++        if (budget < AFMF_ACQUIRE_SLICE_NS)
++            budget = AFMF_ACQUIRE_SLICE_NS;
++        while (count < multiplier - 1u &&
++               afmf_sc_spare_take(dev, sc, &images[count], &slot->acquire[count],
++                                  &slot->acquire_fences[count],
++                                  count == 0 ? afmf_config_get()->acquire_timeout_ns : budget)) {
++            count++;
++            slot->acquired = count;
++        }
++        if (count < multiplier - 1u) {
+             pthread_mutex_lock(&sc->job_lock);
+             sc->skipped_no_image++;
+             pthread_mutex_unlock(&sc->job_lock);
+@@ -45,29 +105,37 @@ VkResult afmf_sc_frame_generate(struct afmf_device *dev, struct afmf_swapchain *
+     }
+     (void)clock_gettime(CLOCK_MONOTONIC, &t_acquire);
+ 
+-    VkResult res = afmf_sc_record_frame(dev, sc, slot->cmd, slot_index, i, generate, j);
++    VkResult res = afmf_sc_record_frame(dev, sc, slot->cmd, slot_index, i, images, count);
+     (void)clock_gettime(CLOCK_MONOTONIC, &t_record);
+     if (res == VK_SUCCESS) {
+-        VkPipelineStageFlags stages[AFMF_MAX_APP_WAITS];
++        VkPipelineStageFlags stages[AFMF_MAX_APP_WAITS + 3];
++        VkSemaphore all_waits[AFMF_MAX_APP_WAITS + 3];
+         for (uint32_t k = 0; k < wait_count; k++)
++            all_waits[k] = waits[k];
++        for (uint32_t n = 0; n < count; n++)
++            all_waits[wait_count + n] = slot->acquire[n];
++        for (uint32_t k = 0; k < wait_count + count; k++)
+             stages[k] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+-        VkSemaphore signals[2] = {sc->sem_real[i], generate ? sc->sem_generated[j] : VK_NULL_HANDLE};
++        VkSemaphore signals[4] = {sc->sem_real[i], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
++        for (uint32_t n = 0; n < count; n++)
++            signals[n + 1u] = sc->sem_generated[images[n]];
+         VkSubmitInfo submit = {
+             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+-            .waitSemaphoreCount = wait_count,
+-            .pWaitSemaphores = waits,
++            .waitSemaphoreCount = wait_count + count,
++            .pWaitSemaphores = all_waits,
+             .pWaitDstStageMask = stages,
+             .commandBufferCount = 1,
+             .pCommandBuffers = &slot->cmd,
+-            .signalSemaphoreCount = generate ? 2u : 1u,
++            .signalSemaphoreCount = count + 1u,
+             .pSignalSemaphores = signals,
+         };
+         if (!threaded)
+             wsi_take(sc);
+-        if (sc->async)
++        bool locked_queue = sc->async || (dev->async_shared && queue == dev->async_queue);
++        if (locked_queue)
+             pthread_mutex_lock(&dev->async_lock);
+         res = f->queue_submit(queue, 1, &submit, slot->fence);
+-        if (sc->async && (res != VK_SUCCESS || threaded))
++        if (locked_queue && (res != VK_SUCCESS || threaded))
+             pthread_mutex_unlock(&dev->async_lock);
+         if (!threaded && res != VK_SUCCESS)
+             wsi_give(sc);
+@@ -81,30 +149,30 @@ VkResult afmf_sc_frame_generate(struct afmf_device *dev, struct afmf_swapchain *
+     sc->submit_ms += elapsed_ms(&t_record, &t_submit);
+     if (res == VK_SUCCESS) {
+         sc->have_history = true;
+-        if (generate)
+-            sc->generated++;
++        sc->generated += count;
++        sc->generated_by_mode[multiplier] += count;
+     }
+     pthread_mutex_unlock(&sc->job_lock);
+     if (res != VK_SUCCESS)
+         return res; /* the image acquired for the generated frame, if any, stays with the engine */
+ 
+     slot->pending = true;
+-    job->generate = generate;
+-    job->companion_image = j;
++    job->generated_count = count;
++    memcpy(job->companion_images, images, sizeof images);
+     job->done = slot->fence;
+ 
+     /* Debug dumps block on the submission; only while AFMF_DUMP_DIR asks for frames. */
+     if (sc->fg != NULL)
+         afmf_framegen_dump_arm(sc->fg);
+-    if (generate && sc->fg != NULL && afmf_framegen_dump_recorded(sc->fg)) {
++    if (count > 0 && sc->fg != NULL && afmf_framegen_dump_recorded(sc->fg)) {
+         (void)f->wait_for_fences(dev->handle, 1, &slot->fence, VK_TRUE, UINT64_MAX);
+         afmf_framegen_dump_write(dev, sc->fg);
+         (void)clock_gettime(CLOCK_MONOTONIC, &job->arrival); /* the pacing and the governor start after the stall */
+     }
+ 
+-    if (generate && threaded && afmf_config_get()->pacing) {
++    if (count > 0 && afmf_config_get()->pacing) {
+         pthread_mutex_lock(&sc->job_lock);
+-        double half_ms = sc->frame_ms_ema / 2.0;
++        double half_ms = sc->frame_ms_ema / (double)(count + 1u);
+         pthread_mutex_unlock(&sc->job_lock);
+         uint64_t hold = (uint64_t)(half_ms * 1e6);
+         /* Never zero with pacing on: two presents in the same instant make MAILBOX drop the
+@@ -150,7 +218,7 @@ void *afmf_sc_worker_main(void *arg)
+             pthread_mutex_lock(&dev->async_lock);
+             VkResult passed = dev->fns.queue_submit(dev->async_queue, 1, &pass, VK_NULL_HANDLE);
+             pthread_mutex_unlock(&dev->async_lock);
+-            work.present.generate = false;
++            work.present.generated_count = 0;
+             work.present.real_unwaited = passed != VK_SUCCESS;
+             pthread_mutex_lock(&sc->job_lock);
+             if (sc->deferred_result >= 0)
+diff --git a/tests/headless.c b/tests/headless.c
+index 03e7993..37c978e 100644
+--- a/tests/headless.c
++++ b/tests/headless.c
+@@ -44,6 +44,16 @@ static bool run(struct ctx *ctx)
+     struct timespec start, end;
+     (void)clock_gettime(CLOCK_MONOTONIC, &start);
+     for (uint32_t i = 0; i < frames; i++) {
++        if (env_is_1("AFMF_TEST_LIVE_TRANSITIONS") && i < 64 && i % 8 == 0) {
++            const char *path = getenv("AFMF_LAPINUX_CONTROL");
++            FILE *control = path != NULL ? fopen(path, "w") : NULL;
++            if (control == NULL)
++                return false;
++            static const char modes[] = {'0', '2', '3', '4', '3', '2', '0', '4'};
++            bool ok = fputc(modes[i / 8], control) != EOF;
++            if (fclose(control) != 0 || !ok)
++                return false;
++        }
+         if (recreate != 0 && i != 0 && i % recreate == 0) {
+             size_index = (size_index + 1) % (uint32_t)(sizeof sizes / sizeof sizes[0]);
+             destroy_swapchain(ctx);
+diff --git a/tests/headless_checks.c b/tests/headless_checks.c
+index 5b39ca7..594e0c8 100644
+--- a/tests/headless_checks.c
++++ b/tests/headless_checks.c
+@@ -91,7 +91,9 @@ bool check_dump(const char *dir, uint32_t n)
+         return false;
+     }
+     double cx = sum_x / (double)bright, cy = sum_y / (double)bright;
+-    double expected_x = ((double)square_x(n - 1) + (double)square_x(n)) / 2.0 + SQUARE_SIZE / 2.0;
++    const char *requested = getenv("AFMF_TEST_PHASE");
++    double phase = requested != NULL ? strtod(requested, NULL) : 0.5;
++    double expected_x = (double)square_x(n - 1) * (1.0 - phase) + (double)square_x(n) * phase + SQUARE_SIZE / 2.0;
+     double expected_y = SQUARE_Y + SQUARE_SIZE / 2.0;
+     /* Centroid of pixel indices sits half a pixel left/up of the geometric centre. */
+     expected_x -= 0.5;
+diff --git a/tests/headless_instance.c b/tests/headless_instance.c
+index ece0b15..1dfd522 100644
+--- a/tests/headless_instance.c
++++ b/tests/headless_instance.c
+@@ -149,8 +149,14 @@ bool pick_physical_device(struct ctx *ctx)
+     if (devices == NULL)
+         return false;
+     bool found = false;
++    const char *vendor_text = getenv("AFMF_TEST_VENDOR_ID");
++    unsigned long vendor = vendor_text != NULL ? strtoul(vendor_text, NULL, 0) : 0;
+     if (vkEnumeratePhysicalDevices(ctx->instance, &count, devices) == VK_SUCCESS) {
+         for (uint32_t d = 0; d < count && !found; d++) {
++            VkPhysicalDeviceProperties device_properties;
++            vkGetPhysicalDeviceProperties(devices[d], &device_properties);
++            if (vendor != 0 && device_properties.vendorID != vendor)
++                continue;
+             uint32_t families = 0;
+             vkGetPhysicalDeviceQueueFamilyProperties(devices[d], &families, NULL);
+             VkQueueFamilyProperties *props = calloc(families, sizeof *props);
+@@ -172,6 +178,8 @@ bool pick_physical_device(struct ctx *ctx)
+         }
+     }
+     free(devices);
++    if (!found && vendor != 0)
++        (void)fprintf(stderr, "no presenting queue for vendor 0x%lx on the headless surface\n", vendor);
+     if (found) {
+         VkPhysicalDeviceProperties props;
+         vkGetPhysicalDeviceProperties(ctx->physical_device, &props);

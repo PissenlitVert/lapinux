@@ -37,11 +37,14 @@ const RAW: usize = 1440;
 ///
 /// Le tube est ouvert sans bloquer : GameScope n'ouvre son bout que quelques
 /// secondes après le lancement, et son absence n'est pas une erreur.
+/// La limite est relue à chaque échantillon : elle se règle en jeu depuis le
+/// menu rapide, et une valeur figée au lancement plafonnait le relevé pour
+/// toute la partie — le compteur semblait revenir à l'ancienne limite.
 pub fn watch_stats(
     path: &Path,
     alive: &dyn Fn() -> bool,
     report: &dyn Fn(FpsStats, &[u32], i64, i64),
-    fps_cap: u32,
+    fps_cap: &dyn Fn() -> u32,
 ) {
     let mut file: Option<std::fs::File> = None;
     let mut pending = String::new();
@@ -90,7 +93,7 @@ pub fn watch_stats(
                     let Ok(rate) = value.trim().parse::<f32>() else {
                         continue;
                     };
-                    let current = measured_rate(rate, fps_cap);
+                    let current = measured_rate(rate, fps_cap());
                     let settled_from = *first_sample.get_or_insert_with(Instant::now);
                     let settled = settled_from.elapsed() >= WARMUP && current >= IDLE_FLOOR;
                     if settled {

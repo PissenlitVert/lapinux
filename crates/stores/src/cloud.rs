@@ -74,7 +74,10 @@ pub fn parse_iso8601(text: &str) -> Option<i64> {
             let (hours, minutes) = match rest.split_once(':') {
                 Some((hours, minutes)) => (
                     hours.parse::<i64>().ok()?,
-                    minutes.get(0..2).and_then(|m| m.parse::<i64>().ok()).unwrap_or(0),
+                    minutes
+                        .get(0..2)
+                        .and_then(|m| m.parse::<i64>().ok())
+                        .unwrap_or(0),
                 ),
                 None if rest.len() >= 4 => (
                     rest[0..2].parse::<i64>().ok()?,
@@ -228,7 +231,46 @@ pub fn get_bytes(url: &str, token: Option<&str>, extra: &[(&str, &str)]) -> Resu
     Ok(bytes)
 }
 
-/// Envoie un corps brut, avec ses en-têtes.
+/// N'expose jamais les URL signées ni le contenu des réponses d'erreur.
+fn safe_transfer_error(error: ureq::Error) -> Error {
+    match error {
+        ureq::Error::Status(401 | 403, _) => Error::Expired,
+        ureq::Error::Status(status, _) => Error::Refused {
+            status,
+            message: "transfert de sauvegarde refusé".into(),
+        },
+        ureq::Error::Transport(_) => Error::Http("transfert de sauvegarde impossible".into()),
+    }
+}
+
+/// Lecture bornée des sauvegardes distantes, pour éviter une allocation illimitée.
+pub fn get_save_bytes(url: &str, token: Option<&str>, extra: &[(&str, &str)]) -> Result<Vec<u8>> {
+    use std::io::Read;
+    const LIMIT: u64 = 64 * 1024 * 1024;
+    let mut request = ureq::get(url)
+        .set("User-Agent", common::USER_AGENT)
+        .timeout(std::time::Duration::from_secs(60));
+    if let Some(token) = token {
+        request = request.set("Authorization", &format!("Bearer {token}"));
+    }
+    for (key, value) in extra {
+        request = request.set(key, value);
+    }
+    let mut bytes = Vec::new();
+    request
+        .call()
+        .map_err(safe_transfer_error)?
+        .into_reader()
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::Http("lecture de la sauvegarde impossible".into()))?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(Error::Other("sauvegarde cloud trop volumineuse".into()));
+    }
+    Ok(bytes)
+}
+
+/// Envoie un corps brut, avec ses enêtes.
 pub fn put_bytes(
     url: &str,
     token: Option<&str>,
@@ -244,7 +286,7 @@ pub fn put_bytes(
     for (key, value) in extra {
         request = request.set(key, value);
     }
-    request.send_bytes(&body)?;
+    request.send_bytes(&body).map_err(safe_transfer_error)?;
     Ok(())
 }
 
@@ -256,10 +298,7 @@ pub fn post_json(
     user_agent: Option<&str>,
 ) -> Result<serde_json::Value> {
     let mut request = ureq::post(url)
-        .set(
-            "User-Agent",
-            user_agent.unwrap_or(common::USER_AGENT),
-        )
+        .set("User-Agent", user_agent.unwrap_or(common::USER_AGENT))
         .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(60));
     if let Some(token) = token {
@@ -282,7 +321,10 @@ mod tests {
     #[test]
     fn iso_dates_become_unix_seconds() {
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_iso8601("2026-06-12T09:17:00.123Z"), Some(1_781_255_820));
+        assert_eq!(
+            parse_iso8601("2026-06-12T09:17:00.123Z"),
+            Some(1_781_255_820)
+        );
         // Un décalage explicite ramène l'heure à UTC.
         assert_eq!(
             parse_iso8601("2026-06-12T11:17:00+02:00"),
@@ -310,7 +352,10 @@ mod tests {
         );
         // Un message plus long que soixante-quatre octets passe par plusieurs
         // blocs.
-        assert_eq!(md5_hex(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
+        assert_eq!(
+            md5_hex(b"message digest"),
+            "f96b697d7cb7938d525a2f31aaf161d0"
+        );
         assert_eq!(
             md5_hex(b"abcdefghijklmnopqrstuvwxyz"),
             "c3fcd3d76192e4007dfb496cca67e13b"

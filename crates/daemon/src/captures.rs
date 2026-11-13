@@ -12,12 +12,13 @@
 
 use crate::kwin_shot;
 use crate::{Result, Shared};
+use lapinux_core::config::CaptureConfig;
 use lapinux_core::ipc::Envelope;
 use lapinux_core::model::SessionInfo;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +30,14 @@ use std::time::{Duration, Instant};
 const PERMISSION_DESKTOP: &str = "lapinux-capture.desktop";
 /// Reste à attendre `ffmpeg` après la dernière image.
 const STOP_WAIT: Duration = Duration::from_secs(25);
+/// Trace de l'enregistrement en cours. Écrite sur disque avant que les images
+/// n'arrivent, elle permet à un daemon qui redémarre après un plantage de
+/// reprendre l'encodeur qu'il a laissé derrière lui.
+pub(crate) const RECORDER_JOURNAL: &str = "recorder.json";
+/// Temps laissé à un encodeur orphelin pour terminer son fichier avant qu'on
+/// ne le termine de force. Court : la reprise bloque le démarrage du daemon,
+/// et l'encodeur d'un daemon mort s'arrête déjà seul avec la fermeture du tube.
+const ORPHAN_WAIT: Duration = Duration::from_secs(5);
 /// Temps laissé au jeu pour ouvrir son flux audio.
 const GAME_AUDIO_WAIT: Duration = Duration::from_secs(60);
 /// Temps laissé au jeu pour remplacer sa fenêtre d'attente par la vraie :
@@ -65,6 +74,9 @@ enum Source {
 
 /// Enregistrement en cours : `ffmpeg` reçoit les images brutes par son entrée.
 pub struct Recorder {
+    /// Partie à laquelle appartient cette capture : un enregistrement laissé
+    /// par une partie précédente ne doit pas empêcher la suivante d'être filmée.
+    appid: u32,
     child: Child,
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -80,8 +92,6 @@ pub struct Recorder {
     fps: u32,
     /// Sources audio captées en parallèle de l'image.
     audio: Vec<AudioTrack>,
-    /// Le HUD MangoHud a été masqué pour la capture : il faut le remontrer.
-    hud_hidden: bool,
     /// Retire le noir de fermeture propre à la scène persistante.
     trim_black: bool,
     /// Début de la capture, pour comparer la durée vidéo au temps réel.
@@ -162,9 +172,7 @@ impl Recorder {
         // perdue : l'audio continue au rythme réel et se retrouve en avance.
         let video_secs = self.frames.load(Ordering::Relaxed) as f64 / f64::from(self.fps.max(1));
         let real_secs = capture_ended.duration_since(self.started).as_secs_f64();
-        tracing::info!(
-            "capture : {video_secs:.2} s de vidéo pour {real_secs:.2} s réelles"
-        );
+        tracing::info!("capture : {video_secs:.2} s de vidéo pour {real_secs:.2} s réelles");
         let deadline = Instant::now() + STOP_WAIT;
         let clean;
         loop {
@@ -201,18 +209,16 @@ impl Recorder {
             }
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::remove_file(self.path.with_extension("err"));
-            return Err(
-                "aucune image captée : la vidéo n'a pas pu être enregistrée".to_string(),
-            );
+            return Err("aucune image captée : la vidéo n'a pas pu être enregistrée".to_string());
         }
         // La scène garde la fenêtre GameScope ouverte après la sortie du jeu :
         // le dernier plan reste noir pendant que Proton rend la main. On coupe
         // cette queue, sans toucher aux scènes noires du jeu lui-même.
         if self.trim_black {
             match trim_trailing_black(&self.path, video_secs) {
-                Some(removed) => tracing::info!(
-                    "capture : noir de fermeture retiré ({removed:.2} s)"
-                ),
+                Some(removed) => {
+                    tracing::info!("capture : noir de fermeture retiré ({removed:.2} s)")
+                }
                 None => {}
             }
         }
@@ -234,9 +240,7 @@ impl Recorder {
                 (file, audible)
             })
             .collect();
-        let any_game = analyzed
-            .iter()
-            .any(|(file, audible)| *audible && file.game);
+        let any_game = analyzed.iter().any(|(file, audible)| *audible && file.game);
         let mut kept_fallback = false;
         let mut ready: Vec<(PathBuf, u64)> = Vec::new();
         for (file, audible) in &analyzed {
@@ -271,11 +275,149 @@ impl Recorder {
     }
 }
 
+/// Écrit la trace d'un enregistrement, en une seule écriture renommée : un
+/// plantage au mauvais moment laisse soit la trace complète, soit rien.
+fn write_journal(log_dir: &Path, recorder: &Recorder) {
+    let mut audio_pids = Vec::new();
+    for track in &recorder.audio {
+        if let Ok(children) = track.children.lock() {
+            audio_pids.extend(children.iter().map(|child| child.id()));
+        }
+    }
+    let journal = serde_json::json!({
+        "daemon_pid": std::process::id(),
+        "ffmpeg_pid": recorder.child.id(),
+        "path": recorder.path.to_string_lossy(),
+        "appid": recorder.appid,
+        "audio_pids": audio_pids,
+    });
+    let _ = std::fs::create_dir_all(log_dir);
+    let path = log_dir.join(RECORDER_JOURNAL);
+    let temp = path.with_extension("json.tmp");
+    if std::fs::write(&temp, journal.to_string()).is_ok() {
+        let _ = std::fs::rename(&temp, &path);
+    }
+}
+
+/// Reprise d'un enregistrement orphelin : l'encodeur est laissé finir son
+/// fichier, ses capteurs audio sont arrêtés et la trace est retirée.
+fn recover_orphan_recording_at(log_dir: &Path) {
+    let path = log_dir.join(RECORDER_JOURNAL);
+    let Ok(raw) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(journal) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        // Trace illisible : elle ne sert plus à rien.
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    let previous = journal["daemon_pid"].as_u64().unwrap_or(0) as u32;
+    if previous == std::process::id() {
+        return;
+    }
+    // Un autre daemon vit encore (relance, tests) : sa capture ne nous
+    // appartient pas.
+    if previous != 0 && process_is_alive(previous) {
+        return;
+    }
+    let encoder = journal["ffmpeg_pid"].as_u64().unwrap_or(0) as u32;
+    let video = journal["path"].as_str().unwrap_or_default().to_string();
+    tracing::warn!(
+        "enregistrement orphelin (daemon {previous}, encodeur {encoder}) : reprise"
+    );
+    let clean = stop_orphan_encoder(encoder);
+    for pid in journal["audio_pids"].as_array().cloned().unwrap_or_default() {
+        if let Some(pid) = pid.as_u64() {
+            stop_audio_sensor(pid as u32);
+        }
+    }
+    let file = PathBuf::from(&video);
+    if file.as_os_str().is_empty() {
+        tracing::warn!("enregistrement orphelin sans fichier à récupérer");
+    } else if clean && file.is_file() {
+        tracing::info!("vidéo récupérée après un plantage : {}", file.display());
+    } else if file.is_file() {
+        tracing::warn!(
+            "vidéo laissée par un plantage, à vérifier : {}",
+            file.display()
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Vrai si le processus tourne encore.
+///
+/// Un daemon tué mais pas récolté par son parent reste joignable (`kill 0`
+/// répond) avec l'état `Z` : il n'a plus aucun tube ouvert et ses enfants sont
+/// déjà orphelins. Le compter comme vivant empêchait la reprise de s'exécuter
+/// après un `SIGKILL`.
+pub(crate) fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 || unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return false;
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // Le nom du processus peut contenir des espaces et des parenthèses :
+    // l'état est le premier champ qui suit la dernière parenthèse fermante.
+    stat.rsplit(')')
+        .next()
+        .map(|rest| !rest.trim_start().starts_with('Z'))
+        .unwrap_or(false)
+}
+
+/// Vrai si ce pid est bien l'encodeur : un pid réutilisé par un autre
+/// programme ne doit jamais être arrêté.
+fn is_encoder(pid: u32) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    String::from_utf8_lossy(&raw)
+        .split('\0')
+        .any(|arg| arg.ends_with("ffmpeg"))
+}
+
+/// Laisse l'encodeur orphelin terminer son fichier. Son tube est déjà fermé
+/// avec le daemon, donc il doit s'arrêter seul ; sinon `SIGTERM` lui fait
+/// encore refermer proprement le conteneur, `SIGKILL` est le dernier recours.
+/// Rend `true` quand il s'est arrêté sans avoir été tué.
+fn stop_orphan_encoder(pid: u32) -> bool {
+    if !process_is_alive(pid) || !is_encoder(pid) {
+        return true;
+    }
+    let deadline = Instant::now() + ORPHAN_WAIT;
+    while Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // `SIGTERM` laisse encore ffmpeg refermer son conteneur ; `SIGKILL` est le
+    // dernier recours, quand l'encodeur refuse même cela.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    false
+}
+
+/// Les capteurs audio d'un enregistrement mort n'ont plus de lecteur.
+fn stop_audio_sensor(pid: u32) {
+    if !process_is_alive(pid) {
+        return;
+    }
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+}
+
 /// Vrai quand la capture est possible sur cette machine : `ffmpeg` pour
 /// l'encodage et un bus de session pour joindre KWin.
 pub fn available() -> bool {
-    lapinux_core::paths::which("ffmpeg").is_some()
-        && zbus::blocking::Connection::session().is_ok()
+    lapinux_core::paths::which("ffmpeg").is_some() && zbus::blocking::Connection::session().is_ok()
 }
 
 /// Fichier `.desktop` qui déclare l'interface KWin à Lapinux. `exe` est le
@@ -323,12 +465,59 @@ impl Shared {
         }
     }
 
+    /// Trace de l'enregistrement en cours, à côté des journaux du daemon.
+    fn recorder_journal(&self) -> PathBuf {
+        self.paths.log_dir.join(RECORDER_JOURNAL)
+    }
+
+    /// Note sur disque l'enregistrement qui démarre : pid du daemon, pid de
+    /// l'encodeur, fichier écrit et capteurs audio. Un daemon tué laisse
+    /// cette trace derrière lui, et le suivant s'en sert pour ne pas laisser
+    /// un `ffmpeg` tourner jusqu'à la fin des temps.
+    fn write_recorder_journal(&self) {
+        let Ok(guard) = self.recorder.lock() else {
+            return;
+        };
+        let Some(recorder) = guard.as_ref() else {
+            return;
+        };
+        write_journal(&self.paths.log_dir, recorder);
+    }
+
+    /// Reprend la main sur un enregistrement laissé par un daemon mort.
+    ///
+    /// Un daemon tué ferme son extrémité du tube : `ffmpeg` lit la fin du flux
+    /// et referme son fichier. Ce n'est pas garanti (machine saturée,
+    /// encodeur bloqué), et même alors les capteurs audio et le badge REC
+    /// restent orphelins. La trace écrite au démarrage de l'enregistrement
+    /// permet de finir le travail au démarrage suivant.
+    pub(crate) fn recover_orphan_recording(&self) {
+        recover_orphan_recording_at(&self.paths.log_dir);
+    }
+
     /// Un enregistrement tourne-t-il déjà ?
     pub fn is_recording(&self) -> bool {
         self.recorder
             .lock()
             .map(|guard| guard.is_some())
             .unwrap_or(false)
+    }
+
+    /// Capture effective d'un jeu : ses réglages explicites priment sur la
+    /// configuration globale, champ par champ.
+    fn capture_for(&self, appid: u32, config: &lapinux_core::config::Config) -> CaptureConfig {
+        self.store
+            .game(appid)
+            .ok()
+            .flatten()
+            .map(|game| {
+                // Un jeu protégé par un anti-triche ne s'enregistre pas tout
+                // seul : la protection se lit dans la même règle que le
+                // lancement.
+                let (settings, _) = self.protected_settings(&game);
+                settings.effective_capture(&config.capture)
+            })
+            .unwrap_or_else(|| config.capture.clone())
     }
 
     /// Fenêtre du jeu : son rectangle, ramené dans son écran (repli), et
@@ -365,7 +554,18 @@ impl Shared {
             .session_info()
             .ok_or_else(|| "aucune partie en cours à enregistrer".to_string())?;
         if self.is_recording() {
-            return Err("un enregistrement tourne déjà".into());
+            // Un enregistrement d'une partie précédente n'est pas celui-ci :
+            // sans cet arrêt, le badge REC continuerait de tourner et cette
+            // partie ne serait jamais filmée.
+            let previous = self
+                .recorder
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|recorder| recorder.appid));
+            if previous == Some(info.appid) {
+                return Err("un enregistrement tourne déjà".into());
+            }
+            self.record_stop();
         }
         let ffmpeg = lapinux_core::paths::which("ffmpeg")
             .ok_or_else(|| "ffmpeg absent : installez-le pour enregistrer".to_string())?;
@@ -374,20 +574,19 @@ impl Shared {
             .game_target(&info)
             .ok_or_else(|| "fenêtre du jeu introuvable pour le cadrage".to_string())?;
         let config = self.config_snapshot();
+        let capture = self.capture_for(info.appid, &config);
         // La cadence choisie dans les réglages est celle de la vidéo. KWin
         // peut répéter une image quand il n'arrive pas à suivre, mais ffmpeg
         // reçoit bien le rythme demandé : le réglage n'est plus décoratif.
-        let fps = config.capture.video_fps.clamp(5, 240);
-        let dir = config.capture.videos_dir();
+        let fps = capture.video_fps.clamp(5, 240);
+        let dir = capture.videos_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("dossier des captures : {e}"))?;
         // Le marqueur dit à la galerie que ce dossier lui appartient : elle
         // peut alors lire les noms personnalisés sans ramasser les vidéos
         // personnelles posées à côté.
         let _ = std::fs::write(dir.join(lapinux_core::captures::MARKER), b"");
         let now = lapinux_core::util::now_unix();
-        let base_stem = config
-            .capture
-            .render_stem(&info.name, info.appid, fps, now);
+        let base_stem = capture.render_stem(&info.name, info.appid, fps, now);
         let (stem, path) = unique_capture_path(&dir, &base_stem, "mp4");
         // Sonde d'autorisation et de taille : la première image donne les
         // dimensions que ffmpeg attendra pour tout le flux. La fenêtre du jeu
@@ -416,12 +615,12 @@ impl Shared {
         // La capture KWin arrive à la taille de la fenêtre ; le redimensionnement
         // éventuel se fait dans ffmpeg avant l'encodeur. Une vidéo 720p ou 1080p
         // demande beaucoup moins de mémoire et de calcul qu'une fenêtre 4K.
-        let target = capture_size(width, height, &config.capture.video_resolution);
+        let target = capture_size(width, height, &capture.video_resolution);
         let filter = video_filter(
             width,
             height,
             target,
-            VideoProfile::from_config(&config.capture.video_profile),
+            VideoProfile::from_config(&capture.video_profile),
         );
         // Sans filtre, NVENC reçoit directement le BGRA de KWin et fait la
         // conversion 4:2:0 sur le GPU. Avec un redimensionnement, le filtre
@@ -444,19 +643,14 @@ impl Shared {
         // explication.
         let err_path = path.with_extension("err");
         command
-            .args(video_encoder_args(
-                &ffmpeg,
-                &config.capture,
-                native_input,
-            ))
+            .args(video_encoder_args(&ffmpeg, &capture, native_input))
             .args(["-movflags", "+faststart"])
             .arg(&path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::from(
-                std::fs::File::create(&err_path).unwrap_or_else(|_| {
-                    std::fs::File::open("/dev/null").expect("/dev/null")
-                }),
+                std::fs::File::create(&err_path)
+                    .unwrap_or_else(|_| std::fs::File::open("/dev/null").expect("/dev/null")),
             ));
         // Pas de `PR_SET_PDEATHSIG` ici : ce signal suit le thread qui a lancé
         // le processus, et ffmpeg était tué dès la fin de la requête — la
@@ -478,18 +672,6 @@ impl Shared {
         let manual_paused = Arc::new(AtomicBool::new(false));
         let menu_paused = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(AtomicU64::new(0));
-        // MangoHud dessine dans l'image du jeu : le masquer est le seul moyen
-        // d'avoir une vidéo propre, et le jeu n'est pas relancé pour autant.
-        // Le HUD se masque par sa configuration, que MangoHud relit à chaud ;
-        // `mangohudctl` sert de second chemin, sans garantie dans un bac à
-        // sable.
-        let hud_hidden = self.set_game_hud(false);
-        let _ = lapinux_perf::mangohud::set_display(false);
-        if hud_hidden {
-            tracing::info!("capture : MangoHud masqué le temps de l'enregistrement");
-        } else {
-            tracing::warn!("capture : MangoHud n'a pas pu être masqué, il restera dans la vidéo");
-        }
         // L'image part en premier. Le son est lancé quand la première image
         // est déjà dans la vidéo : son décalage est alors positif et mesurable
         // au lieu de le faire démarrer avant l'image et de le laisser avancer.
@@ -514,9 +696,10 @@ impl Shared {
         // La première image est le zéro de la vidéo : c'est à partir de cet
         // instant que la durée réelle doit être comparée au nombre d'images.
         let capture_started = Instant::now();
-        let audio = self.start_audio(&info, &dir, &stem, &stop, &frames, fps);
+        let audio = self.start_audio(&info, &capture, &dir, &stem, &stop, &frames, fps);
         if let Ok(mut guard) = self.recorder.lock() {
             *guard = Some(Recorder {
+                appid: info.appid,
                 child,
                 path: path.clone(),
                 stop,
@@ -526,19 +709,21 @@ impl Shared {
                 frames,
                 fps,
                 audio,
-                hud_hidden,
                 trim_black: info.scene,
                 started: capture_started,
                 thread: Some(thread),
             });
         }
+        // La trace part avant la première image : même un plantage immédiat
+        // laisse de quoi retrouver cet encodeur au démarrage suivant.
+        self.write_recorder_journal();
         tracing::info!(
             "enregistrement de {} : {} ({width}x{height} → {}x{}, {fps} i/s, profil {})",
             info.name,
             path.display(),
             target.0,
             target.1,
-            config.capture.video_profile
+            capture.video_profile
         );
         Ok(path)
     }
@@ -549,13 +734,13 @@ impl Shared {
     fn start_audio(
         &self,
         info: &SessionInfo,
+        capture: &CaptureConfig,
         dir: &Path,
         stem: &str,
         stop: &Arc<AtomicBool>,
         frames: &Arc<AtomicU64>,
         fps: u32,
     ) -> Vec<AudioTrack> {
-        let capture = self.config_snapshot().capture;
         if !capture.record_audio && !capture.record_microphone {
             return Vec::new();
         }
@@ -669,14 +854,10 @@ impl Shared {
             .lock()
             .ok()
             .and_then(|mut guard| guard.take())?;
-        let hud_hidden = recorder.hud_hidden;
         let stopped = recorder.stop();
-        // Le HUD revient dès la fin de la capture, sans relancer le jeu.
-        if hud_hidden {
-            self.set_game_hud(true);
-            let _ = lapinux_perf::mangohud::set_display(true);
-            tracing::info!("capture : MangoHud remis");
-        }
+        // L'enregistrement est fini : la trace ne sert plus qu'à un daemon qui
+        // reprendrait après un plantage, elle disparaît avec lui.
+        let _ = std::fs::remove_file(self.recorder_journal());
         Some(stopped.map(|path| {
             tracing::info!("vidéo enregistrée : {}", path.display());
             path
@@ -688,12 +869,11 @@ impl Shared {
     /// performance du jeu coupe cet enregistrement automatique ; l'appel
     /// manuel à `record_start` reste disponible.
     pub(crate) fn start_recording_if_wanted(self: &std::sync::Arc<Self>) {
-        if self
-            .session_info()
-            .is_some_and(|info| info.performance)
-            || !self.config_snapshot().capture.record_on_launch
-            || self.is_recording()
-        {
+        let Some(info) = self.session_info() else {
+            return;
+        };
+        let config = self.config_snapshot();
+        if info.performance || !self.capture_for(info.appid, &config).record_on_launch {
             return;
         }
         if let Err(err) = self.record_start() {
@@ -703,9 +883,11 @@ impl Shared {
             // seconde après la première image. Un second essai unique évite
             // de perdre toute la partie pour ce faux départ.
             let shared = std::sync::Arc::clone(self);
+            let appid = info.appid;
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(1500));
-                if shared.is_recording() || !shared.config_snapshot().capture.record_on_launch {
+                let config = shared.config_snapshot();
+                if shared.is_recording() || !shared.capture_for(appid, &config).record_on_launch {
                     return;
                 }
                 if let Err(err) = shared.record_start() {
@@ -717,8 +899,13 @@ impl Shared {
 
     /// Arrête l'enregistrement à la sortie du jeu quand le réglage le
     /// demande ; sinon il continue, et les Captures proposent de l'arrêter.
-    pub(crate) fn stop_recording_on_exit(&self) {
-        if !self.config_snapshot().capture.stop_on_exit {
+    ///
+    /// L'identifiant vient de l'appelant : `end_session` tourne après
+    /// `take_session`, quand `session_info()` est déjà vide. S'appuyer dessus
+    /// laissait l'enregistrement continuer après la partie, badge REC compris.
+    pub(crate) fn stop_recording_on_exit(&self, appid: u32) {
+        let config = self.config_snapshot();
+        if !self.capture_for(appid, &config).stop_on_exit {
             return;
         }
         match self.record_stop() {
@@ -732,9 +919,7 @@ impl Shared {
     pub fn recording(&self, start: bool) -> Result<Envelope> {
         if start {
             if self.is_recording() {
-                return Ok(Envelope::err(
-                    "un enregistrement tourne déjà".to_string(),
-                ));
+                return Ok(Envelope::err("un enregistrement tourne déjà".to_string()));
             }
             return Ok(match self.record_start() {
                 Ok(path) => Envelope::ok(&serde_json::json!({
@@ -1012,7 +1197,6 @@ fn capture_frames(
         let _ = capture.join();
     })
 }
-
 
 /// Sonde de capture sur la zone de l'écran, à sa taille réelle : son refus
 /// arrive avant que ffmpeg ne crée un fichier vide, et ses dimensions fixent
@@ -1768,7 +1952,10 @@ fn trim_trailing_black(path: &Path, duration: f64) -> Option<f64> {
     let report = String::from_utf8_lossy(&output.stderr);
     let mut black_start = None;
     for line in report.lines() {
-        let (Some(start), Some(end)) = (number_after(line, "black_start:"), number_after(line, "black_end:")) else {
+        let (Some(start), Some(end)) = (
+            number_after(line, "black_start:"),
+            number_after(line, "black_end:"),
+        ) else {
             continue;
         };
         if end >= duration - 0.30 {
@@ -1870,8 +2057,7 @@ fn audio_nodes_from_dump(
     };
     let mut clients: Vec<u64> = Vec::new();
     for object in objects {
-        if object.get("type").and_then(|value| value.as_str())
-            != Some("PipeWire:Interface:Client")
+        if object.get("type").and_then(|value| value.as_str()) != Some("PipeWire:Interface:Client")
         {
             continue;
         }
@@ -1893,7 +2079,8 @@ fn audio_nodes_from_dump(
         let Some(props) = object.pointer("/info/props") else {
             continue;
         };
-        if props.get("media.class").and_then(|value| value.as_str()) != Some("Stream/Output/Audio") {
+        if props.get("media.class").and_then(|value| value.as_str()) != Some("Stream/Output/Audio")
+        {
             continue;
         }
         let own = belongs(props);
@@ -1908,11 +2095,15 @@ fn audio_nodes_from_dump(
         let Some(id) = object.get("id").and_then(|value| value.as_u64()) else {
             continue;
         };
-        let label = ["application.process.binary", "application.name", "media.name"]
-            .iter()
-            .find_map(|key| props.get(*key).and_then(|value| value.as_str()))
-            .unwrap_or("?")
-            .to_string();
+        let label = [
+            "application.process.binary",
+            "application.name",
+            "media.name",
+        ]
+        .iter()
+        .find_map(|key| props.get(*key).and_then(|value| value.as_str()))
+        .unwrap_or("?")
+        .to_string();
         let serial = props.get("object.serial").and_then(|value| value.as_u64());
         let state = object
             .pointer("/info/state")
@@ -1992,10 +2183,7 @@ pub(crate) fn game_volume(pids: &[u32]) -> Option<f32> {
 /// Applique le volume à **tous** les flux du jeu et renvoie la valeur
 /// effective. `wpctl` adresse directement chaque nœud PipeWire : les autres
 /// applications ne changent pas de volume.
-pub(crate) fn set_game_volume(
-    pids: &[u32],
-    volume: f32,
-) -> std::result::Result<f32, String> {
+pub(crate) fn set_game_volume(pids: &[u32], volume: f32) -> std::result::Result<f32, String> {
     let nodes = cached_game_audio_nodes(pids);
     if nodes.is_empty() {
         return Err("aucun flux audio du jeu".into());
@@ -2018,9 +2206,7 @@ pub(crate) fn set_game_volume(
                 // sans ce rétablissement, le curseur du menu semblait agir
                 // sans rendre le son.
                 if value > 0.0 {
-                    let _ = Command::new(&tool)
-                        .args(["set-mute", &node, "0"])
-                        .output();
+                    let _ = Command::new(&tool).args(["set-mute", &node, "0"]).output();
                 }
             }
             Ok(output) => {
@@ -2129,13 +2315,18 @@ fn audio_stream_listing() -> String {
         let Some(props) = object.pointer("/info/props") else {
             continue;
         };
-        if props.get("media.class").and_then(|value| value.as_str()) != Some("Stream/Output/Audio") {
+        if props.get("media.class").and_then(|value| value.as_str()) != Some("Stream/Output/Audio")
+        {
             continue;
         }
-        let name = ["application.process.binary", "application.name", "media.name"]
-            .iter()
-            .find_map(|key| props.get(*key).and_then(|value| value.as_str()))
-            .unwrap_or("?");
+        let name = [
+            "application.process.binary",
+            "application.name",
+            "media.name",
+        ]
+        .iter()
+        .find_map(|key| props.get(*key).and_then(|value| value.as_str()))
+        .unwrap_or("?");
         names.push(name.to_string());
     }
     if names.is_empty() {
@@ -2178,6 +2369,38 @@ fn subject_area(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn la_capture_du_jeu_prime_et_revient_au_global_au_defaut() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = lapinux_core::paths::LapinuxPaths::under(dir.path());
+        let shared = Shared::new(&paths).unwrap();
+        let mut config = lapinux_core::Config::default();
+        config.capture.video_fps = 30;
+        config.capture.video_profile = "balanced".into();
+        config.capture.record_audio = true;
+
+        let mut game = lapinux_core::model::Game::default();
+        game.appid = 4242;
+        game.settings.video_fps = Some(60);
+        game.settings.video_profile = Some("quality".into());
+        game.settings.record_audio = Some(false);
+        shared.store.save_game(&game).unwrap();
+
+        let capture = shared.capture_for(4242, &config);
+        assert_eq!(capture.video_fps, 60);
+        assert_eq!(capture.video_profile, "quality");
+        assert!(!capture.record_audio);
+
+        game.settings.video_fps = None;
+        game.settings.video_profile = None;
+        game.settings.record_audio = None;
+        shared.store.save_game(&game).unwrap();
+        let inherited = shared.capture_for(4242, &config);
+        assert_eq!(inherited.video_fps, 30);
+        assert_eq!(inherited.video_profile, "balanced");
+        assert!(inherited.record_audio);
+    }
 
     #[test]
     fn la_resolution_de_sortie_ne_grandit_jamais_la_fenetre() {
@@ -2310,7 +2533,9 @@ mod tests {
         // Le silence comble l'écart : sans lui, `-shortest` couperait l'image.
         // `first_pts=0` est interdit : il collait un son tardif au début de la
         // vidéo et annulait le décalage calculé par le capteur.
-        assert!(seul.windows(2).any(|pair| pair == ["-af", "apad,aresample=async=1"]));
+        assert!(seul
+            .windows(2)
+            .any(|pair| pair == ["-af", "apad,aresample=async=1"]));
         assert!(!seul.iter().any(|arg| arg.contains("first_pts=0")));
         assert!(!deux.iter().any(|arg| arg.contains("first_pts=0")));
         // Un flux en retard est décalé par `adelay`, pas collé au début. Un
@@ -2326,14 +2551,17 @@ mod tests {
             .any(|pair| pair == ["-af", "adelay=1500:all=1,apad,aresample=async=1"]));
         assert!(deux.windows(2).any(|pair| pair == ["-c:v", "copy"]));
         assert_eq!(deux.first().map(String::as_str), Some("-hide_banner"));
-        assert_eq!(deux.last().map(String::as_str), Some(out.to_string_lossy().as_ref()));
+        assert_eq!(
+            deux.last().map(String::as_str),
+            Some(out.to_string_lossy().as_ref())
+        );
     }
 
     #[test]
     fn le_fichier_d_autorisation_declare_l_interface_kwin() {
-        let desktop = permission_desktop(Path::new("/home/nath/lapinux"));
+        let desktop = permission_desktop(Path::new("/home/joueur/lapinux"));
         assert!(desktop.contains("X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2"));
-        assert!(desktop.contains("Exec=/home/nath/lapinux"));
+        assert!(desktop.contains("Exec=/home/joueur/lapinux"));
     }
 
     #[test]
@@ -2503,5 +2731,43 @@ mod tests {
         assert_eq!(parse_wpctl_volume("Volume: 1.00\n"), Some(1.0));
         assert_eq!(parse_wpctl_volume("Volume: 0.00\n"), Some(0.0));
         assert_eq!(parse_wpctl_volume("aucun volume"), None);
+    }
+
+    #[test]
+    fn un_enregistrement_orphelin_est_close_et_la_trace_disparait() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("partie.mp4");
+        std::fs::write(&video, b"moov").unwrap();
+        let journal = serde_json::json!({
+            "daemon_pid": 0,
+            "ffmpeg_pid": 0,
+            "path": video.to_string_lossy(),
+            "appid": 1636440,
+            "audio_pids": [0],
+        });
+        std::fs::write(dir.path().join(RECORDER_JOURNAL), journal.to_string()).unwrap();
+        recover_orphan_recording_at(dir.path());
+        // La vidéo reste en place : c'est elle qu'on récupère.
+        assert!(video.is_file());
+        assert!(
+            !dir.path().join(RECORDER_JOURNAL).exists(),
+            "la trace d'un enregistrement mort est retirée"
+        );
+    }
+
+    #[test]
+    fn la_trace_d_un_daemon_vivant_est_laissee() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = serde_json::json!({
+            "daemon_pid": std::process::id(),
+            "ffmpeg_pid": 0,
+            "path": "",
+            "appid": 0,
+            "audio_pids": [],
+        });
+        let path = dir.path().join(RECORDER_JOURNAL);
+        std::fs::write(&path, journal.to_string()).unwrap();
+        recover_orphan_recording_at(dir.path());
+        assert!(path.is_file(), "un daemon vivant garde sa trace");
     }
 }

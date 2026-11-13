@@ -51,10 +51,7 @@ impl Shot {
         let mut out = vec![0u8; row * self.height as usize];
         for line in 0..self.height as usize {
             let start = line * stride;
-            let Some(chunk) = self
-                .data
-                .get(start..(start + row).min(self.data.len()))
-            else {
+            let Some(chunk) = self.data.get(start..(start + row).min(self.data.len())) else {
                 break;
             };
             out[line * row..line * row + chunk.len()].copy_from_slice(chunk);
@@ -166,8 +163,7 @@ pub struct Capturer {
 
 impl Capturer {
     pub fn new() -> Result<Self, String> {
-        let connection =
-            Connection::session().map_err(|err| format!("bus de session : {err}"))?;
+        let connection = Connection::session().map_err(|err| format!("bus de session : {err}"))?;
         Ok(Self { connection })
     }
 

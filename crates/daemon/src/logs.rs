@@ -1,11 +1,12 @@
 //! Journaux de l'application exposés à l'écran Réglages → Logs.
 //!
-//! Quatre journaux stables sont écrits : `daemon.log`, `ui.log` (interface et
-//! WebKit), `games.log` (sorties des parties, une section par session) et
-//! `overlay.log` (menu rapide, HUD et bandeaux). Tous tournent au-delà de
-//! `LOG_CAP`, ce qui garde le dossier borné et lisible. Le nom demandé par
-//! l'interface est toujours validé contre cette liste, jamais utilisé comme
-//! chemin : un client IPC ne peut pas lire hors du dossier.
+//! Trois journaux stables sont écrits : `daemon.log`, `ui.log` (interface et
+//! WebKit) et `overlay.log` (menu rapide, HUD et bandeaux). Chaque partie a en
+//! plus son `game-<appid>-<horodatage>.log`, que la page Activité ouvre et que
+//! la suppression de la partie emporte. Tous tournent au-delà de `LOG_CAP`,
+//! ce qui garde le dossier borné et lisible. Le nom demandé par l'interface est
+//! toujours validé contre cette liste, jamais utilisé comme chemin : un client
+//! IPC ne peut pas lire hors du dossier.
 //!
 //! Les fichiers de session peuvent grossir sans limite ; seule la fin est lue,
 //! sur les derniers 256 Kio, pour garder l'interface réactive.
@@ -274,10 +275,8 @@ mod tests {
 
     #[test]
     fn unknown_names_and_paths_fall_back_on_the_daemon_log() {
-        let (_dir, paths) = paths_with_logs(&[
-            ("daemon.log", "daemon"),
-            ("2830030-1.log", "session"),
-        ]);
+        let (_dir, paths) =
+            paths_with_logs(&[("daemon.log", "daemon"), ("2830030-1.log", "session")]);
         let view = view(&paths, Some("../../etc/passwd"), 10);
         assert_eq!(view.file, "daemon.log");
         assert_eq!(view.lines, vec!["daemon"]);
@@ -303,6 +302,7 @@ mod tests {
         assert!(legacy_name("fps-2830030-1793745565.fifo"));
         assert!(legacy_name("nav-2830030.fifo"));
         assert!(!legacy_name("daemon.log"));
+        assert!(!legacy_name("game-2830030-1793745565.log"));
         assert!(!legacy_name("ui.log"));
         assert!(!legacy_name("games.log"));
         assert!(!legacy_name("overlay.log"));

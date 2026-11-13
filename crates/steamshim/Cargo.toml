@@ -1,0 +1,16 @@
+[package]
+name = "lapinux-steamshim"
+version = "0.1.0"
+edition = "2021"
+description = "Pont Steamworks de Lapinux : capte les succès du jeu et les enregistre sans client Steam"
+
+# Le fichier produit doit s'appeler `libsteam_api.so` : c'est le nom que les
+# jeux Linux chargent, et celui sous lequel le préchargement prend leur place.
+[lib]
+name = "steam_api"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lapinux-core = { path = "../core" }
+lapinux-steam = { path = "../steam" }
+serde_json = "1"

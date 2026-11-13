@@ -48,10 +48,7 @@ pub fn install_from_url(
     );
     if target.exists() {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(Error::Other(format!(
-            "{} existe déjà",
-            target.display()
-        )));
+        return Err(Error::Other(format!("{} existe déjà", target.display())));
     }
     std::fs::rename(&extracted, &target)?;
     let _ = std::fs::remove_dir_all(&staging);
@@ -174,7 +171,10 @@ mod tests {
         let archive = dir.path().join("proton.tar.gz");
         make_tar_gz(
             &archive,
-            &[("GE-Proton11-7/proton", b"#!/bin/sh\n"), ("GE-Proton11-7/version", b"11-7\n")],
+            &[
+                ("GE-Proton11-7/proton", b"#!/bin/sh\n"),
+                ("GE-Proton11-7/version", b"11-7\n"),
+            ],
         );
         let dest = dir.path().join("out");
         let root = extract(&archive, &dest).unwrap();
@@ -187,13 +187,7 @@ mod tests {
     fn installs_from_archive_and_validates() {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("GE-Proton11-7-x86_64.tar.gz");
-        make_tar_gz(
-            &archive,
-            &[(
-                "GE-Proton11-7-x86_64/proton",
-                b"#!/bin/sh\n",
-            )],
-        );
+        make_tar_gz(&archive, &[("GE-Proton11-7-x86_64/proton", b"#!/bin/sh\n")]);
         // Simule l'étape de téléchargement en copiant dans le staging.
         let dest_root = dir.path().join("compatibilitytools.d");
         std::fs::create_dir_all(dest_root.join(".staging")).unwrap();

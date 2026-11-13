@@ -8,9 +8,9 @@
 //! sans le client graphique ni ses fichiers ?
 
 use crate::session::{self, SavedSession};
-use lapinux_core::paths::{LapinuxPaths, which};
+use lapinux_core::paths::{which, LapinuxPaths};
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{c_void, CStr, CString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::raw::{c_char, c_int};
@@ -199,10 +199,12 @@ fn extract_archive(data_dir: &Path) -> Result<(), String> {
             .path()
             .map_err(|error| format!("chemin SteamCMD : {error}"))?
             .to_path_buf();
-        if path
-            .components()
-            .any(|part| matches!(part, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
-        {
+        if path.components().any(|part| {
+            matches!(
+                part,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
             return Err(format!("archive SteamCMD refusée : {}", path.display()));
         }
         let unpacked = entry
@@ -254,6 +256,28 @@ fn update_steamcmd(data_dir: &Path) -> Result<(i32, PathBuf), String> {
     Ok((output.status.code().unwrap_or(-1), log_path))
 }
 
+/// Rend `steamcmd.sh` disponible, sans toucher au client Steam graphique.
+/// L'archive officielle est téléchargée et extraite une seule fois.
+pub fn ensure_steamcmd(data_dir: &Path) -> Result<PathBuf, String> {
+    let root = runtime_root(data_dir);
+    fs::create_dir_all(&root).map_err(|error| format!("création du runtime : {error}"))?;
+    let script = root.join("steamcmd.sh");
+    if script.is_file() {
+        return Ok(script);
+    }
+    if !archive_path(data_dir).is_file() {
+        download_archive(data_dir)?;
+    }
+    extract_archive(data_dir)?;
+    if !script.is_file() {
+        return Err(format!(
+            "steamcmd.sh absent après extraction : {}",
+            script.display()
+        ));
+    }
+    Ok(script)
+}
+
 /// Télécharge, extrait et met à jour SteamCMD si la bibliothèque manque.
 pub fn prepare(data_dir: &Path) -> Result<PrepareReport, String> {
     let root = runtime_root(data_dir);
@@ -269,7 +293,9 @@ pub fn prepare(data_dir: &Path) -> Result<PrepareReport, String> {
     };
     if library.is_file() {
         report.size = library.metadata().ok().map(|meta| meta.len());
-        report.notes.push("bibliothèque déjà présente ; aucun téléchargement".into());
+        report
+            .notes
+            .push("bibliothèque déjà présente ; aucun téléchargement".into());
         return Ok(report);
     }
 
@@ -607,7 +633,10 @@ fn host(data_dir: &Path) -> i32 {
         unsafe { libc::_exit(1) }
     };
     let Some(create_global_user) = dlsym(handle, "Steam_CreateGlobalUser") else {
-        report.push("erreur", "Steam_CreateGlobalUser absent : shim serveur dédié probable");
+        report.push(
+            "erreur",
+            "Steam_CreateGlobalUser absent : shim serveur dédié probable",
+        );
         print_host(&report);
         unsafe { libc::_exit(1) }
     };
@@ -627,8 +656,7 @@ fn host(data_dir: &Path) -> i32 {
         unsafe { libc::_exit(1) }
     };
     let create_interface: CreateInterfaceFn = unsafe { std::mem::transmute(create_interface) };
-    let create_global_user: CreateGlobalUserFn =
-        unsafe { std::mem::transmute(create_global_user) };
+    let create_global_user: CreateGlobalUserFn = unsafe { std::mem::transmute(create_global_user) };
     let blogged_on: BLoggedOnFn = unsafe { std::mem::transmute(blogged_on) };
     let bget_callback: BGetCallbackFn = unsafe { std::mem::transmute(bget_callback) };
     let free_callback: FreeLastCallbackFn = unsafe { std::mem::transmute(free_callback) };
@@ -638,7 +666,10 @@ fn host(data_dir: &Path) -> i32 {
     report.push("pipe", pipe);
     report.push("utilisateur", user);
     if pipe == 0 || user == 0 {
-        report.push("erreur", "Steam_CreateGlobalUser a refusé le pipe ou l'utilisateur");
+        report.push(
+            "erreur",
+            "Steam_CreateGlobalUser a refusé le pipe ou l'utilisateur",
+        );
         print_host(&report);
         unsafe { libc::_exit(1) }
     }
@@ -649,7 +680,10 @@ fn host(data_dir: &Path) -> i32 {
     report.push("moteur", !engine.is_null());
     report.push("moteur_code", error_code);
     if engine.is_null() {
-        report.push("erreur", format!("{CLIENT_ENGINE_VERSION} absent (code {error_code})"));
+        report.push(
+            "erreur",
+            format!("{CLIENT_ENGINE_VERSION} absent (code {error_code})"),
+        );
         print_host(&report);
         unsafe { libc::_exit(1) }
     }
@@ -663,13 +697,19 @@ fn host(data_dir: &Path) -> i32 {
     let client_user = unsafe { get_user(engine, user, pipe) };
     report.push("iclient_user", !client_user.is_null());
     if client_user.is_null() {
-        report.push("erreur", "IClientUser absent : la bibliothèque n'expose pas le client");
+        report.push(
+            "erreur",
+            "IClientUser absent : la bibliothèque n'expose pas le client",
+        );
         print_host(&report);
         unsafe { libc::_exit(1) }
     }
 
     let Some(account) = session_for(data_dir) else {
-        report.push("erreur", "aucune session Steam enregistrée ; lance `lapinux-probe account --login`");
+        report.push(
+            "erreur",
+            "aucune session Steam enregistrée ; lance `lapinux-probe account --login`",
+        );
         print_host(&report);
         unsafe { libc::_exit(1) }
     };
@@ -767,8 +807,7 @@ fn logon_with_token(
     token_c: &CString,
     report: &mut HostReport,
 ) -> bool {
-    let Some(set_id_entry) =
-        (unsafe { vtable_entry_at(client_user, ICLIENT_USER_SET_STEAM_ID) })
+    let Some(set_id_entry) = (unsafe { vtable_entry_at(client_user, ICLIENT_USER_SET_STEAM_ID) })
     else {
         report.push("erreur", "SetSteamID absent");
         return false;
@@ -851,10 +890,7 @@ fn host_exe() -> Result<std::path::PathBuf, String> {
     if name.starts_with("lapinux-probe") {
         return Ok(current);
     }
-    let sibling = current.with_file_name(format!(
-        "lapinux-probe{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let sibling = current.with_file_name(format!("lapinux-probe{}", std::env::consts::EXE_SUFFIX));
     Ok(if sibling.is_file() { sibling } else { current })
 }
 
@@ -902,8 +938,12 @@ fn run_host_child(
         let _ = err_tx.send(text);
     });
     let status = wait_child(&mut child, HOST_TIMEOUT)?;
-    let stdout = out_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-    let stderr = err_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    let stdout = out_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default();
+    let stderr = err_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default();
     let duration = started.elapsed().as_millis() as u64;
     let fields = parse_fields(&stdout);
     let exit = status.code().unwrap_or(-1);
@@ -914,7 +954,10 @@ fn run_host_child(
 fn wait_child(child: &mut Child, timeout: Duration) -> Result<std::process::ExitStatus, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait().map_err(|error| format!("hôte : {error}"))? {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("hôte : {error}"))?
+        {
             return Ok(status);
         }
         if Instant::now() >= deadline {
@@ -979,7 +1022,10 @@ fn print_prepare(report: &PrepareReport) {
             lapinux_core::util::format_bytes(report.downloaded)
         );
     }
-    println!("  extraite      {}", if report.extracted { "oui" } else { "non" });
+    println!(
+        "  extraite      {}",
+        if report.extracted { "oui" } else { "non" }
+    );
     if let Some(status) = report.update_status {
         println!("  mise à jour   code {status}");
     }
@@ -996,14 +1042,20 @@ fn print_prepare(report: &PrepareReport) {
 /// Affiche l'état de la bibliothèque.
 fn print_library(report: &LibraryReport) {
     println!("bibliothèque  {}", report.path.display());
-    println!("  présente     {}", if report.exists { "oui" } else { "non" });
+    println!(
+        "  présente     {}",
+        if report.exists { "oui" } else { "non" }
+    );
     if let Some(size) = report.size {
         println!("  taille       {}", lapinux_core::util::format_bytes(size));
     }
     if let Some(elf) = &report.elf {
         println!("  format       {elf}");
     }
-    println!("  chargée      {}", if report.loaded { "oui" } else { "non" });
+    println!(
+        "  chargée      {}",
+        if report.loaded { "oui" } else { "non" }
+    );
     if !report.symbols.is_empty() {
         println!("  symboles :");
         for (name, present) in &report.symbols {
@@ -1038,7 +1090,15 @@ fn print_probe(report: &ProbeReport) {
     }
     if !report.stderr.trim().is_empty() {
         println!("  journal stderr :");
-        for line in report.stderr.lines().rev().take(12).collect::<Vec<_>>().iter().rev() {
+        for line in report
+            .stderr
+            .lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
             println!("    {line}");
         }
     }
@@ -1087,7 +1147,9 @@ pub fn cli(args: &[String]) -> i32 {
         println!("\nAstuce : lance `lapinux-probe runtime --prepare`.");
         return 1;
     }
-    println!("\nAstuce : `lapinux-probe runtime --probe` tente la connexion avec le jeton enregistré.");
+    println!(
+        "\nAstuce : `lapinux-probe runtime --probe` tente la connexion avec le jeton enregistré."
+    );
     0
 }
 
@@ -1106,7 +1168,10 @@ mod tests {
     #[test]
     fn runtime_paths_are_private() {
         let data = Path::new("/data/lapinux");
-        assert_eq!(runtime_root(data), PathBuf::from("/data/lapinux/steam-runtime"));
+        assert_eq!(
+            runtime_root(data),
+            PathBuf::from("/data/lapinux/steam-runtime")
+        );
         assert_eq!(steam_home(data), PathBuf::from("/data/lapinux/steam-home"));
         let library = library_path(data);
         assert!(library.ends_with("steam-runtime/linux64/steamclient.so"));

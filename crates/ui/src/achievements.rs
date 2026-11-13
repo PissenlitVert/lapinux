@@ -15,8 +15,12 @@ fn timeout_error() -> &'static str {
     lapinux_core::i18n::t("achievements.timeout")
 }
 /// Un téléchargement d'icône sans réponse au bout de huit secondes est perdu :
-/// la case grise reste, la fiche ne bloque pas pour autant.
+/// la case grise reste pour l'instant, puis un nouvel essai part après
+/// `ICON_RETRY`.
 const ICON_TIMEOUT: Duration = Duration::from_secs(8);
+/// Délai avant de retenter une icône qui a échoué : une coupure passagère ne
+/// doit pas laisser une case grise jusqu'au redémarrage.
+const ICON_RETRY: Duration = Duration::from_secs(30);
 /// Icônes téléchargées en parallèle : quatre requêtes remplissent la bande
 /// aussi vite qu'une seule en tirerait le premier tiers.
 const ICON_WORKERS: usize = 4;
@@ -69,7 +73,6 @@ impl Achievements {
     pub fn completion(&self) -> f32 {
         self.fraction() * 100.0
     }
-
 
     /// Tous les succès sont débloqués : le jeu est « platine ».
     pub fn platinum(&self) -> bool {
@@ -142,9 +145,7 @@ fn fetch(client: &Client, appid: u32) -> Result<Achievements, String> {
     let envelope = client
         .request(&Req::GameAchievements { appid })
         .map_err(|error| error.to_string())?;
-    let read: SteamAchievements = envelope
-        .into_data()
-        .map_err(|error| error.to_string())?;
+    let read: SteamAchievements = envelope.into_data().map_err(|error| error.to_string())?;
     if read.items.is_empty() {
         return Err(empty_message(&read));
     }
@@ -164,6 +165,7 @@ fn empty_message(read: &SteamAchievements) -> String {
 enum Msg {
     Loaded(Result<Achievements, String>),
     Icon { url: String, bytes: Vec<u8> },
+    IconFailed { url: String },
 }
 
 /// État et peinture du bloc « Succès » de la fiche.
@@ -184,6 +186,9 @@ pub(crate) struct Sheet {
     icons: HashMap<String, egui::TextureHandle>,
     /// Icônes en cours de téléchargement : une seule demande par adresse.
     pending: HashSet<String>,
+    /// Icônes dont le dernier téléchargement a échoué : nouvel essai après
+    /// un délai, sans marteler le CDN à chaque image.
+    failed: HashMap<String, Instant>,
     /// Nom du jeu lu, pour le titre de la liste complète.
     title: String,
     /// Boutique d'où viennent les succès : Steam, ou celle qui les publie.
@@ -214,6 +219,7 @@ impl Default for Sheet {
             tx: None,
             icons: HashMap::new(),
             pending: HashSet::new(),
+            failed: HashMap::new(),
             title: String::new(),
             source: "Steam".into(),
             modal: false,
@@ -254,6 +260,7 @@ impl Sheet {
         // Les tâches en cours s'arrêtent avec le canal : leurs icônes ne
         // seront plus jamais livrées, il faut redemander celles qui manquent.
         self.pending.clear();
+        self.failed.clear();
         // Les textures restent : un jeu revu ne re-télécharge pas ses icônes.
     }
 
@@ -301,7 +308,11 @@ impl Sheet {
     /// Relève les réponses des tâches de fond : jeu chargé, puis icônes. Une
     /// lecture qui dépasse son budget est abandonnée, avec un message clair.
     pub fn poll(&mut self, ctx: &egui::Context) {
-        if self.loading && self.started.is_some_and(|started| started.elapsed() > LOAD_BUDGET) {
+        if self.loading
+            && self
+                .started
+                .is_some_and(|started| started.elapsed() > LOAD_BUDGET)
+        {
             self.loading = false;
             self.error = Some(timeout_error().to_string());
         }
@@ -323,8 +334,17 @@ impl Sheet {
                 Msg::Icon { url, bytes } => {
                     self.pending.remove(&url);
                     if let Some(texture) = texture_from_bytes(ctx, &url, &bytes) {
+                        self.failed.remove(&url);
                         self.icons.insert(url, texture);
+                    } else {
+                        self.failed.insert(url, Instant::now());
+                        ctx.request_repaint_after(ICON_RETRY);
                     }
+                }
+                Msg::IconFailed { url } => {
+                    self.pending.remove(&url);
+                    self.failed.insert(url, Instant::now());
+                    ctx.request_repaint_after(ICON_RETRY);
                 }
             }
         }
@@ -333,9 +353,12 @@ impl Sheet {
     /// Télécharge les icônes demandées en quelques tâches parallèles, dans
     /// l'ordre d'affichage : la bande se remplit quatre fois plus vite.
     fn start_icons(&mut self, urls: Vec<String>, ctx: &egui::Context) {
+        let now = Instant::now();
+        self.failed
+            .retain(|_, failed_at| now.duration_since(*failed_at) < ICON_RETRY);
         let wanted: Vec<String> = urls
             .into_iter()
-            .filter(|url| !self.icons.contains_key(url) && !self.pending.contains(url))
+            .filter(|url| self.icon_wanted(url, now))
             .take(MAX_ICONS)
             .collect();
         if wanted.is_empty() {
@@ -364,6 +387,10 @@ impl Sheet {
                     return;
                 };
                 let Some(bytes) = http_bytes(&url) else {
+                    if tx.send(Msg::IconFailed { url }).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
                     continue;
                 };
                 if tx.send(Msg::Icon { url, bytes }).is_err() {
@@ -372,6 +399,17 @@ impl Sheet {
                 ctx.request_repaint();
             });
         }
+    }
+
+    /// Une icône absente, pas déjà en téléchargement et dont le dernier échec
+    /// date de plus que `ICON_RETRY` peut être redemandée.
+    fn icon_wanted(&self, url: &str, now: Instant) -> bool {
+        !self.icons.contains_key(url)
+            && !self.pending.contains(url)
+            && !self
+                .failed
+                .get(url)
+                .is_some_and(|failed_at| now.duration_since(*failed_at) < ICON_RETRY)
     }
 
     /// Liste complète des succès, ouverte par la tuile « + N » : les débloqués
@@ -447,20 +485,30 @@ impl Sheet {
             egui::vec2(660.0, 680.0),
             |ui| {
                 ui.horizontal(|ui| {
-                    if crate::link_text(ui, &lapinux_core::i18n::t_args("achievements.reload_from", &[("source", &self.source)])).clicked() {
+                    if crate::link_text(
+                        ui,
+                        &lapinux_core::i18n::t_args(
+                            "achievements.reload_from",
+                            &[("source", &self.source)],
+                        ),
+                    )
+                    .clicked()
+                    {
                         reload = true;
                     }
                     ui.add_space(12.0);
-                    if crate::link_text(ui, lapinux_core::i18n::t("achievements.test_notification")).clicked() {
+                    if crate::link_text(ui, lapinux_core::i18n::t("achievements.test_notification"))
+                        .clicked()
+                    {
                         test = true;
                     }
                     if let Some((note, ok, _)) = &self.toast_note {
                         ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(note)
-                                .size(10.5)
-                                .color(if *ok { OK } else { TEXT_DIM() }),
-                        );
+                        ui.label(egui::RichText::new(note).size(10.5).color(if *ok {
+                            OK
+                        } else {
+                            TEXT_DIM()
+                        }));
                     }
                 });
                 ui.add_space(8.0);
@@ -469,10 +517,8 @@ impl Sheet {
                         continue;
                     };
                     ui.horizontal_top(|ui| {
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(34.0, 34.0),
-                            egui::Sense::hover(),
-                        );
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
                         match self.icons.get(&achievement.icon) {
                             Some(texture) => {
                                 let tint = if achievement.unlocked {
@@ -524,12 +570,17 @@ impl Sheet {
                                 match (achievement.unlocked, achievement.unlock_time) {
                                     // L'heure compte : un succès obtenu hier soir
                                     // se lit autrement qu'un succès de 2017.
-                                    (true, Some(time)) => (
-                                        lapinux_core::util::format_datetime(time),
+                                    (true, Some(time)) => {
+                                        (lapinux_core::util::format_datetime(time), OK)
+                                    }
+                                    (true, None) => (
+                                        lapinux_core::i18n::t("achievements.unlocked").to_string(),
                                         OK,
                                     ),
-                                    (true, None) => (lapinux_core::i18n::t("achievements.unlocked").to_string(), OK),
-                                    (false, _) => (lapinux_core::i18n::t("achievements.locked").to_string(), TEXT_DIM()),
+                                    (false, _) => (
+                                        lapinux_core::i18n::t("achievements.locked").to_string(),
+                                        TEXT_DIM(),
+                                    ),
                                 };
                             ui.label(egui::RichText::new(label).size(11.0).color(color));
                             if let Some(percent) = achievement.percent {
@@ -567,14 +618,20 @@ impl Sheet {
         let client = client.detached();
         let (tx, rx) = mpsc::channel();
         self.toast_rx = Some(rx);
-        self.toast_note = Some((lapinux_core::i18n::t("achievements.toast_pending").into(), true, Instant::now()));
+        self.toast_note = Some((
+            lapinux_core::i18n::t("achievements.toast_pending").into(),
+            true,
+            Instant::now(),
+        ));
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let result = match client.request(&Req::AchievementToast {
                 appid,
                 api_name: String::new(),
             }) {
-                Ok(envelope) if envelope.ok => Ok(lapinux_core::i18n::t("achievements.toast_shown").to_string()),
+                Ok(envelope) if envelope.ok => {
+                    Ok(lapinux_core::i18n::t("achievements.toast_shown").to_string())
+                }
                 Ok(envelope) => Err(envelope
                     .error
                     .unwrap_or_else(|| lapinux_core::i18n::t("achievements.toast_refused").into())),
@@ -641,7 +698,11 @@ impl Sheet {
                 // la garder réservée réduisait le lapin d'une taille à l'autre.
                 if self.loading {
                     if let Some(bunny) = bunny {
-                        let title_size = crate::text_size(ui, lapinux_core::i18n::t("achievements.title"), TITLE);
+                        let title_size = crate::text_size(
+                            ui,
+                            lapinux_core::i18n::t("achievements.title"),
+                            TITLE,
+                        );
                         let left = ui.available_rect_before_wrap().center().x - title_size.x / 2.0;
                         crate::painted_text_at(
                             ui,
@@ -657,7 +718,12 @@ impl Sheet {
                             let bottom = top + (height - 20.0).max(0.0) - 2.0;
                             rest.set_bottom(rest.bottom().max(bottom).max(rest.min.y + 24.0));
                         }
-                        crate::launch::waiting_in(ui, rest, bunny, lapinux_core::i18n::t("achievements.loading"));
+                        crate::launch::waiting_in(
+                            ui,
+                            rest,
+                            bunny,
+                            lapinux_core::i18n::t("achievements.loading"),
+                        );
                         return;
                     }
                 }
@@ -688,16 +754,14 @@ impl Sheet {
                     && self.loaded_for.is_some()
                     && !self.loading
                     && self.error.is_none()
-                    && self
-                        .data
-                        .as_ref()
-                        .is_some_and(|data| !data.list.is_empty());
+                    && self.data.as_ref().is_some_and(|data| !data.list.is_empty());
                 let (row, _) =
                     ui.allocate_exact_size(egui::vec2(inner, SIZE + 2.0), egui::Sense::hover());
                 // Sans bande d'icônes (lecture, jeu sans succès), le titre se
                 // centre sur la carte ; avec la bande, il reste au bord pour
                 // lui laisser la largeur nécessaire.
-                let title_width = crate::text_size(ui, lapinux_core::i18n::t("achievements.title"), TITLE).x;
+                let title_width =
+                    crate::text_size(ui, lapinux_core::i18n::t("achievements.title"), TITLE).x;
                 let title_left = if ready {
                     row.left()
                 } else {
@@ -707,7 +771,13 @@ impl Sheet {
                     ui,
                     egui::pos2(
                         title_left,
-                        row.center().y - crate::text_size(ui, lapinux_core::i18n::t("achievements.title"), TITLE).y / 2.0,
+                        row.center().y
+                            - crate::text_size(
+                                ui,
+                                lapinux_core::i18n::t("achievements.title"),
+                                TITLE,
+                            )
+                            .y / 2.0,
                     ),
                     lapinux_core::i18n::t("achievements.title"),
                     TITLE,
@@ -722,7 +792,10 @@ impl Sheet {
                 if !count.is_empty() {
                     crate::painted_text_at(
                         ui,
-                        egui::pos2(row.right() - count_size.x, row.center().y - count_size.y / 2.0),
+                        egui::pos2(
+                            row.right() - count_size.x,
+                            row.center().y - count_size.y / 2.0,
+                        ),
                         &count,
                         11.0,
                         if platinum { ACCENT() } else { TEXT_DIM() },
@@ -830,7 +903,11 @@ impl Sheet {
                             ui.painter().rect_filled(
                                 tile,
                                 egui::Rounding::same(6.0),
-                                if response.hovered() { CARD_ACTIVE() } else { CARD_HOVER() },
+                                if response.hovered() {
+                                    CARD_ACTIVE()
+                                } else {
+                                    CARD_HOVER()
+                                },
                             );
                             ui.painter().text(
                                 tile.center(),
@@ -840,7 +917,10 @@ impl Sheet {
                                 TEXT(),
                             );
                             if response
-                                .on_hover_text(lapinux_core::i18n::t_args("achievements.see_all", &[("count", &data.list.len().to_string())]))
+                                .on_hover_text(lapinux_core::i18n::t_args(
+                                    "achievements.see_all",
+                                    &[("count", &data.list.len().to_string())],
+                                ))
                                 .clicked()
                             {
                                 open_list = true;
@@ -861,7 +941,7 @@ impl Sheet {
                     // Sans planche, la carte garde sa ligne d'attente : même
                     // libellé, même taille que sous le lapin.
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        crate::section_icons::loading(ui, 18.0);
                         ui.label(
                             egui::RichText::new(lapinux_core::i18n::t("achievements.loading"))
                                 .size(crate::launch::WAITING_LABEL_FONT)
@@ -994,7 +1074,11 @@ impl Sheet {
                 egui::pos2(row.left() + 22.0, row.center().y - name_size.y / 2.0),
                 &name,
                 11.0,
-                if achievement.unlocked { TEXT() } else { TEXT_DIM() },
+                if achievement.unlocked {
+                    TEXT()
+                } else {
+                    TEXT_DIM()
+                },
             );
             crate::painted_text_at(
                 ui,
@@ -1074,7 +1158,6 @@ fn centered_notice(ui: &mut egui::Ui, label: &str) {
     );
 }
 
-
 fn share(value: f32) -> String {
     lapinux_core::i18n::decimal(format!("{value:.1}"))
 }
@@ -1109,7 +1192,23 @@ fn achievement_tooltip(achievement: &Achievement) -> String {
     text
 }
 
-pub(crate) fn http_bytes(url: &str) -> Option<Vec<u8>> {
+/// Adresse de secours pour les visuels communautaires Steam : les anciens
+/// caches peuvent encore porter l'ancien CDN Cloudflare, et quelques jeux
+/// n'existent que sur l'un des deux.
+fn alternate_steam_community_url(url: &str) -> Option<String> {
+    const CURRENT: &str = "https://shared.fastly.steamstatic.com/community_assets/images/apps/";
+    const LEGACY: &str =
+        "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/";
+    if let Some(rest) = url.strip_prefix(CURRENT) {
+        Some(format!("{LEGACY}{rest}"))
+    } else if let Some((_, rest)) = url.split_once("/steamcommunity/public/images/apps/") {
+        Some(format!("{CURRENT}{rest}"))
+    } else {
+        None
+    }
+}
+
+fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
     let response = ureq::get(url)
         .set("User-Agent", "Lapinux/0.1")
         .timeout(ICON_TIMEOUT)
@@ -1118,6 +1217,15 @@ pub(crate) fn http_bytes(url: &str) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes).ok()?;
     Some(bytes)
+}
+
+/// Télécharge une image. Pour les visuels communautaires Steam, un ancien
+/// chemin disparu est retenté sur le CDN actuel, et inversement : les caches
+/// écrits avant la migration continuent de fonctionner.
+pub(crate) fn http_bytes(url: &str) -> Option<Vec<u8>> {
+    fetch_bytes(url).or_else(|| {
+        alternate_steam_community_url(url).and_then(|alternate| fetch_bytes(&alternate))
+    })
 }
 
 pub(crate) fn texture_from_bytes(
@@ -1221,7 +1329,11 @@ mod tests {
         // Succès déjà chargés : le bloc ne doit rien demander au réseau.
         sheet.loaded_for = Some(10);
         sheet.data = Some(sample(2, 5));
-        sheet.order = sheet.data.as_ref().map(|data| data.order()).unwrap_or_default();
+        sheet.order = sheet
+            .data
+            .as_ref()
+            .map(|data| data.order())
+            .unwrap_or_default();
         let region = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 220.0));
         let mut output = None;
         for _ in 0..2 {
@@ -1263,7 +1375,10 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "compte des succès : {:?}",
-                    texts.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>()
+                    texts
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<Vec<_>>()
                 )
             });
         // La bande se range à droite du mot, sur sa ligne, et s'arrête avant
@@ -1289,10 +1404,19 @@ mod tests {
         // La barre passe sous la bande, et rien ne déborde de la colonne.
         // Elle porte la teinte du jeu (`accent`), plus le vert fixe d'avant.
         let bars = painted_rects(&output, egui::Color32::from_rgb(0xE0, 0x9A, 0x40));
-        assert!(bars.iter().any(|bar| bar.top() > first.bottom()), "barre sous la bande");
+        assert!(
+            bars.iter().any(|bar| bar.top() > first.bottom()),
+            "barre sous la bande"
+        );
         for (text, rect) in &texts {
-            assert!(rect.right() <= region.right(), "« {text} » déborde à droite");
-            assert!(rect.bottom() <= region.bottom(), "« {text} » déborde en bas");
+            assert!(
+                rect.right() <= region.right(),
+                "« {text} » déborde à droite"
+            );
+            assert!(
+                rect.bottom() <= region.bottom(),
+                "« {text} » déborde en bas"
+            );
         }
     }
 
@@ -1342,7 +1466,7 @@ mod tests {
         let texts = painted_texts(&output);
         let (_, rect) = texts
             .iter()
-            .find(|(text, _)| text == "Aucun succès")
+            .find(|(text, _)| text == lapinux_core::i18n::t("achievements.empty"))
             .expect("le message « Aucun succès »");
         let (_, title) = texts
             .iter()
@@ -1354,7 +1478,10 @@ mod tests {
             (rect.center().x - title.center().x).abs() < 1.0,
             "message décalé : {rect:?} contre {title:?}"
         );
-        assert!(rect.center().y > title.bottom(), "message trop haut : {rect:?}");
+        assert!(
+            rect.center().y > title.bottom(),
+            "message trop haut : {rect:?}"
+        );
     }
 
     /// La place libre sous la barre porte les derniers succès obtenus, avec
@@ -1371,11 +1498,17 @@ mod tests {
                 .unwrap_or_else(|| {
                     panic!(
                         "{needle} manque : {:?}",
-                        texts.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>()
+                        texts
+                            .iter()
+                            .map(|(text, _)| text.as_str())
+                            .collect::<Vec<_>>()
                     )
                 })
         };
-        assert!(rect_of("Derniers succès").is_positive(), "section des derniers succès");
+        assert!(
+            rect_of(lapinux_core::i18n::t("achievements.recent")).is_positive(),
+            "section des derniers succès"
+        );
         let last = rect_of("Succès 1");
         let before = rect_of("Succès 0");
         assert!(
@@ -1388,7 +1521,10 @@ mod tests {
                 .iter()
                 .any(|(text, _)| text == &lapinux_core::util::format_date(1_700_000_001)),
             "date du dernier déblocage : {:?}",
-            texts.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>()
+            texts
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<Vec<_>>()
         );
         // L'encart descend jusqu'à la hauteur demandée : il finit avec les
         // autres cartes de la ligne.
@@ -1396,7 +1532,11 @@ mod tests {
             .into_iter()
             .max_by(|left, right| left.width().total_cmp(&right.width()))
             .expect("encart peint");
-        assert!((card.height() - 170.0).abs() < 1.0, "encart de {}", card.height());
+        assert!(
+            (card.height() - 170.0).abs() < 1.0,
+            "encart de {}",
+            card.height()
+        );
         for (text, rect) in &texts {
             assert!(
                 card.contains_rect(*rect),
@@ -1407,7 +1547,9 @@ mod tests {
         let output = block_in(0.0, sample(2, 5));
         let texts = painted_texts(&output);
         assert!(
-            !texts.iter().any(|(text, _)| text == "Derniers succès"),
+            !texts
+                .iter()
+                .any(|(text, _)| text == lapinux_core::i18n::t("achievements.recent")),
             "pas de ligne sans place"
         );
     }
@@ -1424,11 +1566,24 @@ mod tests {
         let output = block_in(170.0, data);
         let texts = painted_texts(&output);
         let names: Vec<&str> = texts.iter().map(|(text, _)| text.as_str()).collect();
-        assert!(names.contains(&"Les plus rares"), "{names:?}");
-        assert!(names.contains(&"0,5 %"), "la rareté se lit : {names:?}");
-        assert!(names.contains(&"Succès 3"), "le plus rare d'abord : {names:?}");
+        assert!(
+            names.contains(&lapinux_core::i18n::t("achievements.rarest")),
+            "{names:?}"
+        );
+        let rarest = lapinux_core::i18n::decimal("0.5 %");
+        assert!(
+            names.contains(&rarest.as_str()),
+            "la rareté se lit : {names:?}"
+        );
+        assert!(
+            names.contains(&"Succès 3"),
+            "le plus rare d'abord : {names:?}"
+        );
         assert!(names.contains(&"Succès 2"), "{names:?}");
-        assert!(!names.contains(&"Succès 0"), "un succès caché se tait : {names:?}");
+        assert!(
+            !names.contains(&"Succès 0"),
+            "un succès caché se tait : {names:?}"
+        );
     }
 
     /// Images peintes par le bloc : leur texture et leur cadre.
@@ -1526,7 +1681,10 @@ mod tests {
     #[test]
     fn a_game_in_progress_has_no_platinum_trophy() {
         let (_sheet, output) = block_with(2, 5);
-        assert!(painted_images(&output).is_empty(), "pas de trophée avant la fin");
+        assert!(
+            painted_images(&output).is_empty(),
+            "pas de trophée avant la fin"
+        );
     }
 
     #[test]
@@ -1563,9 +1721,14 @@ mod tests {
         }
         let texts = painted_texts(&output.expect("une image peinte"));
         assert!(
-            texts.iter().any(|(text, _)| text == "Aucun succès"),
+            texts
+                .iter()
+                .any(|(text, _)| text == lapinux_core::i18n::t("achievements.empty")),
             "la carte le dit sans détailler : {:?}",
-            texts.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>()
+            texts
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<Vec<_>>()
         );
         assert!(sheet.loaded_for.is_none());
     }
@@ -1608,7 +1771,10 @@ mod tests {
         assert!(
             texts.iter().any(|(text, _)| text.starts_with('+')),
             "la tuile du reste doit être peinte : {:?}",
-            texts.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>()
+            texts
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<Vec<_>>()
         );
         assert!(!sheet.modal, "la fenêtre ne s'ouvre qu'au clic");
     }
@@ -1637,19 +1803,34 @@ mod tests {
         }
         let texts = painted_texts(&output.expect("une image peinte"));
         // Le panneau fixe porte le titre, le jeu et le compte en sous-titre.
+        let subtitle = lapinux_core::i18n::t_args(
+            "achievements.subtitle",
+            &[
+                ("title", "Jeu test"),
+                ("unlocked", "2"),
+                ("total", "60"),
+                ("percent", &lapinux_core::i18n::decimal("3.3")),
+                ("platinum", ""),
+            ],
+        );
         for expected in [
             lapinux_core::i18n::t("achievements.title"),
-            "Jeu test · 2 / 60 débloqués · 3,3 %",
+            subtitle.as_str(),
             "Succès 1",
             "Succès 0",
         ] {
             assert!(
                 texts.iter().any(|(text, _)| text == expected),
                 "« {expected} » manque : {:?}",
-                texts.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>()
+                texts
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<Vec<_>>()
             );
         }
-        assert!(texts.iter().any(|(text, _)| text == "Non débloqué"));
+        assert!(texts
+            .iter()
+            .any(|(text, _)| text == lapinux_core::i18n::t("achievements.locked")));
         assert!(sheet.modal);
     }
 
@@ -1662,16 +1843,18 @@ mod tests {
             play_minutes: None,
             items: entries
                 .iter()
-                .map(|(api_name, name, description, hidden, achieved, time)| SteamAchievement {
-                    api_name: (*api_name).to_string(),
-                    name: (*name).to_string(),
-                    description: (*description).to_string(),
-                    icon: format!("https://cdn.example/{api_name}.jpg"),
-                    hidden: *hidden,
-                    achieved: *achieved,
-                    unlock_time: *time,
-                    percent: None,
-                })
+                .map(
+                    |(api_name, name, description, hidden, achieved, time)| SteamAchievement {
+                        api_name: (*api_name).to_string(),
+                        name: (*name).to_string(),
+                        description: (*description).to_string(),
+                        icon: format!("https://cdn.example/{api_name}.jpg"),
+                        hidden: *hidden,
+                        achieved: *achieved,
+                        unlock_time: *time,
+                        percent: None,
+                    },
+                )
                 .collect(),
             notes: Vec::new(),
         }
@@ -1680,8 +1863,22 @@ mod tests {
     #[test]
     fn a_success_is_assembled_from_the_protocol_read() {
         let read = read(&[
-            ("NEW_DAY", "Nouveau jour", "Termine le premier jour", false, false, None),
-            ("BOSS", "Boss final", "Vaincs le boss", false, true, Some(1_700_000_000)),
+            (
+                "NEW_DAY",
+                "Nouveau jour",
+                "Termine le premier jour",
+                false,
+                false,
+                None,
+            ),
+            (
+                "BOSS",
+                "Boss final",
+                "Vaincs le boss",
+                false,
+                true,
+                Some(1_700_000_000),
+            ),
         ]);
         let merged = assemble(read);
         assert_eq!(merged.total(), 2);
@@ -1724,7 +1921,8 @@ mod tests {
         assert_eq!(locked.list[0].description, "Tu ne dois pas le savoir");
         assert!(locked.list[0].hidden);
         assert!(!locked.list[0].unlocked);
-        assert!(achievement_tooltip(&locked.list[0]).contains("succès caché"));
+        assert!(achievement_tooltip(&locked.list[0])
+            .contains(lapinux_core::i18n::t("achievements.hidden_suffix")));
 
         let unlocked = assemble(read(&[(
             "SECRET",
@@ -1772,13 +1970,39 @@ mod tests {
         // Aucune note : la lecture a abouti, le jeu ne publie rien.
         assert_eq!(
             empty_message(&read(&[])),
-            "Ce jeu ne publie aucun succès : rien à afficher."
+            lapinux_core::i18n::t("achievements.none_published")
         );
     }
 
     #[test]
+    fn old_steam_community_icons_fall_back_to_the_new_cdn() {
+        let old = "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/4670920/a.jpg";
+        let new =
+            "https://shared.fastly.steamstatic.com/community_assets/images/apps/4670920/a.jpg";
+        assert_eq!(alternate_steam_community_url(old).as_deref(), Some(new));
+        assert_eq!(alternate_steam_community_url(new).as_deref(), Some(old));
+        assert_eq!(
+            alternate_steam_community_url("https://example.com/a.jpg"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failed_icon_is_retried_after_the_delay() {
+        let url = "https://shared.fastly.steamstatic.com/community_assets/images/apps/1/a.jpg";
+        let now = Instant::now();
+        let mut sheet = Sheet::default();
+        assert!(sheet.icon_wanted(url, now));
+        sheet.failed.insert(url.to_string(), now);
+        assert!(!sheet.icon_wanted(url, now));
+        assert!(sheet.icon_wanted(url, now + ICON_RETRY));
+    }
+
+    #[test]
     fn icon_requests_are_capped() {
-        let urls: Vec<String> = (0..40).map(|index| format!("https://cdn/{index}.jpg")).collect();
+        let urls: Vec<String> = (0..40)
+            .map(|index| format!("https://cdn/{index}.jpg"))
+            .collect();
         assert!(urls.len() > MAX_ICONS);
         // Une seule icône par adresse : la garde est un ensemble d'attente.
         let mut pending = HashSet::new();

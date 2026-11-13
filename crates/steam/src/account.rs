@@ -71,11 +71,7 @@ impl CmBackend {
     }
 
     /// Connexion nominative avec la donnée Steam Guard d'une session passée.
-    pub fn account_with_guard(
-        name: String,
-        password: String,
-        guard_data: Option<String>,
-    ) -> Self {
+    pub fn account_with_guard(name: String, password: String, guard_data: Option<String>) -> Self {
         Self {
             config: cm::Config::from_env(),
             auth: cm::Auth::Account {
@@ -127,8 +123,8 @@ impl Backend for CmBackend {
             };
             prompt(kind, retry).map_err(cm::Error::Auth)
         };
-        let session = cm::sign_in(&self.config, &self.auth, &mut guard)
-            .map_err(|error| error.to_string())?;
+        let session =
+            cm::sign_in(&self.config, &self.auth, &mut guard).map_err(|error| error.to_string())?;
         let mut details = vec![
             ("eresult".to_string(), session.eresult.to_string()),
             (
@@ -142,7 +138,10 @@ impl Backend for CmBackend {
         match &self.auth {
             cm::Auth::Account { name, .. } => {
                 details.push(("compte".to_string(), name.clone()));
-                details.push(("authentification".to_string(), "mot de passe + jeton".into()));
+                details.push((
+                    "authentification".to_string(),
+                    "mot de passe + jeton".into(),
+                ));
             }
             cm::Auth::Token { name, .. } => {
                 details.push(("compte".to_string(), name.clone()));
@@ -168,9 +167,12 @@ impl Backend for CmBackend {
             logged_on: true,
             anonymous: session.anonymous,
             endpoint: Some(session.endpoint),
-            licenses: session
-                .licenses
-                .map(|licenses| licenses.into_iter().map(|license| license.package_id).collect()),
+            licenses: session.licenses.map(|licenses| {
+                licenses
+                    .into_iter()
+                    .map(|license| license.package_id)
+                    .collect()
+            }),
             refresh_token: session.refresh_token,
             guard_data: session.guard_data,
             details,

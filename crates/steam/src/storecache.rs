@@ -27,12 +27,16 @@ pub(crate) struct PackageEntry {
     pub apps: Vec<(u32, String)>,
 }
 
-/// Nom et type d'une application, tels que la boutique les publie.
+/// Nom, type et DLC publiés d'une application, tels que la boutique les
+/// publie. `dlc_ids` reste `None` pour une entrée écrite avant ce relevé :
+/// elle sera relue une fois, puis les DLC vides seront mémorisés eux aussi.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AppEntry {
     pub at: i64,
     pub name: String,
     pub kind: String,
+    #[serde(default)]
+    pub dlc_ids: Option<Vec<u32>>,
 }
 
 /// Compteurs du dernier passage : servis par le cache, demandés au réseau.
@@ -186,8 +190,8 @@ pub(crate) fn app(appid: u32) -> Option<AppEntry> {
     read(&app_path(dir(), appid))
 }
 
-/// Garde le nom et le type d'une application.
-pub(crate) fn save_app(appid: u32, name: &str, kind: &str) {
+/// Garde le nom, le type et les DLC publiés d'une application.
+pub(crate) fn save_app(appid: u32, name: &str, kind: &str, dlc_ids: &[u32]) {
     if name.trim().is_empty() {
         return;
     }
@@ -197,6 +201,7 @@ pub(crate) fn save_app(appid: u32, name: &str, kind: &str) {
             at: now(),
             name: name.to_string(),
             kind: kind.to_string(),
+            dlc_ids: Some(dlc_ids.to_vec()),
         },
     );
 }
@@ -244,6 +249,7 @@ mod tests {
             at: now(),
             name: "Half-Life 2".into(),
             kind: "game".into(),
+            dlc_ids: Some(vec![420, 421]),
         };
         write(file.clone(), &entry);
         assert_eq!(read::<AppEntry>(&file), Some(entry.clone()));

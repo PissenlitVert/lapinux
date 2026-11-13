@@ -12,9 +12,21 @@ use std::sync::{Mutex, OnceLock};
 /// Version des fiches écrites dans le cache. Un catalogue plus ancien est
 /// resynchronisé une fois pour recevoir les champs ajoutés depuis.
 ///
-/// Version 11 : les démos sont conservées dans le catalogue, pour que la
-/// bibliothèque puisse les afficher ou les masquer selon le réglage.
-pub const VERSION: u32 = 11;
+/// Version 16 : les jeux prêtés par la famille reçoivent leur date
+/// d'obtention (`rt_time_acquired`), au lieu de rester sans date.
+///
+/// Version 15 : les jeux sans fiche PICS reçoivent la liste de leurs DLC
+/// publiés par la boutique, pour que les versions familiales montrent aussi
+/// leurs contenus.
+///
+/// Version 14 : les DLC partagés viennent des licences du groupe, qui nomment
+/// le membre propriétaire de chaque paquet, et non du service de famille —
+/// celui-ci ne publie jamais de contenu additionnel.
+///
+/// Version 13 : les DLC partagés par la famille gardent leur propriétaire.
+/// Le type 4 de Steam (outils, SDK) n'est pas un DLC : la version 13 écarte
+/// le cache de la version 12 qui les avait pris pour tels.
+pub const VERSION: u32 = 16;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
@@ -75,6 +87,17 @@ pub struct DlcEntry {
     pub download: u64,
 }
 
+/// Contenu additionnel partagé par la famille : son appid, son nom, et les
+/// membres qui le possèdent. La même application peut appartenir à plusieurs
+/// membres ; elle est alors proposée pour chacun d'eux.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FamilyDlc {
+    pub appid: u32,
+    pub name: String,
+    #[serde(default)]
+    pub owners: Vec<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Catalog {
     /// Version des fiches ; `0` pour un cache écrit avant le versionnement.
@@ -89,6 +112,9 @@ pub struct Catalog {
     /// Contenus additionnels possédés, tous jeux confondus.
     #[serde(default)]
     pub dlcs: Vec<DlcEntry>,
+    /// Contenus additionnels partagés par la famille et leur propriétaire.
+    #[serde(default)]
+    pub family_dlcs: Vec<FamilyDlc>,
     /// Dates posées à l'activation d'une clé. Elles priment sur celles qu'une
     /// relève devine par les licences et les lots, souvent plus anciennes et
     /// fausses pour un jeu reçu par une clé.
@@ -156,20 +182,24 @@ impl Catalog {
         self.entries.iter().find(|entry| entry.appid == appid)
     }
 
-    /// Nom d'un jeu absent du catalogue — celui d'un ami, par exemple : le
-    /// catalogue ne contient que les jeux possédés, alors qu'un ami peut jouer
-    /// à n'importe quoi. La boutique publique donne le nom, et il est gardé
-    /// pour la suite de la session.
-    pub fn store_name(appid: u32) -> Option<String> {
-        static NAMES: OnceLock<Mutex<HashMap<u32, Option<String>>>> = OnceLock::new();
-        let names = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(known) = names.lock().ok().and_then(|names| names.get(&appid).cloned()) {
-            return known;
+    /// Nom et type d'une application, lus sur la boutique publique. Sert au
+    /// contrôle léger du compte : un appid ajouté depuis la dernière
+    /// synchronisation se nomme sans relire les paquets. Le type évite de
+    /// prendre un contenu additionnel ou un outil pour un jeu.
+    pub fn store_entry(appid: u32) -> Option<(String, String)> {
+        static ENTRIES: OnceLock<Mutex<HashMap<u32, (String, String)>>> = OnceLock::new();
+        let entries = ENTRIES.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(known) = entries
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(&appid).cloned())
+        {
+            return Some(known);
         }
         let url = format!(
             "https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic&l=french"
         );
-        let name = ureq::get(&url)
+        let found = ureq::get(&url)
             .set("User-Agent", "Lapinux/1.0")
             .timeout(std::time::Duration::from_secs(8))
             .call()
@@ -177,17 +207,30 @@ impl Catalog {
             .and_then(|reply| reply.into_string().ok())
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
             .and_then(|value| {
-                value
-                    .get(appid.to_string())
-                    .and_then(|entry| entry.get("data"))
-                    .and_then(|data| data.get("name"))
-                    .and_then(|name| name.as_str())
-                    .map(str::to_string)
+                let data = value.get(appid.to_string())?.get("data")?;
+                let name = data.get("name")?.as_str()?.to_string();
+                let kind = data
+                    .get("type")
+                    .and_then(|kind| kind.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((name, kind))
             });
-        if let Ok(mut names) = names.lock() {
-            names.insert(appid, name.clone());
+        // Un échec réseau ou une réponse momentanément vide ne doit pas
+        // condamner cet appid pour toute la session : le prochain relevé
+        // redemandera le nom. Seules les réponses valides sont gardées.
+        if let (Some(found), Ok(mut entries)) = (&found, entries.lock()) {
+            entries.insert(appid, found.clone());
         }
-        name
+        found
+    }
+
+    /// Nom d'un jeu absent du catalogue — celui d'un ami, par exemple : le
+    /// catalogue ne contient que les jeux possédés, alors qu'un ami peut jouer
+    /// à n'importe quoi. La boutique publique donne le nom, et il est gardé
+    /// pour la suite de la session.
+    pub fn store_name(appid: u32) -> Option<String> {
+        Self::store_entry(appid).map(|(name, _)| name)
     }
 
     pub fn dlc(&self, appid: u32) -> Option<&DlcEntry> {
@@ -401,7 +444,10 @@ mod tests {
         let owned = catalog.dlcs_of(&game);
         // L'ordre du jeu est gardé, pas celui du catalogue.
         assert_eq!(
-            owned.iter().map(|dlc| dlc.name.as_str()).collect::<Vec<_>>(),
+            owned
+                .iter()
+                .map(|dlc| dlc.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["Première extension", "Troisième extension"]
         );
         assert_eq!(owned[0].download, 2_000);
@@ -438,7 +484,10 @@ mod tests {
         catalog.fill_missing_art();
         catalog.save(&path).unwrap();
         assert_eq!(Catalog::load(&path), catalog);
-        assert_eq!(Catalog::load(&dir.path().join("absent.json")), Catalog::default());
+        assert_eq!(
+            Catalog::load(&dir.path().join("absent.json")),
+            Catalog::default()
+        );
     }
 
     #[test]
@@ -501,5 +550,4 @@ mod tests {
             Some("Blair Witch")
         );
     }
-
 }

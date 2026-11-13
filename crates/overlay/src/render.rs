@@ -4,15 +4,16 @@
 //! puis une ligne par réglage (pictogramme, libellé, valeur).
 
 use crate::menu::{
-    icon, FpsStatus, HudLayout, HudPosition, HudPreset, Icon, Item, MenuState, Page, CAPSULE_HEIGHT,
-    CAPSULE_TOP, CHAT_COMPOSER_HEIGHT, FOOTER_HEIGHT, FRIENDS_BUTTON_SIZE, FRIENDS_HEIGHT,
-    FRIENDS_WIDTH, FPS_STEPS, FPS_TRACK_LEFT, FPS_TRACK_RIGHT, HEADER_HEIGHT,
-    INVITE_TITLE_TOP, INVITE_TOP, LIVE_HEIGHT, LIVE_TOP, PADDING,
-    PERF_ENGINE_GAP, PERF_ENGINE_W, PERF_GRID, PERF_INFO, PERF_ROW, PERF_SECTION, PERF_TOP,
-    PROFILE_TOP, RECORDING_STATUS_HEIGHT, ROW_HEIGHT,
+    icon, profile_display_name, FpsStatus, Hover, HudLayout, HudPosition, Icon, Item, MenuState,
+    Page, CAPSULE_HEIGHT, CAPSULE_TOP, CHAT_COMPOSER_HEIGHT, FOOTER_HEIGHT, FPS_STEPS,
+    AFMF_RAIL_INSET, FPS_TRACK_LEFT, FPS_TRACK_RIGHT, FRIENDS_HEIGHT, FRIENDS_WIDTH, HEADER_HEIGHT,
+    INVITE_TITLE_TOP, INVITE_TOP, LIVE_HEIGHT, LIVE_TOP, PADDING, PERF_GRID, PERF_INFO, PERF_ROW,
+    PERF_SECTION, PERF_TOP, PROFILE_TOP, RECORDING_STATUS_HEIGHT, ROW_HEIGHT,
 };
 use crate::{Error, Result};
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use lapinux_core::hud::HudElement;
+use lapinux_core::i18n::{t, t_args};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,32 +21,32 @@ use tiny_skia::{
     FillRule, IntSize, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform,
 };
 
-const PANEL_WIDTH: f32 = 520.0;
+const PANEL_WIDTH: f32 = 440.0;
 /// Distance du bord gauche de l'écran.
 const PANEL_MARGIN: f32 = 40.0;
-/// Angles à l'équerre : le panneau et ses cartes sont rectangulaires.
+/// Bords carrés pour le panneau et ses lignes.
 const PANEL_RADIUS: f32 = 0.0;
 const CARD_RADIUS: f32 = 0.0;
 
-const BG_PANEL: (u8, u8, u8, u8) = (13, 14, 16, 247);
+// Palette classique de l'interface Lapinux (crates/ui/src/theme.rs).
+const BG_PANEL: (u8, u8, u8, u8) = (28, 29, 31, 248);
 const BORDER: (u8, u8, u8, u8) = (255, 255, 255, 24);
 const ROW: (u8, u8, u8, u8) = (255, 255, 255, 10);
 const ROW_PRIMARY: (u8, u8, u8, u8) = (255, 255, 255, 20);
-const SELECTED: (u8, u8, u8, u8) = (238, 239, 241, 255);
-const TEXT: (u8, u8, u8, u8) = (234, 235, 238, 255);
-const TEXT_DIM: (u8, u8, u8, u8) = (150, 152, 157, 255);
-const TEXT_DARK: (u8, u8, u8, u8) = (21, 22, 24, 255);
-const TEXT_DARK_DIM: (u8, u8, u8, u8) = (78, 80, 85, 255);
+const SELECTED: (u8, u8, u8, u8) = (58, 59, 62, 255);
+const TEXT: (u8, u8, u8, u8) = (235, 236, 238, 255);
+const TEXT_DIM: (u8, u8, u8, u8) = (160, 162, 166, 255);
+const TEXT_DARK: (u8, u8, u8, u8) = (235, 236, 238, 255);
+const TEXT_DARK_DIM: (u8, u8, u8, u8) = (206, 208, 211, 255);
 const DANGER: (u8, u8, u8, u8) = (231, 148, 148, 255);
-/// Bleu discret : repères de section, onglet actif, titre en jeu. Il donne au
-/// panneau une lecture d'ensemble sans concurrencer les valeurs.
-const ACCENT: (u8, u8, u8, u8) = (138, 178, 255, 255);
+/// Accent clair du thème classique, également utilisé pour le repère de focus.
+const ACCENT: (u8, u8, u8, u8) = (206, 208, 211, 255);
 
 pub struct Renderer {
     font: FontVec,
     /// Jaquette du jeu en cours, déjà décodée (facultative).
     capsule: Option<Pixmap>,
-    /// Icône carrée du jeu, pour l'en-tête de la plaque de performance.
+    /// Icône carrée du jeu, pour la capsule et la plaque de performance.
     game_icon: Option<Pixmap>,
     /// Avatars d'amis déjà décodés, par chemin du cache du daemon.
     invite_avatars: RefCell<HashMap<PathBuf, Option<Pixmap>>>,
@@ -74,114 +75,49 @@ impl Renderer {
         })
     }
 
-    /// Plaque de performance : la lecture de MangoHud — fond noir translucide
-    /// sans bordure, une ligne par grandeur, libellé à gauche et valeur à
-    /// droite dans la couleur du composant, barres par cœur et courbe de
-    /// frametime en bas.
-    ///
-    /// Elle est dessinée dans la surface de l'overlay, qui est une fenêtre
-    /// distincte de celle du jeu : une capture du jeu ne la contient jamais,
-    /// alors que MangoHud dessine dans l'image du jeu.
+    /// Plaque de performance, entièrement pilotée par `menu.hud_style` :
+    /// l'ordre des éléments, leurs unités et leur précision, chaque couleur,
+    /// le fond et l'accent viennent du style actif. Aucun réglage affiché
+    /// n'est ignoré au rendu.
     fn draw_perf_hud(&self, pixmap: &mut Pixmap, menu: &MenuState) {
-        // Palette de la plaque : une teinte franche par composant, un blanc
-        // doux pour les mesures et du gris bleuté pour les libellés. Les
-        // couleurs se lisent d'un coup d'œil sans saturer l'image du jeu.
-        const SKY: (u8, u8, u8, u8) = (125, 211, 252, 255);
-        const GREEN: (u8, u8, u8, u8) = (52, 211, 153, 255);
-        const BLUE: (u8, u8, u8, u8) = (96, 165, 250, 255);
-        const VIOLET: (u8, u8, u8, u8) = (167, 139, 250, 255);
-        const PINK: (u8, u8, u8, u8) = (244, 114, 182, 255);
-        const VALUE: (u8, u8, u8, u8) = (241, 245, 249, 255);
+        let style = &menu.hud_style;
+        let label_color = hud_rgba(&style.colors.label);
+        let accent = hud_rgba(&style.colors.accent);
+        let panel = hud_rgba(&style.colors.panel);
+        let border = hud_rgba(&style.colors.border);
+        let icon_color = hud_rgba(&style.colors.icon);
+        let cores_color = hud_rgba(&style.colors.cores);
+        let graph_color = hud_rgba(&style.colors.graph);
 
         let live = &menu.live;
-        // Le nom du matériel, comme MangoHud : « RTX 4070 », « Ryzen 7
-        // 5800X3D ». Les deux libellés sont mis en cache.
-        let gpu_label = lapinux_perf::mangohud::gpu_label();
-        let cpu_label = lapinux_perf::mangohud::cpu_label();
-        // Chaque ligne porte sa couleur et, pour les charges, la fraction qui
-        // remplit sa barre de fond.
-        let mut rows: Vec<(String, String, (u8, u8, u8, u8), Option<f32>)> = Vec::new();
-        rows.push((
-            "FPS".into(),
-            live.fps
-                .map(|fps| fps.to_string())
-                .unwrap_or_else(|| "—".into()),
-            SKY,
-            None,
-        ));
-        if menu.hud != HudPreset::Simple {
-            rows.push((
-                "FrameTime".into(),
-                live.fps
-                    .filter(|fps| *fps > 0)
-                    .map(|fps| format!("{:.1} ms", 1000.0 / fps as f32))
-                    .unwrap_or_else(|| "—".into()),
-                VALUE,
-                None,
-            ));
-        }
-        if let Some(system) = menu.system.as_ref() {
-            if let Some(gpu) = system.gpu_load {
-                rows.push((
-                    gpu_label.unwrap_or_else(|| "GPU".into()),
-                    format!("{:.0} %", gpu.usage),
-                    GREEN,
-                    Some(gpu.usage / 100.0),
-                ));
-                if menu.hud == HudPreset::Detailed && gpu.vram_total > 0 {
-                    rows.push((
-                        "VRAM".into(),
-                        format!(
-                            "{:.1} / {:.1} GiB",
-                            gib(gpu.vram_used),
-                            gib(gpu.vram_total)
-                        ),
-                        VIOLET,
-                        Some(gpu.vram_used as f32 / gpu.vram_total as f32),
-                    ));
-                }
-            }
-            rows.push((
-                cpu_label.unwrap_or_else(|| "CPU".into()),
-                format!("{:.0} %", system.cpu_usage),
-                BLUE,
-                Some(system.cpu_usage / 100.0),
-            ));
-            if menu.hud != HudPreset::Simple && system.ram_total > 0 {
-                rows.push((
-                    "RAM".into(),
-                    format!(
-                        "{:.1} / {:.1} GiB",
-                        gib(system.ram_used),
-                        gib(system.ram_total)
-                    ),
-                    PINK,
-                    Some(system.ram_used as f32 / system.ram_total as f32),
-                ));
-            }
-        }
-
-        let inline = menu.hud_layout == HudLayout::Inline;
-        let cores = if menu.hud_cores {
+        let pieces = perf_pieces(menu);
+        let rows: Vec<&PerfRow> = pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                PerfPiece::Row(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+        let inline = style.layout == "inline";
+        let cores = if style.enabled(HudElement::Cores) {
             menu.system
                 .as_ref()
-                .map(|system| system.cpu_cores.clone())
+                .map(|system| system.cpu_cores.as_slice())
                 .filter(|cores| !cores.is_empty())
         } else {
             None
         };
-        let graph = menu.hud_graph && live.series.len() >= 2;
+        let graph = style.enabled(HudElement::Graph) && live.series.len() >= 2;
         let margin = 18.0;
 
         if inline {
-            self.draw_inline_perf_hud(pixmap, menu, cores.as_deref(), graph, margin);
+            self.draw_inline_perf_hud(pixmap, menu, cores, graph, margin);
             return;
         }
 
         // Une seule échelle pour tout : texte, marges, lignes, barres et
-        // courbe. Le réglage va de 0,75 à 2,0 ; la valeur par défaut est un
-        // peu plus grande que la plaque d'origine, illisible à 1080p.
-        let scale = menu.perf_scale.clamp(0.75, 2.0);
+        // courbe. Le réglage va de 0,75 à 2,0.
+        let scale = style.scale.clamp(0.75, 2.0);
         let font_size = 14.0 * scale;
         let label_size = 12.0 * scale;
         let row_h = 24.0 * scale;
@@ -189,17 +125,28 @@ impl Renderer {
         let header_h = 22.0 * scale;
         let mut label_w: f32 = 0.0;
         let mut value_w: f32 = 0.0;
-        for (label, value, _, _) in &rows {
-            label_w = label_w.max(text_width(&self.font, label, label_size));
-            value_w = value_w.max(text_width(&self.font, value, font_size));
+        let mut unit_w: f32 = 0.0;
+        let mut rows_h: f32 = 0.0;
+        for row in &rows {
+            let row_scale = row.scale.clamp(0.75, 1.5);
+            label_w = label_w.max(text_width(&self.font, &row.label, label_size * row_scale));
+            value_w = value_w.max(text_width(&self.font, &row.value, font_size * row_scale));
+            unit_w = unit_w.max(text_width(&self.font, &row.unit, label_size * row_scale));
+            rows_h += row_h * row_scale;
         }
-        let width = (label_w + 30.0 * scale + value_w).max(210.0 * scale) + 2.0 * pad;
-        let mut height = 2.0 * pad + header_h + rows.len() as f32 * row_h;
-        if cores.is_some() {
-            height += 38.0 * scale;
-        }
-        if graph {
-            height += 46.0 * scale;
+        let width = (label_w + 30.0 * scale + value_w + unit_w + 4.0 * scale).max(210.0 * scale)
+            + 2.0 * pad;
+        let mut height = 2.0 * pad + header_h + rows_h;
+        for piece in &pieces {
+            match piece {
+                PerfPiece::Cores(item_scale) if cores.is_some() => {
+                    height += 38.0 * scale * item_scale.clamp(0.75, 1.5);
+                }
+                PerfPiece::Graph(item_scale) if graph => {
+                    height += 46.0 * scale * item_scale.clamp(0.75, 1.5);
+                }
+                _ => {}
+            }
         }
         let width = width
             .min(self.width as f32 - 2.0 * margin)
@@ -209,20 +156,34 @@ impl Renderer {
             self.height,
             width,
             height,
-            menu.hud_position,
+            hud_position_of(&style.position),
             margin,
         );
-        draw_hud_card(pixmap, x, y, width, height);
+        // Fond, bordure et accent du style : la transparence de `panel` est
+        // respectée telle quelle.
+        fill_round(pixmap, x, y, width, height, 12.0, panel);
+        stroke_round(pixmap, x, y, width, height, 12.0, border);
+        fill_round(pixmap, x + 12.0, y, 28.0, 2.0, 1.0, accent);
         let left = x + pad;
         let right = x + width - pad;
         let inner = right - left;
 
-        // En-tête : l'icône carrée du jeu et son nom remplacent le mot
-        // « PERFORMANCE ». La durée de session reste à droite.
+        // En-tête : l'icône carrée du jeu et son nom. La couleur d'icône
+        // dessine le liseré de la vignette, même quand une vraie image est
+        // affichée : une photo ne peut pas être teintée sans la dégrader.
         let mut header_x = left + 2.0;
         if let Some(icon) = &self.game_icon {
             let size = 18.0 * scale;
             let icon_y = y + pad + (header_h - size) * 0.5 - 2.0 * scale;
+            stroke_round(
+                pixmap,
+                header_x - 1.0,
+                icon_y - 1.0,
+                size + 2.0,
+                size + 2.0,
+                2.0,
+                icon_color,
+            );
             let sx = size / icon.width() as f32;
             let sy = size / icon.height() as f32;
             pixmap.draw_pixmap(
@@ -234,6 +195,17 @@ impl Renderer {
                 None,
             );
             header_x += size + 7.0 * scale;
+        } else {
+            fill_round(
+                pixmap,
+                header_x,
+                y + pad + 3.0 * scale,
+                9.0 * scale,
+                9.0 * scale,
+                2.0,
+                icon_color,
+            );
+            header_x += 13.0 * scale;
         }
         let title = fit_text(
             &self.font,
@@ -248,12 +220,9 @@ impl Renderer {
             header_x,
             y + pad + 9.0 * scale,
             11.5 * scale,
-            (234, 235, 238, 225),
+            accent,
         );
-        let session = live
-            .session_secs
-            .map(clock)
-            .unwrap_or_else(|| "—".into());
+        let session = live.session_secs.map(clock).unwrap_or_else(|| "—".into());
         draw_text_right_baseline(
             pixmap,
             &self.font,
@@ -261,179 +230,451 @@ impl Renderer {
             right,
             y + pad + 9.0 * scale,
             10.0 * scale,
-            (148, 163, 184, 190),
+            label_color,
         );
 
         let mut cursor = y + pad + header_h;
-        for (label, value, color, fill) in &rows {
-            let baseline = cursor + row_h * 0.64;
-            let mut dot = PathBuilder::new();
-            dot.push_circle(left + 3.0 * scale, cursor + row_h * 0.5, 2.4 * scale);
-            fill_path(pixmap, dot, *color);
-            draw_text_baseline(
-                pixmap,
-                &self.font,
-                label,
-                left + 14.0 * scale,
-                baseline,
-                label_size,
-                (148, 163, 184, 225),
-            );
-            draw_text_right_baseline(
-                pixmap,
-                &self.font,
-                value,
-                right,
-                baseline,
-                font_size,
-                *color,
-            );
-            if let Some(fraction) = fill {
-                let bar_y = cursor + row_h - 3.5 * scale;
-                fill_round(
-                    pixmap,
-                    left,
-                    bar_y,
-                    inner,
-                    2.5 * scale,
-                    1.2 * scale,
-                    (255, 255, 255, 16),
-                );
-                fill_round(
-                    pixmap,
-                    left,
-                    bar_y,
-                    inner * fraction.clamp(0.0, 1.0),
-                    2.5 * scale,
-                    1.2 * scale,
-                    (color.0, color.1, color.2, 175),
-                );
+        for piece in &pieces {
+            match piece {
+                PerfPiece::Row(row) => {
+                    let item_h = row_h * row.scale.clamp(0.75, 1.5);
+                    let baseline = cursor + item_h * 0.64;
+                    let mut dot = PathBuilder::new();
+                    dot.push_circle(left + 3.0 * scale, cursor + item_h * 0.5, 2.4 * scale);
+                    fill_path(pixmap, dot, row.color);
+                    draw_text_baseline(
+                        pixmap,
+                        &self.font,
+                        &row.label,
+                        left + 14.0 * scale,
+                        baseline,
+                        label_size * row.scale.clamp(0.75, 1.5),
+                        label_color,
+                    );
+                    let row_scale = row.scale.clamp(0.75, 1.5);
+                    draw_text_right_baseline(
+                        pixmap,
+                        &self.font,
+                        &row.value,
+                        right - unit_w - 4.0 * scale,
+                        baseline,
+                        font_size * row_scale,
+                        row.color,
+                    );
+                    // Les unités suivent la couleur des libellés : elles font
+                    // partie du texte d'interface, pas de la mesure colorée.
+                    draw_text_right_baseline(
+                        pixmap,
+                        &self.font,
+                        &row.unit,
+                        right,
+                        baseline,
+                        label_size * row_scale,
+                        label_color,
+                    );
+                    if let Some(fraction) = row.fill {
+                        let bar_y = cursor + item_h - 3.5 * scale;
+                        fill_round(
+                            pixmap,
+                            left,
+                            bar_y,
+                            inner,
+                            2.5 * scale,
+                            1.2 * scale,
+                            (255, 255, 255, 16),
+                        );
+                        fill_round(
+                            pixmap,
+                            left,
+                            bar_y,
+                            inner * fraction.clamp(0.0, 1.0),
+                            2.5 * scale,
+                            1.2 * scale,
+                            (row.color.0, row.color.1, row.color.2, 175),
+                        );
+                    }
+                    cursor += item_h;
+                }
+                PerfPiece::Cores(item_scale) if cores.is_some() => {
+                    let item_scale = scale * item_scale.clamp(0.75, 1.5);
+                    draw_text_baseline(
+                        pixmap,
+                        &self.font,
+                        t("overlay.cores"),
+                        left,
+                        cursor + 10.0 * item_scale,
+                        9.5 * item_scale,
+                        label_color,
+                    );
+                    if let Some(cores) = cores {
+                        draw_cores(
+                            pixmap,
+                            left,
+                            cursor + 15.0 * item_scale,
+                            inner,
+                            13.0 * item_scale,
+                            cores,
+                            cores_color,
+                        );
+                    }
+                    cursor += 38.0 * item_scale;
+                }
+                PerfPiece::Graph(item_scale) if graph => {
+                    let item_scale = scale * item_scale.clamp(0.75, 1.5);
+                    draw_text_baseline(
+                        pixmap,
+                        &self.font,
+                        "FRAMETIME",
+                        left,
+                        cursor + 10.0 * item_scale,
+                        9.5 * item_scale,
+                        label_color,
+                    );
+                    draw_frametime_graph(
+                        pixmap,
+                        &live.series,
+                        left,
+                        cursor + 15.0 * item_scale,
+                        inner,
+                        28.0 * item_scale,
+                        graph_color,
+                    );
+                    cursor += 46.0 * item_scale;
+                }
+                _ => {}
             }
-            cursor += row_h;
-        }
-        if let Some(cores) = cores.as_deref() {
-            draw_text_baseline(
-                pixmap,
-                &self.font,
-                "CŒURS",
-                left,
-                cursor + 10.0 * scale,
-                9.5 * scale,
-                (148, 163, 184, 210),
-            );
-            draw_cores(
-                pixmap,
-                left,
-                cursor + 15.0 * scale,
-                inner,
-                13.0 * scale,
-                cores,
-                BLUE,
-            );
-            cursor += 38.0 * scale;
-        }
-        if graph {
-            draw_text_baseline(
-                pixmap,
-                &self.font,
-                "FRAMETIME",
-                left,
-                cursor + 10.0 * scale,
-                9.5 * scale,
-                (148, 163, 184, 210),
-            );
-            draw_frametime_graph(
-                pixmap,
-                &live.series,
-                left,
-                cursor + 15.0 * scale,
-                inner,
-                28.0 * scale,
-                (56, 189, 248, 220),
-            );
         }
     }
-
 }
 
-/// Une ligne façon MangoHud : le matériel d'abord, la cadence à la fin, des
+/// Une ligne de la plaque : libellé, valeur, couleur et fraction de barre.
+struct PerfRow {
+    label: String,
+    value: String,
+    unit: String,
+    color: (u8, u8, u8, u8),
+    fill: Option<f32>,
+    /// Taille relative choisie pour cet élément (0,75 à 1,5).
+    scale: f32,
+}
+
+/// Élément du rendu dans l'ordre exact choisi par l'utilisateur.
+enum PerfPiece {
+    Row(PerfRow),
+    /// Bloc de cœurs et sa taille relative.
+    Cores(f32),
+    /// Courbe de frametime et sa taille relative.
+    Graph(f32),
+}
+
 /// Capacité en Gio : une barrette de 32 Go annonce « 32 », pas « 34 », qui
 /// est la même quantité comptée en Go décimaux.
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
-/// valeurs colorées et aucun séparateur. La plaque native ne lit pas toutes
-/// les sondes de MangoHud (API graphique, par exemple), mais elle garde sa
-/// grammaire visuelle et l'ordre de ses grandeurs.
-fn inline_hud_spans(menu: &MenuState) -> Vec<(String, (u8, u8, u8, u8))> {
-    const GPU: (u8, u8, u8, u8) = (126, 217, 87, 255);
-    const CPU: (u8, u8, u8, u8) = (106, 181, 255, 255);
-    const TEMP: (u8, u8, u8, u8) = (242, 181, 90, 255);
-    const RAM: (u8, u8, u8, u8) = (226, 120, 180, 255);
-    const VRAM: (u8, u8, u8, u8) = (184, 142, 255, 255);
-    const FPS: (u8, u8, u8, u8) = (255, 145, 130, 255);
-    const FRAMETIME: (u8, u8, u8, u8) = (235, 235, 235, 255);
+/// Couleur d'un style, avec un repli lisible si la valeur est abîmée.
+fn hud_rgba(value: &str) -> (u8, u8, u8, u8) {
+    lapinux_core::hud::color_rgba(value)
+        .map(|[r, g, b, a]| (r, g, b, a))
+        .unwrap_or((241, 245, 249, 255))
+}
 
-    let mut spans = Vec::new();
-    if let Some(system) = menu.system.as_ref() {
-        let gpu_label = lapinux_perf::mangohud::gpu_label();
-        if let Some(gpu) = system.gpu_load {
-            spans.push((
-                format!(
-                    "{} {:.0}%",
-                    gpu_label.as_deref().unwrap_or("GPU"),
-                    gpu.usage
-                ),
-                GPU,
-            ));
-            if let Some(temperature) = gpu.temperature {
-                spans.push((format!("{temperature:.0}°C"), TEMP));
-            }
-            if menu.hud == HudPreset::Detailed && gpu.vram_total > 0 {
-                spans.push((
-                    format!(
-                        "VRAM {:.1}/{:.1} GiB",
-                        gib(gpu.vram_used),
-                        gib(gpu.vram_total)
-                    ),
-                    VRAM,
-                ));
-            }
-        }
-        spans.push((
+/// Nombre avec la précision demandée : 0 à 2 décimales.
+fn format_number(value: f32, precision: u8) -> String {
+    format!("{:.*}", precision.min(2) as usize, value)
+}
+
+fn format_temperature(celsius: f32, unit: &str, precision: u8) -> String {
+    if unit == "fahrenheit" {
+        format!(
+            "{} °F",
+            format_number(celsius * 9.0 / 5.0 + 32.0, precision)
+        )
+    } else {
+        format!("{} °C", format_number(celsius, precision))
+    }
+}
+
+fn memory_text(used: u64, total: u64, unit: &str, precision: u8) -> (String, Option<f32>) {
+    if total == 0 {
+        return ("—".into(), None);
+    }
+    let ratio = used as f32 / total as f32;
+    if unit == "percent" {
+        (
+            format!("{} %", format_number(ratio * 100.0, precision)),
+            Some(ratio),
+        )
+    } else {
+        (
             format!(
-                "{} {:.0}%",
-                lapinux_perf::mangohud::cpu_label()
-                    .as_deref()
-                    .unwrap_or("CPU"),
-                system.cpu_usage
+                "{} / {} GiB",
+                format_number(gib(used) as f32, precision),
+                format_number(gib(total) as f32, precision)
             ),
-            CPU,
-        ));
-        if let Some(temperature) = system.cpu_temp {
-            spans.push((format!("{temperature:.0}°C"), TEMP));
+            Some(ratio),
+        )
+    }
+}
+
+/// Construit une ligne à partir d'un élément et de ses options. Une sonde
+/// absente laisse « — » : l'élément reste visible, mais ne prétend rien.
+fn perf_row(menu: &MenuState, element: &lapinux_core::hud::HudElementStyle) -> PerfRow {
+    use lapinux_core::hud::HudElement;
+    let precision = element.precision.min(2);
+    let label_color = hud_rgba(&menu.hud_style.colors.label);
+    let _ = label_color;
+    let colors = &menu.hud_style.colors;
+    let system = menu.system.as_ref();
+    let element_scale = element.scale.clamp(0.75, 1.5);
+    let (label, value, color, fill) = match element.kind {
+        HudElement::Fps => (
+            "FPS".to_string(),
+            menu.live
+                .fps
+                .map(|fps| format_number(fps as f32, precision))
+                .unwrap_or_else(|| "—".into()),
+            hud_rgba(&colors.fps),
+            None,
+        ),
+        HudElement::Frametime => (
+            "FrameTime".to_string(),
+            menu.live
+                .fps
+                .filter(|fps| *fps > 0)
+                .map(|fps| format!("{} ms", format_number(1000.0 / fps as f32, precision)))
+                .unwrap_or_else(|| "—".into()),
+            hud_rgba(&colors.frametime),
+            None,
+        ),
+        HudElement::Gpu => {
+            let gpu = system.and_then(|system| system.gpu_load);
+            (
+                gpu_hud_label(&menu.hud_style),
+                gpu.map(|gpu| format!("{} %", format_number(gpu.usage, precision)))
+                    .unwrap_or_else(|| "—".into()),
+                hud_rgba(&colors.gpu),
+                gpu.map(|gpu| gpu.usage / 100.0),
+            )
         }
-        if menu.hud != HudPreset::Simple && system.ram_total > 0 {
-            spans.push((
-                format!("RAM {:.1} GiB", gib(system.ram_used)),
-                RAM,
-            ));
+        HudElement::GpuTemp => {
+            let temperature = system
+                .and_then(|system| system.gpu_load)
+                .and_then(|gpu| gpu.temperature);
+            (
+                "Temp. GPU".to_string(),
+                temperature
+                    .map(|value| format_temperature(value, &element.unit, precision))
+                    .unwrap_or_else(|| "—".into()),
+                hud_rgba(&colors.temp),
+                None,
+            )
+        }
+        HudElement::Vram => {
+            let gpu = system.and_then(|system| system.gpu_load);
+            let (value, fill) = gpu
+                .filter(|gpu| gpu.vram_total > 0)
+                .map(|gpu| memory_text(gpu.vram_used, gpu.vram_total, &element.unit, precision))
+                .unwrap_or_else(|| ("—".into(), None));
+            ("VRAM".to_string(), value, hud_rgba(&colors.vram), fill)
+        }
+        HudElement::Cpu => (
+            cpu_hud_label(&menu.hud_style),
+            system
+                .map(|system| format!("{} %", format_number(system.cpu_usage, precision)))
+                .unwrap_or_else(|| "—".into()),
+            hud_rgba(&colors.cpu),
+            system.map(|system| system.cpu_usage / 100.0),
+        ),
+        HudElement::CpuTemp => (
+            "Temp. CPU".to_string(),
+            system
+                .and_then(|system| system.cpu_temp)
+                .map(|value| format_temperature(value, &element.unit, precision))
+                .unwrap_or_else(|| "—".into()),
+            hud_rgba(&colors.temp),
+            None,
+        ),
+        HudElement::Ram => {
+            let (value, fill) = system
+                .filter(|system| system.ram_total > 0)
+                .map(|system| {
+                    memory_text(system.ram_used, system.ram_total, &element.unit, precision)
+                })
+                .unwrap_or_else(|| ("—".into(), None));
+            ("RAM".to_string(), value, hud_rgba(&colors.ram), fill)
+        }
+        // Les courbes ne sont pas des lignes : elles gardent leur place dans
+        // l'ordre, dessinées par `PerfPiece`.
+        HudElement::Cores | HudElement::Graph => {
+            ("".into(), "".into(), hud_rgba(&colors.text), None)
+        }
+    };
+    let (value, unit) = split_unit(&value);
+    PerfRow {
+        label,
+        value,
+        unit,
+        color,
+        fill,
+        scale: element_scale,
+    }
+}
+
+/// Sépare la mesure de son unité pour que « °C », « GiB », « ms » ou « % »
+/// puissent prendre la couleur des libellés sans teinter le nombre.
+fn split_unit(value: &str) -> (String, String) {
+    let Some((number, unit)) = value.rsplit_once(' ') else {
+        return (value.to_string(), String::new());
+    };
+    if matches!(unit, "FPS" | "ms" | "%" | "°C" | "°F" | "GiB") {
+        (number.to_string(), unit.to_string())
+    } else {
+        (value.to_string(), String::new())
+    }
+}
+
+/// Toutes les pièces du HUD dans l'ordre du style : les lignes, mais aussi la
+/// courbe et les cœurs, qui ne sont plus repoussés en bas de la plaque.
+fn perf_pieces(menu: &MenuState) -> Vec<PerfPiece> {
+    use lapinux_core::hud::HudElement;
+    let mut pieces = Vec::new();
+    for element in menu
+        .hud_style
+        .elements
+        .iter()
+        .filter(|element| element.enabled)
+    {
+        match element.kind {
+            HudElement::Cores => pieces.push(PerfPiece::Cores(element.scale)),
+            HudElement::Graph => pieces.push(PerfPiece::Graph(element.scale)),
+            _ => pieces.push(PerfPiece::Row(perf_row(menu, element))),
         }
     }
-    if let Some(fps) = menu.live.fps {
-        spans.push((format!("{fps} FPS"), FPS));
-        if menu.hud != HudPreset::Simple && fps > 0 {
-            spans.push((format!("{:.1} ms", 1000.0 / fps as f32), FRAMETIME));
-        }
+    pieces
+}
+
+fn hud_position_of(value: &str) -> HudPosition {
+    HudPosition::from_wire(value)
+}
+
+/// Nom CPU affiché par le HUD : celui du style s'il est renseigné, sinon le
+/// modèle détecté sur la machine.
+fn cpu_hud_label(style: &lapinux_core::hud::HudStyle) -> String {
+    let custom = style.cpu_label.trim();
+    if custom.is_empty() {
+        lapinux_perf::labels::cpu_label().unwrap_or_else(|| "CPU".into())
     } else {
-        spans.push(("— FPS".into(), FPS));
+        custom.to_string()
+    }
+}
+
+fn gpu_hud_label(style: &lapinux_core::hud::HudStyle) -> String {
+    let custom = style.gpu_label.trim();
+    if custom.is_empty() {
+        lapinux_perf::labels::gpu_label().unwrap_or_else(|| "GPU".into())
+    } else {
+        custom.to_string()
+    }
+}
+
+/// Une ligne compacte, composée des mêmes éléments et couleurs que la plaque.
+/// Les courbes restent une bande sous la ligne, faute de place pour les
+/// intercaler sans rendre le texte illisible.
+fn inline_hud_spans(menu: &MenuState) -> Vec<(String, (u8, u8, u8, u8))> {
+    use lapinux_core::hud::HudElement;
+    let colors = &menu.hud_style.colors;
+    let mut spans = Vec::new();
+    for element in menu
+        .hud_style
+        .elements
+        .iter()
+        .filter(|element| element.enabled)
+    {
+        let precision = element.precision.min(2);
+        let system = menu.system.as_ref();
+        match element.kind {
+            HudElement::Fps => spans.push((
+                menu.live
+                    .fps
+                    .map(|fps| format!("{} FPS", format_number(fps as f32, precision)))
+                    .unwrap_or_else(|| "— FPS".into()),
+                hud_rgba(&colors.fps),
+            )),
+            HudElement::Frametime => {
+                if let Some(fps) = menu.live.fps.filter(|fps| *fps > 0) {
+                    spans.push((
+                        format!("{} ms", format_number(1000.0 / fps as f32, precision)),
+                        hud_rgba(&colors.frametime),
+                    ));
+                }
+            }
+            HudElement::Gpu => {
+                let label = gpu_hud_label(&menu.hud_style);
+                spans.push((
+                    system
+                        .and_then(|system| system.gpu_load)
+                        .map(|gpu| format!("{label} {}%", format_number(gpu.usage, precision)))
+                        .unwrap_or_else(|| format!("{label} —")),
+                    hud_rgba(&colors.gpu),
+                ));
+            }
+            HudElement::GpuTemp => {
+                if let Some(value) = system
+                    .and_then(|system| system.gpu_load)
+                    .and_then(|gpu| gpu.temperature)
+                {
+                    spans.push((
+                        format_temperature(value, &element.unit, precision),
+                        hud_rgba(&colors.temp),
+                    ));
+                }
+            }
+            HudElement::Vram => {
+                if let Some(gpu) = system
+                    .and_then(|system| system.gpu_load)
+                    .filter(|gpu| gpu.vram_total > 0)
+                {
+                    let (value, _) =
+                        memory_text(gpu.vram_used, gpu.vram_total, &element.unit, precision);
+                    spans.push((format!("VRAM {value}"), hud_rgba(&colors.vram)));
+                }
+            }
+            HudElement::Cpu => {
+                let label = cpu_hud_label(&menu.hud_style);
+                spans.push((
+                    system
+                        .map(|system| {
+                            format!("{label} {}%", format_number(system.cpu_usage, precision))
+                        })
+                        .unwrap_or_else(|| format!("{label} —")),
+                    hud_rgba(&colors.cpu),
+                ));
+            }
+            HudElement::CpuTemp => {
+                if let Some(value) = system.and_then(|system| system.cpu_temp) {
+                    spans.push((
+                        format_temperature(value, &element.unit, precision),
+                        hud_rgba(&colors.temp),
+                    ));
+                }
+            }
+            HudElement::Ram => {
+                if let Some(system) = system.filter(|system| system.ram_total > 0) {
+                    let (value, _) =
+                        memory_text(system.ram_used, system.ram_total, &element.unit, precision);
+                    spans.push((format!("RAM {value}"), hud_rgba(&colors.ram)));
+                }
+            }
+            HudElement::Cores | HudElement::Graph => {}
+        }
     }
     spans
 }
 
 impl Renderer {
-    /// Ligne compacte façon MangoHud : fond noir translucide carré, texte
+    /// Ligne compacte du HUD natif : fond noir translucide carré, texte
     /// serré, chaque composant dans sa couleur, puis la cadence à la fin.
     fn draw_inline_perf_hud(
         &self,
@@ -443,9 +684,9 @@ impl Renderer {
         graph: bool,
         margin: f32,
     ) {
-        const CPU: (u8, u8, u8, u8) = (106, 181, 255, 230);
         let spans = inline_hud_spans(menu);
-        let scale = menu.perf_scale.clamp(0.75, 2.0);
+        let colors = &menu.hud_style.colors;
+        let scale = menu.hud_style.scale.clamp(0.75, 2.0);
         let font_size = 13.0 * scale;
         let pad_x = 8.0 * scale;
         let pad_y = 4.0 * scale;
@@ -475,22 +716,18 @@ impl Renderer {
             self.height,
             width,
             height,
-            menu.hud_position,
+            hud_position_of(&menu.hud_style.position),
             margin,
         );
-        // MangoHud : fond noir translucide, sans bordure ni coins arrondis.
-        fill_rect(pixmap, x, y, width, height, (0, 0, 0, 90));
+        // Fond et bordure du style ; le coin reste droit, comme la ligne
+        // compacte d'origine.
+        fill_rect(pixmap, x, y, width, height, hud_rgba(&colors.panel));
+        stroke_round(pixmap, x, y, width, height, 0.0, hud_rgba(&colors.border));
         let baseline = y + pad_y + font_size;
         let mut cursor = x + pad_x;
         for (text, color) in &spans {
             draw_text_baseline(
-                pixmap,
-                &self.font,
-                text,
-                cursor,
-                baseline,
-                font_size,
-                *color,
+                pixmap, &self.font, text, cursor, baseline, font_size, *color,
             );
             cursor += text_width(&self.font, text, font_size) + gap;
         }
@@ -509,7 +746,7 @@ impl Renderer {
                     half,
                     12.0 * scale,
                     cores,
-                    CPU,
+                    hud_rgba(&colors.cores),
                 );
                 draw_frametime_graph(
                     pixmap,
@@ -518,7 +755,7 @@ impl Renderer {
                     top,
                     half,
                     26.0 * scale,
-                    (56, 189, 248, 220),
+                    hud_rgba(&colors.graph),
                 );
             }
             (Some(cores), false) => {
@@ -529,7 +766,7 @@ impl Renderer {
                     inner,
                     14.0 * scale,
                     cores,
-                    CPU,
+                    hud_rgba(&colors.cores),
                 );
             }
             (None, true) => {
@@ -540,7 +777,7 @@ impl Renderer {
                     top,
                     inner,
                     26.0 * scale,
-                    (56, 189, 248, 220),
+                    hud_rgba(&colors.graph),
                 );
             }
             (None, false) => {}
@@ -560,10 +797,13 @@ impl Renderer {
         let font_size = 11.5 * scale;
         let pad = 9.0 * scale;
         let dot = 7.0 * scale;
+        let label = menu.hud_style.badge.label.trim();
         let text = if state.paused {
-            format!("PAUSE  {}", clock(state.secs))
+            format!("{}  {}", t("overlay.tag_paused"), clock(state.secs))
+        } else if label.is_empty() {
+            clock(state.secs)
         } else {
-            format!("REC  {}", clock(state.secs))
+            format!("{label}  {}", clock(state.secs))
         };
         let text_w = text_width(&self.font, &text, font_size);
         let width = 2.0 * pad + dot + 7.0 * scale + text_w;
@@ -577,10 +817,11 @@ impl Renderer {
             18.0,
         );
         let live = !state.paused;
+        let colors = &menu.hud_style.colors;
         let accent = if live {
-            (248, 113, 113, 255)
+            hud_rgba(&colors.badge_accent)
         } else {
-            (148, 163, 184, 255)
+            hud_rgba(&colors.label)
         };
         fill_round(
             pixmap,
@@ -589,7 +830,7 @@ impl Renderer {
             width,
             height,
             height / 2.0,
-            (8, 10, 14, 220),
+            hud_rgba(&colors.badge_panel),
         );
         stroke_round(
             pixmap,
@@ -620,9 +861,9 @@ impl Renderer {
             cy + font_size * 0.35,
             font_size,
             if live {
-                (254, 226, 226, 255)
+                hud_rgba(&colors.badge_text)
             } else {
-                (203, 213, 225, 235)
+                hud_rgba(&colors.label)
             },
         );
     }
@@ -651,7 +892,7 @@ impl Renderer {
             0.0,
             self.width as f32,
             self.height as f32,
-            (0, 0, 0, (104.0 * ease) as u8),
+            (0, 0, 0, (64.0 * ease) as u8),
         );
 
         let (panel_x, panel_y, panel_w, panel_h) = panel_origin(self.width, self.height, menu);
@@ -675,7 +916,7 @@ impl Renderer {
             panel_w,
             panel_h,
             PANEL_RADIUS,
-            (24, 26, 31),
+            (39, 40, 43),
             |t| ((1.0 - t).powf(1.4) * 46.0) as u8,
             alpha,
         );
@@ -706,15 +947,6 @@ impl Renderer {
                         alpha,
                     );
                 }
-                draw_friends_button(
-                    &mut pixmap,
-                    &self.font,
-                    menu,
-                    panel_x,
-                    panel_y,
-                    panel_h,
-                    alpha,
-                );
             }
             Page::Performance => {
                 draw_performance(
@@ -767,7 +999,7 @@ impl Renderer {
         // Filet de séparation entre l'en-tête et la première ligne : il donne
         // un repère fixe au regard, que la jaquette soit claire ou sombre.
         // La page d'amis a son propre en-tête compact et trace le sien.
-        if menu.page != Page::Invite {
+        if menu.page == Page::Menu {
             fill_rect(
                 &mut pixmap,
                 panel_x + PADDING,
@@ -790,9 +1022,6 @@ impl Renderer {
         );
         let hint_y = footer_top + 15.0;
         let mut hint_x = panel_x + PADDING + 4.0;
-        if menu.page == Page::Menu {
-            hint_x += FRIENDS_BUTTON_SIZE + 12.0;
-        }
         hint_x = key_hint(
             &mut pixmap,
             &self.font,
@@ -801,12 +1030,12 @@ impl Renderer {
             "A",
             if menu.page == Page::Invite {
                 if menu.chat_open() {
-                    "Envoyer"
+                    t("overlay.send")
                 } else {
-                    "Ouvrir"
+                    t("overlay.open")
                 }
             } else {
-                "Valider"
+                t("overlay.confirm")
             },
             alpha,
         );
@@ -817,46 +1046,54 @@ impl Renderer {
             hint_y,
             "B",
             if menu.page != Page::Menu {
-                "Retour"
+                t("overlay.back")
             } else {
-                "Fermer"
+                t("overlay.close")
             },
             alpha,
         );
-        if !(menu.page == Page::Invite && menu.chat_open()) {
+        if menu.page == Page::Invite && menu.invite_available() {
+            key_hint(
+                &mut pixmap,
+                &self.font,
+                hint_x,
+                hint_y,
+                "→",
+                t("overlay.invite"),
+                alpha,
+            );
+        } else if !(menu.page == Page::Invite && menu.chat_open()) {
             arrow_hint(
                 &mut pixmap,
                 &self.font,
                 hint_x,
                 hint_y,
                 if menu.page == Page::Profiles {
-                    "Choisir"
+                    t("overlay.choose")
+                } else if menu.page == Page::Menu {
+                    t("overlay.navigate")
                 } else if menu.page == Page::Invite {
-                    "Défiler"
+                    t("overlay.scroll")
                 } else {
-                    "Régler"
+                    t("overlay.adjust")
                 },
                 alpha,
             );
         }
         if menu.page == Page::Performance {
             // GameScope peut changer sa limite de FPS à chaud ; hors de lui,
-            // elle attend le prochain lancement. MangoHud relit toujours sa
+            // elle attend le prochain lancement. Le style relit toujours sa
             // configuration quand un HUD tourne.
-            let note = if menu.perf_selected == 0 {
+            let note = if menu.perf_selected == 1 {
                 if menu.live.gamescope {
-                    "GameScope : à chaud"
+                    t("overlay.live")
                 } else {
-                    "prochain lancement"
+                    t("overlay.next_launch")
                 }
-            } else if menu.perf_selected == 1 {
-                "prochain lancement"
-            } else if menu.perf_selected == 9 {
-                "à chaud"
-            } else if menu.live.hud_live {
-                "MangoHud : à chaud"
+            } else if menu.perf_selected == 2 {
+                t("overlay.next_launch")
             } else {
-                "prochain lancement"
+                ""
             };
             draw_text_right(
                 &mut pixmap,
@@ -869,10 +1106,13 @@ impl Renderer {
             );
         }
 
+        if let Some(hover) = menu.hover {
+            draw_hover_hint(&mut pixmap, &self.font, hover, alpha);
+        }
         pixmap
     }
 
-    /// Carte de tête : jaquette du jeu, voile dégradé et titre.
+    /// Capsule panoramique tout en haut du panneau, avec titre lisible.
     fn draw_capsule(
         &self,
         pixmap: &mut Pixmap,
@@ -882,114 +1122,86 @@ impl Renderer {
         panel_w: f32,
         alpha: u8,
     ) {
-    let x = panel_x + PADDING;
-    let y = panel_y + CAPSULE_TOP;
-    let w = panel_w - 2.0 * PADDING;
-    let h = CAPSULE_HEIGHT;
-    let radius = CARD_RADIUS;
-    // Filet lumineux au sommet de la carte : elle se détache du fond du
-    // panneau sans empiéter sur la jaquette.
-    fill_rect(
-        pixmap,
-        x,
-        y,
-        w,
-        1.0,
-        with_alpha((255, 255, 255, 40), alpha),
-    );
-
-        match &self.capsule {
-            Some(image) => draw_cover(pixmap, image, x, y, w, h, radius, alpha),
-            None => {
-                // Sans jaquette : un dégradé sombre garde la même silhouette.
-                fill_round(
-                    pixmap,
-                    x,
-                    y,
-                    w,
-                    h,
-                    radius,
-                    with_alpha((34, 36, 42, 255), alpha),
-                );
-                shade_round(
-                    pixmap,
-                    x,
-                    y,
-                    w,
-                    h,
-                    radius,
-                    (8, 9, 11),
-                    |t| (150.0 * t.powf(1.5)) as u8,
-                    alpha,
-                );
-            }
+        let x = panel_x;
+        let y = panel_y + CAPSULE_TOP;
+        let h = CAPSULE_HEIGHT;
+        if let Some(image) = &self.capsule {
+            draw_cover(pixmap, image, x, y, panel_w, h, 0.0, alpha);
+        } else {
+            fill_rect(
+                pixmap,
+                x,
+                y,
+                panel_w,
+                h,
+                with_alpha((39, 40, 43, 255), alpha),
+            );
         }
-
-        // Voile bas pour que le titre tienne sur n'importe quelle image.
-        shade_round(
+        // Plaque semi-transparente en haut à gauche : lisible sur toute image.
+        let plate_x = x + 12.0;
+        let plate_y = y + 12.0;
+        let icon_size = 44.0;
+        let inner = 10.0;
+        let gap = 10.0;
+        let subtitle = match menu.active_proton() {
+            Some(proton) => t_args("overlay.in_game_proton", &[("proton", proton)]),
+            None => t("overlay.in_game_quick").to_string(),
+        };
+        let available = (panel_w - 24.0 - 2.0 * inner - icon_size - gap).max(1.0);
+        let title = fit_text(&self.font, &menu.game_name, available, 19.0);
+        let subtitle = fit_text(&self.font, &subtitle, available, 11.0);
+        let text_w =
+            text_width(&self.font, &title, 19.0).max(text_width(&self.font, &subtitle, 11.0));
+        let plate_w = (2.0 * inner + icon_size + gap + text_w).min(panel_w - 24.0);
+        fill_rect(
             pixmap,
-            x,
-            y,
-            w,
-            h,
-            radius,
-            (7, 8, 10),
-            |t| {
-                let t = ((t - 0.38) / 0.62).clamp(0.0, 1.0);
-                (196.0 * t.powf(1.15)) as u8
-            },
-            alpha,
+            plate_x,
+            plate_y,
+            plate_w,
+            icon_size + 2.0 * inner,
+            with_alpha((0, 0, 0, 175), alpha),
         );
-
-        // Étiquette « LAPINUX » en haut à gauche.
-        let pill_w = text_width(&self.font, "LAPINUX", 10.5) + 20.0;
-        fill_round(
-            pixmap,
-            x + 12.0,
-            y + 12.0,
-            pill_w,
-            22.0,
-            0.0,
-            with_alpha((12, 13, 15, 190), alpha),
-        );
-        draw_text(
-            pixmap,
-            &self.font,
-            "LAPINUX",
-            x + 22.0,
-            y + 16.5,
-            10.5,
-            with_alpha((240, 241, 243, 255), alpha),
-        );
-
-        let title = fit_text(&self.font, &menu.game_name, w - 40.0, 25.0);
-        draw_text(
+        let icon_x = plate_x + inner;
+        let icon_y = plate_y + inner;
+        if let Some(icon) = &self.game_icon {
+            draw_cover(
+                pixmap, icon, icon_x, icon_y, icon_size, icon_size, 0.0, alpha,
+            );
+        } else {
+            fill_rect(
+                pixmap,
+                icon_x,
+                icon_y,
+                icon_size,
+                icon_size,
+                with_alpha((70, 70, 72, 200), alpha),
+            );
+            draw_icon(
+                pixmap,
+                Icon::Gamepad,
+                icon_x + icon_size / 2.0,
+                icon_y + icon_size / 2.0,
+                with_alpha(TEXT, alpha),
+            );
+        }
+        let text_x = icon_x + icon_size + gap;
+        draw_text_centered_y(
             pixmap,
             &self.font,
             &title,
-            x + 18.0,
-            y + h - 46.0,
-            25.0,
-            with_alpha((252, 252, 253, 255), alpha),
+            text_x,
+            icon_y + 14.0,
+            19.0,
+            with_alpha(TEXT, alpha),
         );
-        let overline = "EN JEU";
-        draw_text(
+        draw_text_centered_y(
             pixmap,
             &self.font,
-            overline,
-            x + 18.0,
-            y + h - 20.0,
+            &subtitle,
+            text_x,
+            icon_y + 34.0,
             11.0,
             with_alpha(ACCENT, alpha),
-        );
-        draw_text(
-            pixmap,
-            &self.font,
-            "· menu rapide",
-            x + 18.0 + text_width(&self.font, overline, 11.0) + 8.0,
-            y + h - 20.0,
-            11.0,
-            with_alpha(TEXT_DIM, alpha),
         );
     }
 
@@ -1027,7 +1239,14 @@ impl Renderer {
             with_alpha((225, 227, 231, 255), alpha),
         );
         let mut cursor = panel_x + PADDING;
-        cursor = draw_tag(pixmap, &self.font, cursor, y, &menu.live.fps_label(), palette);
+        cursor = draw_tag(
+            pixmap,
+            &self.font,
+            cursor,
+            y,
+            &menu.live.fps_label(),
+            palette,
+        );
         cursor = draw_tag(
             pixmap,
             &self.font,
@@ -1037,7 +1256,7 @@ impl Renderer {
             neutral,
         );
         // La capture en cours : rouge quand elle tourne, grise en pause.
-        if let Some(label) = menu.live.recording_label() {
+        if let Some(label) = menu.live.recording_label(&menu.hud_style.badge.label) {
             let paused = menu
                 .live
                 .recording
@@ -1181,6 +1400,15 @@ fn draw_row(
             radius,
             with_alpha(SELECTED, alpha),
         );
+        stroke_round(
+            pixmap,
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            radius,
+            with_alpha(ACCENT, alpha),
+        );
         // Barre de focus à gauche, dans l'alignement du pictogramme.
         fill_round(
             pixmap,
@@ -1200,16 +1428,6 @@ fn draw_row(
             card_h,
             radius,
             with_alpha(ROW_PRIMARY, alpha),
-        );
-    } else {
-        fill_round(
-            pixmap,
-            card_x,
-            card_y,
-            card_w,
-            card_h,
-            radius,
-            with_alpha(ROW, alpha),
         );
     }
 
@@ -1239,25 +1457,30 @@ fn draw_row(
         )
     };
 
-    draw_icon(
-        pixmap,
-        icon(item),
-        card_x + 34.0,
-        card_y + card_h / 2.0,
-        icon_color,
-    );
+    // Le volume est décalé vers le haut pour laisser place à sa piste :
+    // le pictogramme suit le même axe que son libellé.
+    let text_center_y = card_y + card_h / 2.0 - if item == Item::Volume { 6.0 } else { 0.0 };
+    draw_icon(pixmap, icon(item), card_x + 34.0, text_center_y, icon_color);
 
     let title = match item {
-        Item::Resume => "Reprendre le jeu",
-        Item::Performance => "Performances",
-        Item::Recordings => "Enregistrements",
-        Item::Volume => "Volume du jeu",
-        Item::Profile => "Profil manettes",
-        Item::Proton => "Proton",
-        Item::Screenshot => "Capture d'écran",
-        Item::QuitGame => "Quitter le jeu",
+        Item::Resume => t("overlay.resume_game"),
+        Item::Performance => t("overlay.performance"),
+        Item::Recordings => t("overlay.recordings"),
+        Item::Volume => t("overlay.volume"),
+        Item::Profile => t("overlay.profile_controllers"),
+        Item::Screenshot => t("overlay.screenshot"),
+        Item::Friends => t("overlay.friends"),
+        Item::QuitGame => t("overlay.quit_game_full"),
     };
-    draw_text(pixmap, font, title, card_x + 58.0, card_y + 16.5, 17.5, title_color);
+    draw_text_centered_y(
+        pixmap,
+        font,
+        title,
+        card_x + 58.0,
+        text_center_y,
+        17.5,
+        title_color,
+    );
 
     if item == Item::Volume {
         // Une vraie piste sous le titre : le curseur se règle au pointeur,
@@ -1267,12 +1490,12 @@ fn draw_row(
         let track_w = (right - left).max(1.0);
         let track_y = card_y + card_h - 11.0;
         let track_color = if selected {
-            with_alpha((24, 26, 30, 38), alpha)
+            with_alpha((255, 255, 255, 55), alpha)
         } else {
             with_alpha((255, 255, 255, 30), alpha)
         };
         let fill_color = if selected {
-            with_alpha((24, 26, 30, 255), alpha)
+            with_alpha((235, 236, 238, 255), alpha)
         } else {
             with_alpha((236, 237, 239, 190), alpha)
         };
@@ -1287,25 +1510,26 @@ fn draw_row(
             fill_color,
         );
         let knob = left + track_w * menu.volume_ratio();
-        fill_round(pixmap, knob - 4.0, track_y - 3.0, 8.0, 10.0, 4.0, fill_color);
+        fill_round(
+            pixmap,
+            knob - 4.0,
+            track_y - 3.0,
+            8.0,
+            10.0,
+            4.0,
+            fill_color,
+        );
     }
 
     if let Some(value) = menu.value(item) {
         let text = fit_text(font, &value, 134.0, 14.0);
-        draw_text_right(
-            pixmap,
-            font,
-            &text,
-            card_x + card_w - 16.0,
-            card_y + 16.5,
-            14.0,
-            value_color,
-        );
+        let x = card_x + card_w - 16.0 - text_width(font, &text, 14.0);
+        draw_text_centered_y(pixmap, font, &text, x, text_center_y, 14.0, value_color);
     }
 }
 
-/// Panneau « Performances » : limite de FPS, MangoHud, trois profils,
-/// disposition ligne/bloc, grille des neuf ancrages et détail DLSS.
+/// Panneau « Performances » : limite de FPS, style du HUD, disposition,
+/// grille des neuf ancrages et détail DLSS.
 fn draw_performance(
     pixmap: &mut Pixmap,
     font: &FontVec,
@@ -1317,101 +1541,26 @@ fn draw_performance(
 ) {
     let left = panel_x + PADDING;
     let width = panel_w - 2.0 * PADDING;
-
     draw_back_button(pixmap, font, menu, panel_x, panel_y, panel_w, alpha);
-    // L'interrupteur de la plaque est la première ligne du panneau.
-    draw_perf_card(pixmap, font, menu, 0, left, panel_y + menu.perf_row_y(0), width, alpha);
-    draw_perf_card(pixmap, font, menu, 1, left, panel_y + menu.perf_row_y(1), width, alpha);
-    draw_fps_track(pixmap, font, menu, left, panel_y + menu.perf_row_y(1), width, alpha);
-    draw_perf_card(pixmap, font, menu, 2, left, panel_y + menu.perf_row_y(2), width, alpha);
-    draw_engine_buttons(
-        pixmap,
-        font,
-        menu,
-        left,
-        panel_y + menu.perf_row_y(2),
-        width,
-        alpha,
-    );
-
-    draw_section_label(
-        pixmap,
-        font,
-        left,
-        panel_y + menu.perf_row_y(3) - PERF_SECTION + 7.0,
-        width,
-        "PROFIL MANGOHUD",
-        alpha,
-    );
-    for row in 3..=5 {
-        draw_perf_card(
-            pixmap,
-            font,
-            menu,
-            row,
-            left,
-            panel_y + menu.perf_row_y(row),
-            width,
-            alpha,
-        );
+    for &row in menu.perf_visible_rows() {
+        let y = panel_y + menu.perf_row_y(row);
+        draw_perf_card(pixmap, font, menu, row, left, y, width, alpha);
+        match row {
+            1 => draw_fps_track(pixmap, font, menu, left, y, width, alpha),
+            2 => draw_afmf_track(pixmap, menu, left, y, width, alpha),
+            10 => draw_value_track(
+                pixmap,
+                menu,
+                left,
+                y,
+                width,
+                ((menu.perf_scale - 0.75) / 1.25).clamp(0.0, 1.0),
+                menu.perf_selected == 10,
+                alpha,
+            ),
+            _ => {}
+        }
     }
-
-    draw_section_label(
-        pixmap,
-        font,
-        left,
-        panel_y + menu.perf_row_y(6) - PERF_SECTION + 7.0,
-        width,
-        "POSITION",
-        alpha,
-    );
-    for row in 6..=9 {
-        draw_perf_card(
-            pixmap,
-            font,
-            menu,
-            row,
-            left,
-            panel_y + menu.perf_row_y(row),
-            width,
-            alpha,
-        );
-    }
-    // Taille de la plaque native, en dernier avant la grille.
-    draw_perf_card(
-        pixmap,
-        font,
-        menu,
-        10,
-        left,
-        panel_y + menu.perf_row_y(10),
-        width,
-        alpha,
-    );
-    draw_value_track(
-        pixmap,
-        menu,
-        left,
-        panel_y + menu.perf_row_y(10),
-        width,
-        ((menu.perf_scale - 0.75) / (2.0 - 0.75)).clamp(0.0, 1.0),
-        menu.perf_selected == 10,
-        alpha,
-    );
-    // La grille reste cliquable dans les deux dispositions : la couche
-    // MangoHud de Lapinux place les neuf ancrages aussi bien en ligne qu'en
-    // bloc.
-    draw_position_grid(
-        pixmap,
-        font,
-        menu,
-        left,
-        panel_y + menu.perf_grid_top(),
-        width,
-        false,
-        alpha,
-    );
-
     let dlss_y = panel_y + menu.perf_height() - FOOTER_HEIGHT - 10.0 - PERF_INFO;
     draw_dlss_card(pixmap, font, menu, left, dlss_y, width, alpha);
 }
@@ -1433,7 +1582,7 @@ fn draw_profiles(
     draw_text(
         pixmap,
         font,
-        "Profils manettes",
+        t("overlay.profile_controllers"),
         left,
         panel_y + HEADER_HEIGHT + 16.0,
         18.0,
@@ -1443,7 +1592,7 @@ fn draw_profiles(
         draw_text(
             pixmap,
             font,
-            "Aucun profil enregistré",
+            t("overlay.no_profile"),
             left,
             panel_y + HEADER_HEIGHT + PROFILE_TOP + 14.0,
             13.0,
@@ -1451,7 +1600,13 @@ fn draw_profiles(
         );
         return;
     }
-    for (index, name) in menu.profiles.iter().enumerate() {
+    for (index, name) in menu
+        .profiles
+        .iter()
+        .enumerate()
+        .skip(menu.profile_offset())
+        .take(8)
+    {
         let top = panel_y + menu.profile_row_y(index);
         let selected = index == menu.profile_selected;
         let active = *name == menu.profile;
@@ -1496,14 +1651,22 @@ fn draw_profiles(
                 ink
             },
         );
-        draw_text(pixmap, font, name, left + 52.0, top + 13.0, 16.5, ink);
+        draw_text_centered_y(
+            pixmap,
+            font,
+            &profile_display_name(name),
+            left + 52.0,
+            top + ROW_HEIGHT / 2.0,
+            16.5,
+            ink,
+        );
         if active {
-            draw_text_right(
+            draw_text_centered_y(
                 pixmap,
                 font,
                 "Actuel",
-                left + width - 16.0,
-                top + 18.0,
+                left + width - 16.0 - text_width(font, "Actuel", 12.0),
+                top + ROW_HEIGHT / 2.0,
                 12.0,
                 if selected {
                     dim
@@ -1515,80 +1678,9 @@ fn draw_profiles(
     }
 }
 
-/// Carré d'accès aux amis, dans le pied du panneau principal, avec le nombre
-/// de contacts en ligne.
-fn draw_friends_button(
-    pixmap: &mut Pixmap,
-    font: &FontVec,
-    menu: &MenuState,
-    panel_x: f32,
-    panel_y: f32,
-    panel_h: f32,
-    alpha: u8,
-) {
-    let (x, y, width, height) = menu.friends_button_rect(panel_x, panel_y, panel_h);
-    fill_round(
-        pixmap,
-        x,
-        y,
-        width,
-        height,
-        CARD_RADIUS,
-        with_alpha((255, 255, 255, 16), alpha),
-    );
-    stroke_round(
-        pixmap,
-        x,
-        y,
-        width,
-        height,
-        CARD_RADIUS,
-        with_alpha(BORDER, alpha),
-    );
-    draw_icon(
-        pixmap,
-        Icon::Friend,
-        x + width / 2.0,
-        y + height / 2.0,
-        with_alpha(TEXT, alpha),
-    );
-    let online = menu
-        .invite
-        .friends
-        .iter()
-        .filter(|friend| friend.presence.online())
-        .count();
-    if online > 0 {
-        fill_round(
-            pixmap,
-            x + width - 13.0,
-            y + 2.0,
-            14.0,
-            14.0,
-            7.0,
-            with_alpha(ACCENT, alpha),
-        );
-        let label = if online > 9 {
-            "9+".to_string()
-        } else {
-            online.to_string()
-        };
-        let label_width = text_width(font, &label, 9.0);
-        draw_text(
-            pixmap,
-            font,
-            &label,
-            x + width - 13.0 + (14.0 - label_width) / 2.0,
-            y + 4.5,
-            9.0,
-            with_alpha(TEXT_DARK, alpha),
-        );
-    }
-}
-
-/// Page « Amis » : liste des contacts puis conversation. Les cartes ne
-/// portent plus d'invitation ; un clic ouvre les messages échangés avec
-/// l'ami, et le champ du bas en envoie un nouveau.
+/// Page « Amis » : liste des contacts puis conversation. Les cartes
+/// proposent « Inviter » quand un lobby existe ; un clic ouvre les messages
+/// échangés avec l'ami, et le champ du bas en envoie un nouveau.
 fn draw_invite(
     pixmap: &mut Pixmap,
     font: &FontVec,
@@ -1601,7 +1693,9 @@ fn draw_invite(
     avatars: &RefCell<HashMap<PathBuf, Option<Pixmap>>>,
 ) {
     if menu.chat_open() {
-        draw_chat(pixmap, font, menu, panel_x, panel_y, panel_w, panel_h, alpha);
+        draw_chat(
+            pixmap, font, menu, panel_x, panel_y, panel_w, panel_h, alpha,
+        );
         return;
     }
 
@@ -1620,27 +1714,32 @@ fn draw_invite(
     draw_text(
         pixmap,
         font,
-        "Amis",
+        t("overlay.friends_page"),
         left,
         panel_y + INVITE_TITLE_TOP,
         26.0,
         with_alpha(TEXT, alpha),
     );
-    let subtitle = if menu.invite.live {
-        format!(
-            "{count} ami{} · {online} en ligne",
-            if count > 1 { "s" } else { "" }
+    // Un refus d'invitation prend la place du sous-titre : c'est la seule
+    // explication visible quand le bouton revient à « Inviter ».
+    let failure = menu.invite_failure();
+    let subtitle = if let Some(failure) = failure {
+        failure.to_string()
+    } else if menu.invite.live {
+        t_args(
+            "overlay.friends_count",
+            &[("count", &count.to_string()), ("online", &online.to_string())],
         )
     } else if count > 0 {
         // La liste reste affichée pendant une reconnexion : le sous-titre dit
         // pourquoi elle ne bouge plus, au lieu de laisser croire à une erreur.
-        "Reconnexion à Steam…".to_string()
+        t("overlay.reconnecting_steam").to_string()
     } else {
         menu.invite
             .error
             .as_deref()
             .filter(|error| !error.trim().is_empty())
-            .unwrap_or("Connexion à Steam…")
+            .unwrap_or(t("overlay.connecting_steam"))
             .to_string()
     };
     draw_text(
@@ -1650,7 +1749,7 @@ fn draw_invite(
         left,
         panel_y + INVITE_TITLE_TOP + 31.0,
         12.5,
-        with_alpha(TEXT_DIM, alpha),
+        with_alpha(if failure.is_some() { DANGER } else { TEXT_DIM }, alpha),
     );
     fill_rect(
         pixmap,
@@ -1683,7 +1782,7 @@ fn draw_invite(
         draw_text(
             pixmap,
             font,
-            "Aucun ami Steam pour le moment",
+            t("overlay.no_friends"),
             left + 62.0,
             top + 20.0,
             15.5,
@@ -1694,7 +1793,7 @@ fn draw_invite(
             .error
             .as_deref()
             .filter(|error| !error.trim().is_empty())
-            .unwrap_or("La liste apparaîtra dès que la session sociale sera connectée.");
+            .unwrap_or(t("overlay.friends_hint"));
         draw_text(
             pixmap,
             font,
@@ -1746,16 +1845,12 @@ fn draw_invite(
             let avatar_left = left + 14.0;
             let avatar_top = top + (row_h - avatar_size) / 2.0;
             let mut cache = avatars.borrow_mut();
-            let avatar = menu
-                .invite
-                .avatars
-                .get(&friend.steam_id)
-                .and_then(|path| {
-                    cache
-                        .entry(path.clone())
-                        .or_insert_with(|| decode_image(path))
-                        .as_ref()
-                });
+            let avatar = menu.invite.avatars.get(&friend.steam_id).and_then(|path| {
+                cache
+                    .entry(path.clone())
+                    .or_insert_with(|| decode_image(path))
+                    .as_ref()
+            });
             if let Some(image) = avatar {
                 draw_cover(
                     pixmap,
@@ -1819,7 +1914,11 @@ fn draw_invite(
                 );
             }
             let text_left = avatar_left + avatar_size + 14.0;
-            let text_w = (list_w - (text_left - left) - 30.0).max(80.0);
+            let invite_button = menu.invite_button_rect(index, panel_x, panel_y, panel_w, panel_h);
+            let reserve = invite_button
+                .map(|(_, _, width, _)| width + 30.0)
+                .unwrap_or(30.0);
+            let text_w = (list_w - (text_left - left) - reserve).max(80.0);
             let name = fit_text(font, &menu.invite_friend_label(index), text_w, 16.0);
             draw_text(
                 pixmap,
@@ -1831,7 +1930,11 @@ fn draw_invite(
                 ink,
             );
             let preview = menu.last_message(friend.steam_id).map(|message| {
-                let prefix = if message.outgoing { "Vous : " } else { "" };
+                let prefix = if message.outgoing {
+                    t("overlay.you_colon")
+                } else {
+                    ""
+                };
                 format!("{prefix}{}", message.text.replace('\n', " "))
             });
             let state = fit_text(
@@ -1849,18 +1952,39 @@ fn draw_invite(
                 11.5,
                 dim,
             );
-            // Petit chevron : la carte entière ouvre la conversation.
-            let cx = left + list_w - 20.0;
-            let cy = top + row_h / 2.0;
-            let mut chevron = PathBuilder::new();
-            chevron.move_to(cx - 2.0, cy - 5.0);
-            chevron.line_to(cx + 3.0, cy);
-            chevron.line_to(cx - 2.0, cy + 5.0);
-            stroke_path(pixmap, chevron, dim, 1.6);
+            if let Some((bx, by, bw, bh)) = invite_button {
+                let sent = menu.invite_sent(friend.steam_id);
+                let fill = if sent { (74, 222, 128, 230) } else { ACCENT };
+                fill_round(pixmap, bx, by, bw, bh, 3.0, with_alpha(fill, alpha));
+                let label = menu.invite_button_label(friend.steam_id);
+                let label_size = if sent { 10.5 } else { 11.5 };
+                let label_width = text_width(font, label, label_size);
+                draw_text(
+                    pixmap,
+                    font,
+                    label,
+                    bx + (bw - label_width) / 2.0,
+                    by + (bh - label_size) / 2.0,
+                    label_size,
+                    with_alpha(TEXT_DARK, alpha),
+                );
+            } else {
+                // Petit chevron : la carte entière ouvre la conversation.
+                let cx = left + list_w - 20.0;
+                let cy = top + row_h / 2.0;
+                let mut chevron = PathBuilder::new();
+                chevron.move_to(cx - 2.0, cy - 5.0);
+                chevron.line_to(cx + 3.0, cy);
+                chevron.line_to(cx - 2.0, cy + 5.0);
+                stroke_path(pixmap, chevron, dim, 1.6);
+            }
         }
     }
 
-    if let (Some((track_x, track_y, track_w, track_h)), Some((thumb_x, thumb_y, thumb_w, thumb_h))) = (
+    if let (
+        Some((track_x, track_y, track_w, track_h)),
+        Some((thumb_x, thumb_y, thumb_w, thumb_h)),
+    ) = (
         menu.invite_scrollbar(panel_x, panel_y, panel_w, panel_h),
         menu.invite_scrollbar_thumb(panel_x, panel_y, panel_w, panel_h),
     ) {
@@ -1900,25 +2024,35 @@ fn draw_chat(
 ) {
     let left = panel_x + PADDING;
     let width = panel_w - 2.0 * PADDING;
+    let chat_invite = menu.chat_invite_button_rect(panel_x, panel_y, panel_w);
+    let title_width = chat_invite
+        .map(|(_, _, button_width, _)| (width - button_width - 16.0).max(120.0))
+        .unwrap_or(width);
     draw_back_button(pixmap, font, menu, panel_x, panel_y, panel_w, alpha);
     let friend = menu.chat_friend_name();
     draw_text(
         pixmap,
         font,
-        &fit_text(font, &friend, width, 22.0),
+        &fit_text(font, &friend, title_width, 22.0),
         left,
         panel_y + INVITE_TITLE_TOP,
         22.0,
         with_alpha(TEXT, alpha),
     );
+    // Un refus d'invitation prend la place du statut : c'est la seule
+    // explication visible quand le bouton revient à « Inviter ».
+    let failure = menu.invite_failure();
+    let status = failure
+        .map(str::to_string)
+        .unwrap_or_else(|| menu.chat_friend_status());
     draw_text(
         pixmap,
         font,
-        &fit_text(font, &menu.chat_friend_status(), width, 11.5),
+        &fit_text(font, &status, width, 11.5),
         left,
         panel_y + INVITE_TITLE_TOP + 28.0,
         11.5,
-        with_alpha(TEXT_DIM, alpha),
+        with_alpha(if failure.is_some() { DANGER } else { TEXT_DIM }, alpha),
     );
     fill_rect(
         pixmap,
@@ -1928,6 +2062,25 @@ fn draw_chat(
         1.0,
         with_alpha(BORDER, alpha),
     );
+    if let Some((bx, by, bw, bh)) = chat_invite {
+        let sent = menu
+            .chat_friend
+            .is_some_and(|steam_id| menu.invite_sent(steam_id));
+        let fill = if sent { (74, 222, 128, 230) } else { ACCENT };
+        fill_round(pixmap, bx, by, bw, bh, 3.0, with_alpha(fill, alpha));
+        let label = menu.chat_invite_button_label();
+        let label_size = if sent { 10.5 } else { 11.5 };
+        let label_width = text_width(font, label, label_size);
+        draw_text(
+            pixmap,
+            font,
+            label,
+            bx + (bw - label_width) / 2.0,
+            by + (bh - label_size) / 2.0,
+            label_size,
+            with_alpha(TEXT_DARK, alpha),
+        );
+    }
 
     let composer_top = panel_y + panel_h - FOOTER_HEIGHT - CHAT_COMPOSER_HEIGHT - 8.0;
     let area_top = panel_y + INVITE_TOP;
@@ -1937,7 +2090,7 @@ fn draw_chat(
         draw_text_center(
             pixmap,
             font,
-            "Aucun message pour le moment",
+            t("overlay.no_messages"),
             panel_x + panel_w / 2.0,
             area_top + 24.0,
             14.0,
@@ -1946,7 +2099,7 @@ fn draw_chat(
         draw_text_center(
             pixmap,
             font,
-            "Écris le premier message ci-dessous.",
+            t("overlay.first_message"),
             panel_x + panel_w / 2.0,
             area_top + 45.0,
             11.5,
@@ -1965,7 +2118,7 @@ fn draw_chat(
         let mut bottom = area_bottom;
         for message in messages.iter().rev().take(40) {
             let label = if message.outgoing {
-                "Vous".to_string()
+                t("overlay.you").to_string()
             } else {
                 friend.clone()
             };
@@ -2003,13 +2156,13 @@ fn draw_chat(
                 bubble.width,
                 27.0 + bubble.lines.len() as f32 * 18.0,
                 10.0,
-                with_alpha(
-                    if bubble.outgoing { ACCENT } else { ROW_PRIMARY },
-                    alpha,
-                ),
+                with_alpha(if bubble.outgoing { ACCENT } else { ROW_PRIMARY }, alpha),
             );
             let (ink, dim) = if bubble.outgoing {
-                (with_alpha(TEXT_DARK, alpha), with_alpha(TEXT_DARK_DIM, alpha))
+                (
+                    with_alpha(TEXT_DARK, alpha),
+                    with_alpha(TEXT_DARK_DIM, alpha),
+                )
             } else {
                 (with_alpha(TEXT, alpha), with_alpha(TEXT_DIM, alpha))
             };
@@ -2066,7 +2219,7 @@ fn draw_chat(
         draw_text(
             pixmap,
             font,
-            "Écris un message…",
+            t("overlay.message_placeholder"),
             text_left,
             text_top,
             14.0,
@@ -2163,11 +2316,9 @@ fn draw_perf_card(
         }
     } else {
         match row {
-            0 => menu.perf_hud || menu.hud_on,
-            2 => menu.hud_on,
-            3..=5 => menu.hud_on && menu.hud == HudPreset::ALL[row - 3],
-            8 => menu.hud_graph,
-            9 => menu.hud_cores,
+            0 => menu.perf_hud,
+            8 => menu.hud_style.enabled(lapinux_core::hud::HudElement::Graph),
+            9 => menu.hud_style.enabled(lapinux_core::hud::HudElement::Cores),
             _ => false,
         }
     };
@@ -2193,6 +2344,17 @@ fn draw_perf_card(
         )
     };
     fill_round(pixmap, x, card_y, w, card_h, CARD_RADIUS, fill);
+    if selected {
+        stroke_round(
+            pixmap,
+            x,
+            card_y,
+            w,
+            card_h,
+            CARD_RADIUS,
+            with_alpha(ACCENT, alpha),
+        );
+    }
 
     let glyph = if menu.page == Page::Recordings {
         match row {
@@ -2209,23 +2371,36 @@ fn draw_perf_card(
             _ => Icon::Screen,
         }
     };
-    draw_icon(pixmap, glyph, x + 30.0, card_y + card_h / 2.0, icon_color);
-
     let title = menu.perf_label(row);
     let subtitle = menu.perf_subtitle(row);
-    let title_y = if subtitle.is_empty() {
-        card_y + 12.0
+    let has_track = if menu.page == Page::Recordings {
+        row == 4
     } else {
-        card_y + 8.0
+        row == 1 || row == 10
     };
-    draw_text(pixmap, font, &title, x + 52.0, title_y, 16.5, title_color);
+    let text_center_y = card_y + card_h / 2.0 - if has_track { 6.0 } else { 0.0 };
+    let title_center_y = if subtitle.is_empty() {
+        text_center_y
+    } else {
+        text_center_y - 7.0
+    };
+    draw_icon(pixmap, glyph, x + 30.0, title_center_y, icon_color);
+    draw_text_centered_y(
+        pixmap,
+        font,
+        &title,
+        x + 52.0,
+        title_center_y,
+        16.5,
+        title_color,
+    );
     if !subtitle.is_empty() {
-        draw_text(
+        draw_text_centered_y(
             pixmap,
             font,
             &subtitle,
             x + 52.0,
-            card_y + 28.0,
+            text_center_y + 9.0,
             11.0,
             value_color,
         );
@@ -2251,86 +2426,17 @@ fn draw_perf_card(
         let value = menu.perf_value(row);
         if !value.is_empty() {
             let text = fit_text(font, &value, 150.0, 14.0);
-            draw_text_right(
+            let value_x = x + w - 16.0 - text_width(font, &text, 14.0);
+            draw_text_centered_y(
                 pixmap,
                 font,
                 &text,
-                x + w - 16.0,
-                card_y + if subtitle.is_empty() { 15.0 } else { 12.0 },
+                value_x,
+                title_center_y,
                 14.0,
                 value_color,
             );
         }
-    }
-}
-
-/// Sélecteur Natif / MangoHud de la ligne « Moteur du HUD ». Les deux
-/// boutons occupent la droite de la carte, à la place d'une valeur unique.
-fn draw_engine_buttons(
-    pixmap: &mut Pixmap,
-    font: &FontVec,
-    menu: &MenuState,
-    x: f32,
-    row_top: f32,
-    w: f32,
-    alpha: u8,
-) {
-    let card_y = row_top + 2.0;
-    let card_h = PERF_ROW - 4.0;
-    let right = x + w - 16.0;
-    let left = right - (2.0 * PERF_ENGINE_W + PERF_ENGINE_GAP);
-    let top = card_y + (card_h - 26.0) / 2.0;
-    // Sur la carte blanche de la ligne sélectionnée, un bouton actif blanc
-    // disparaîtrait : il passe alors en encre sombre.
-    let selected_row = menu.perf_selected == 2;
-    for (index, (label, active)) in [
-        ("Natif", matches!(menu.hud_engine, crate::menu::HudEngine::Native)),
-        ("MangoHud", matches!(menu.hud_engine, crate::menu::HudEngine::MangoHud)),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let bx = left + index as f32 * (PERF_ENGINE_W + PERF_ENGINE_GAP);
-        let (fill, ink) = if *active {
-            if selected_row {
-                ((24, 26, 30, 255), (250, 250, 252, 255))
-            } else {
-                (SELECTED, TEXT_DARK)
-            }
-        } else if selected_row {
-            ((24, 26, 30, 40), (78, 80, 85, 255))
-        } else {
-            (ROW_PRIMARY, TEXT_DIM)
-        };
-        fill_round(
-            pixmap,
-            bx,
-            top,
-            PERF_ENGINE_W,
-            26.0,
-            4.0,
-            with_alpha(fill, alpha),
-        );
-        if *active && !selected_row {
-            stroke_round(
-                pixmap,
-                bx,
-                top,
-                PERF_ENGINE_W,
-                26.0,
-                4.0,
-                with_alpha(BORDER, alpha),
-            );
-        }
-        draw_text(
-            pixmap,
-            font,
-            label,
-            bx + 10.0,
-            top + 7.0,
-            12.5,
-            with_alpha(ink, alpha),
-        );
     }
 }
 
@@ -2356,12 +2462,12 @@ fn draw_fps_track(
     // La carte sélectionnée est claire : la piste doit alors s'assombrir au
     // lieu de blanchir, sinon le curseur disparaît.
     let track_color = if selected {
-        with_alpha((24, 26, 30, 38), alpha)
+        with_alpha((255, 255, 255, 55), alpha)
     } else {
         with_alpha((255, 255, 255, 30), alpha)
     };
     let fill_color = if selected {
-        with_alpha((24, 26, 30, 255), alpha)
+        with_alpha((235, 236, 238, 255), alpha)
     } else {
         with_alpha((236, 237, 239, 190), alpha)
     };
@@ -2372,29 +2478,98 @@ fn draw_fps_track(
     };
     fill_round(pixmap, left, track_y, track_w, 3.0, 1.5, track_color);
     let ratio = menu.fps_ratio();
-    fill_round(
-        pixmap,
-        left,
-        track_y,
-        track_w * ratio,
-        3.0,
-        1.5,
-        fill_color,
-    );
+    fill_round(pixmap, left, track_y, track_w * ratio, 3.0, 1.5, fill_color);
     for index in 0..FPS_STEPS.len() {
         let tick = left + track_w * index as f32 / (FPS_STEPS.len() - 1) as f32;
-        fill_round(
-            pixmap,
-            tick - 0.5,
-            track_y + 5.0,
-            1.0,
-            3.0,
-            0.5,
-            tick_color,
-        );
+        fill_round(pixmap, tick - 0.5, track_y + 5.0, 1.0, 3.0, 0.5, tick_color);
     }
     let knob_x = left + track_w * ratio;
-    fill_round(pixmap, knob_x - 4.0, track_y - 3.5, 8.0, 10.0, 4.0, fill_color);
+    fill_round(
+        pixmap,
+        knob_x - 4.0,
+        track_y - 3.5,
+        8.0,
+        10.0,
+        4.0,
+        fill_color,
+    );
+}
+
+/// Rail de la génération d'images : quatre crans (coupée, ×2, ×3, ×4) entre
+/// deux flèches dessinées en traits. Un clic sur le rail choisit le cran le
+/// plus proche ; les flèches des extrémités coupent ou montent à ×4.
+fn draw_afmf_track(
+    pixmap: &mut Pixmap,
+    menu: &MenuState,
+    x: f32,
+    row_top: f32,
+    w: f32,
+    alpha: u8,
+) {
+    let selected = menu.perf_selected == 2;
+    let card_y = row_top + 2.0;
+    let card_h = PERF_ROW - 4.0;
+    let track_y = card_y + card_h - 12.0;
+    let arrow_left = x + FPS_TRACK_LEFT;
+    let arrow_right = x + w - FPS_TRACK_RIGHT;
+    let left = arrow_left + AFMF_RAIL_INSET;
+    let right = arrow_right - AFMF_RAIL_INSET;
+    let track_w = (right - left).max(1.0);
+    // Comme la piste de cadence : la carte sélectionnée est claire, le rail
+    // doit donc s'y assombrir au lieu de blanchir.
+    let track_color = if selected {
+        with_alpha((255, 255, 255, 55), alpha)
+    } else {
+        with_alpha((255, 255, 255, 30), alpha)
+    };
+    let fill_color = if selected {
+        with_alpha((235, 236, 238, 255), alpha)
+    } else {
+        with_alpha((236, 237, 239, 190), alpha)
+    };
+    let tick_color = if selected {
+        with_alpha((24, 26, 30, 46), alpha)
+    } else {
+        with_alpha((255, 255, 255, 40), alpha)
+    };
+    // Les flèches restent lisibles quand la couche n'est pas chargée : elles
+    // disent que la ligne se règle, même si le réglage ne s'applique pas.
+    let arrow_color = if menu.afmf_multiplier.is_some() {
+        if selected {
+            with_alpha((24, 26, 30, 210), alpha)
+        } else {
+            with_alpha((236, 237, 239, 200), alpha)
+        }
+    } else {
+        with_alpha((160, 162, 166, 150), alpha)
+    };
+    for (cx, direction) in [(arrow_left + 6.0, -1.0f32), (arrow_right - 6.0, 1.0f32)] {
+        let mut chevron = PathBuilder::new();
+        chevron.move_to(cx - 2.8 * direction, track_y - 2.5);
+        chevron.line_to(cx + 1.6 * direction, track_y + 2.0);
+        chevron.line_to(cx - 2.8 * direction, track_y + 6.5);
+        stroke_path(pixmap, chevron, arrow_color, 1.6);
+    }
+    fill_round(pixmap, left, track_y, track_w, 3.0, 1.5, track_color);
+    let ratio = menu.afmf_ratio();
+    if menu.afmf_multiplier.is_some_and(|value| value > 0) {
+        fill_round(pixmap, left, track_y, track_w * ratio, 3.0, 1.5, fill_color);
+    }
+    let steps = lapinux_core::config::AFMF_MULTIPLIERS.len();
+    for index in 0..steps {
+        let tick = left + track_w * index as f32 / (steps - 1) as f32;
+        fill_round(pixmap, tick - 0.5, track_y + 5.0, 1.0, 3.0, 0.5, tick_color);
+    }
+    let knob_x = left + track_w * ratio;
+    fill_round(
+        pixmap,
+        knob_x - 4.0,
+        track_y - 3.5,
+        8.0,
+        10.0,
+        4.0,
+        fill_color,
+    );
 }
 
 /// Bouton Retour, au sommet du panneau Performances : une flèche et un
@@ -2427,11 +2602,13 @@ fn draw_back_button(
     arrow.move_to(x + 24.0, cy);
     arrow.line_to(x + 31.0, cy + 6.0);
     stroke_path(pixmap, arrow, ink, 1.8);
-    draw_text(pixmap, font, "Retour", x + 42.0, cy - 7.0, 16.0, ink);
+    draw_text(pixmap, font, t("overlay.back"), x + 42.0, cy - 7.0, 16.0, ink);
     let destination = if menu.page == Page::Invite && menu.chat_open() {
-        "Amis"
+        t("overlay.friends_page")
+    } else if menu.page == Page::Performance && menu.perf_advanced {
+        t("overlay.performances_page")
     } else {
-        "Menu du jeu"
+        t("overlay.game_menu")
     };
     draw_text_right(
         pixmap,
@@ -2444,24 +2621,20 @@ fn draw_back_button(
     );
 }
 
-/// Interrupteur à glissière des lignes MangoHud et graphique de cadence.
+/// Interrupteur à glissière des lignes du HUD et du graphique de cadence.
 fn draw_switch(pixmap: &mut Pixmap, x: f32, y: f32, on: bool, selected: bool, alpha: u8) {
     const W: f32 = 38.0;
     const H: f32 = 20.0;
     let track = if on {
         with_alpha((74, 222, 128, 230), alpha)
     } else if selected {
-        with_alpha((24, 26, 30, 32), alpha)
+        with_alpha((255, 255, 255, 65), alpha)
     } else {
         with_alpha((255, 255, 255, 46), alpha)
     };
     fill_round(pixmap, x, y, W, H, H / 2.0, track);
     let knob_x = if on { x + W - H + 2.0 } else { x + 2.0 };
-    let knob = if selected && !on {
-        with_alpha((86, 90, 98, 255), alpha)
-    } else {
-        with_alpha((252, 252, 253, 255), alpha)
-    };
+    let knob = with_alpha((252, 252, 253, 255), alpha);
     fill_round(
         pixmap,
         knob_x,
@@ -2505,7 +2678,7 @@ fn draw_section_label(
     }
 }
 
-/// Grille 3 × 3 des ancrages MangoHud. Chaque case montre un écran en
+/// Grille 3 × 3 des ancrages du HUD. Chaque case montre un écran en
 /// miniature avec le HUD posé là où il tombera ; la position choisie est
 /// blanche, et un clic sur une case la sélectionne directement.
 fn draw_position_grid(
@@ -2569,10 +2742,10 @@ fn draw_position_grid(
     }
 }
 
-/// Écran en miniature d'une case de la grille : un fond sombre et la barre du
-/// HUD à l'ancre correspondante. Sa forme suit la disposition choisie — une
-/// ligne fine en mode « en ligne », un petit bloc sinon — pour que l'aperçu
-/// dise aussi ce qui sera affiché.
+/// Écran en miniature d'une case de la grille : un fond sombre et le HUD à
+/// l'ancre correspondante. Sa forme suit la disposition, le nombre de lignes
+/// du profil, le moteur, la courbe et les cœurs pour que l'aperçu dise aussi
+/// ce qui sera affiché.
 fn draw_position_preview(
     pixmap: &mut Pixmap,
     menu: &MenuState,
@@ -2604,12 +2777,19 @@ fn draw_position_preview(
         2.0,
         with_alpha((255, 255, 255, 64), alpha),
     );
+    let elements = menu
+        .hud_style
+        .elements
+        .iter()
+        .filter(|element| element.enabled)
+        .count()
+        .clamp(1, 8);
     let (bar_w, bar_h) = if record {
         (18.0, 5.0)
     } else {
         match menu.hud_layout {
-            HudLayout::Inline => (20.0, 3.0),
-            HudLayout::Block => (12.0, 7.0),
+            HudLayout::Inline => (28.0, 5.0),
+            HudLayout::Block => (18.0, 2.0 + elements as f32 * 1.7),
         }
     };
     let bar_x = match index % 3 {
@@ -2622,14 +2802,140 @@ fn draw_position_preview(
         1 => y + (SCREEN_H - bar_h) / 2.0,
         _ => y + SCREEN_H - MARGIN - bar_h,
     };
-    fill_rect(
+    if record {
+        fill_round(
+            pixmap,
+            bar_x,
+            bar_y,
+            bar_w,
+            bar_h,
+            2.5,
+            with_alpha((0, 0, 0, 220), alpha),
+        );
+        stroke_round(
+            pixmap,
+            bar_x,
+            bar_y,
+            bar_w,
+            bar_h,
+            2.5,
+            with_alpha(DANGER, alpha),
+        );
+        fill_rect(
+            pixmap,
+            bar_x + 3.0,
+            bar_y + bar_h / 2.0 - 1.0,
+            2.0,
+            2.0,
+            with_alpha(DANGER, alpha),
+        );
+        fill_rect(
+            pixmap,
+            bar_x + 7.0,
+            bar_y + 1.5,
+            bar_w - 10.0,
+            0.8,
+            with_alpha(TEXT, alpha),
+        );
+        fill_rect(
+            pixmap,
+            bar_x + 7.0,
+            bar_y + 3.5,
+            bar_w - 12.0,
+            0.8,
+            with_alpha(TEXT_DIM, alpha),
+        );
+        return;
+    }
+
+    fill_round(
         pixmap,
         bar_x,
         bar_y,
         bar_w,
         bar_h,
+        1.0,
+        with_alpha((0, 0, 0, 210), alpha),
+    );
+    stroke_round(
+        pixmap,
+        bar_x,
+        bar_y,
+        bar_w,
+        bar_h,
+        1.0,
         with_alpha(ACCENT, alpha),
     );
+    if menu.hud_layout == HudLayout::Inline {
+        let colors = [
+            (52, 211, 153, 255),
+            (96, 165, 250, 255),
+            (244, 114, 182, 255),
+            (125, 211, 252, 255),
+        ];
+        let segment = (bar_w - 4.0) / elements as f32;
+        for index in 0..elements {
+            let color = colors[index % colors.len()];
+            fill_rect(
+                pixmap,
+                bar_x + 2.0 + index as f32 * segment,
+                bar_y + 2.0,
+                (segment - 1.0).max(1.0),
+                1.2,
+                with_alpha(color, alpha),
+            );
+        }
+    } else {
+        let rows = elements;
+        let row_h = (bar_h - 2.0) / rows as f32;
+        let colors = [
+            (125, 211, 252, 255),
+            (52, 211, 153, 255),
+            (96, 165, 250, 255),
+            (244, 114, 182, 255),
+            (167, 139, 250, 255),
+        ];
+        for index in 0..rows {
+            let color = colors[index % colors.len()];
+            fill_rect(
+                pixmap,
+                bar_x + 2.0,
+                bar_y + 1.0 + index as f32 * row_h,
+                bar_w - 4.0,
+                (row_h - 0.7).max(0.7),
+                with_alpha(color, alpha),
+            );
+        }
+        if menu.hud_style.enabled(lapinux_core::hud::HudElement::Cores) {
+            let count = 5;
+            let gap = 0.6;
+            let inner = bar_w - 4.0;
+            let width = (inner - gap * (count - 1) as f32) / count as f32;
+            for index in 0..count {
+                let h = 1.0 + (index % 3) as f32 * 0.7;
+                fill_rect(
+                    pixmap,
+                    bar_x + 2.0 + index as f32 * (width + gap),
+                    bar_y + bar_h - h - 0.5,
+                    width,
+                    h,
+                    with_alpha((96, 165, 250, 255), alpha),
+                );
+            }
+        } else if menu.hud_style.enabled(lapinux_core::hud::HudElement::Graph) {
+            let mut builder = PathBuilder::new();
+            for index in 0..5 {
+                let px = bar_x + 2.0 + index as f32 * (bar_w - 4.0) / 4.0;
+                let py = bar_y + bar_h - 1.0 - (index % 3) as f32 * 0.8;
+                if index == 0 {
+                    builder.move_to(px, py);
+                } else {
+                    builder.line_to(px, py);
+                }
+            }
+            stroke_path(pixmap, builder, with_alpha((56, 189, 248, 255), alpha), 0.8);
+        }
+    }
 }
 
 /// Bandeau du bas : ce que le jeu expose en DLSS.
@@ -2659,8 +2965,8 @@ fn draw_dlss_card(
         with_alpha(TEXT_DIM, alpha),
     );
     let text = match menu.live.dlss {
-        Some(info) if !info.is_empty() => format!("DLSS · {}", info.summary()),
-        _ => "DLSS · non détecté".to_string(),
+        Some(info) if !info.is_empty() => info.summary(),
+        _ => t("overlay.dlss_missing").to_string(),
     };
     draw_text(
         pixmap,
@@ -2858,6 +3164,192 @@ fn key_hint(
     x + key_w + 6.0 + text_width(font, label, 12.0) + 12.0
 }
 
+/// Élément sous le pointeur, sans modifier la sélection manette.
+pub fn hover_at(width: u32, height: u32, menu: &MenuState, x: f32, y: f32) -> Option<Hover> {
+    let (px, py, pw, ph) = panel_bounds(width, height, menu);
+    if x < px + PADDING || x > px + pw - PADDING || y < py || y > py + ph {
+        return None;
+    }
+    if menu.back_at(px, py, pw, x, y) {
+        let (x, y, width, height) = menu.perf_back_rect(px, py, pw);
+        return Some(Hover {
+            x,
+            y,
+            width,
+            height,
+            hint: t("overlay.hover_back"),
+        });
+    }
+    let local = y - py;
+    let left = px + PADDING;
+    let width = pw - 2.0 * PADDING;
+    let (top, height, hint) = match menu.page {
+        Page::Menu => {
+            let row = menu.hit_row(local)?;
+            let hint = match menu.items()[row] {
+                Item::Resume => t("overlay.hover_resume"),
+                Item::Screenshot => t("overlay.hover_screenshot"),
+                Item::Recordings => t("overlay.hover_recordings"),
+                Item::Volume => t("overlay.hover_volume"),
+                Item::Performance => t("overlay.hover_performance"),
+                Item::Profile => t("overlay.hover_profile"),
+                Item::Friends => t("overlay.hover_friends"),
+                Item::QuitGame => t("overlay.hover_quit"),
+            };
+            (menu.row_y(row), ROW_HEIGHT, hint)
+        }
+        Page::Performance => {
+            let row = menu.hit_perf_row(local)?;
+            let hint = match row {
+                0 => t("overlay.hover_toggle_perf"),
+                1 if menu.live.gamescope => t("overlay.hover_fps_live"),
+                1 => t("overlay.hover_fps_next"),
+                3 => t("overlay.hover_detail"),
+                6 => t("overlay.hover_hud_position"),
+                7 => t("overlay.hover_layout"),
+                8 => t("overlay.hover_graph"),
+                9 => t("overlay.hover_cores"),
+                10 => t("overlay.hover_hud_size"),
+                11 => t("overlay.hover_advanced"),
+                12..=19 => t("overlay.element_hint"),
+                20 => t("overlay.hover_theme"),
+                21 => t("overlay.hover_elements"),
+                _ => return None,
+            };
+            (menu.perf_row_y(row), PERF_ROW, hint)
+        }
+        Page::Recordings => {
+            if menu.record_position_cell_at(px, py, pw, x, y).is_some() {
+                return Some(Hover {
+                    x: left,
+                    y: py + menu.perf_grid_top(),
+                    width,
+                    height: PERF_GRID,
+                    hint: t("overlay.hover_record_position"),
+                });
+            }
+            let row = menu.hit_recording_row(local)?;
+            let hint = match row {
+                0 if menu.live.recording.is_none() => t("overlay.hover_start_recording"),
+                0 if menu.live.recording.is_some_and(|state| state.paused) => {
+                    t("overlay.hover_resume_recording")
+                }
+                0 => t("overlay.hover_pause_recording"),
+                1 if menu.live.recording.is_none() => t("overlay.no_recording"),
+                1 => t("overlay.hover_stop_recording"),
+                2 => t("overlay.hover_toggle_record_hud"),
+                3 => t("overlay.hover_record_position"),
+                4 => t("overlay.hover_hud_size"),
+                _ => return None,
+            };
+            (menu.perf_row_y(row), PERF_ROW, hint)
+        }
+        Page::Profiles => {
+            let row = menu.profile_hit_row(local)?;
+            (
+                menu.profile_row_y(row),
+                ROW_HEIGHT,
+                t("overlay.hover_activate_profile"),
+            )
+        }
+        Page::Invite => {
+            if menu.chat_invite_button_at(x, y, px, py, pw).is_some() {
+                let (x, y, width, height) = menu.chat_invite_button_rect(px, py, pw)?;
+                return Some(Hover {
+                    x,
+                    y,
+                    width,
+                    height,
+                    hint: t("overlay.hover_invite_friend"),
+                });
+            }
+            if menu.chat_open() {
+                return None;
+            }
+            let row = menu.invite_hit_row(local, ph)?;
+            if menu.invite_button_at(x, y, px, py, pw, ph).is_some() {
+                let (x, y, width, height) = menu.invite_button_rect(row, px, py, pw, ph)?;
+                return Some(Hover {
+                    x,
+                    y,
+                    width,
+                    height,
+                    hint: t("overlay.hover_invite_friend"),
+                });
+            }
+            (
+                menu.invite_row_y(row - menu.invite_offset(), ph),
+                menu.invite_row_height(ph),
+                t("overlay.hover_open_chat"),
+            )
+        }
+    };
+    Some(Hover {
+        x: left,
+        y: py + top + 2.0,
+        width,
+        height: height - 4.0,
+        hint,
+    })
+}
+
+/// Dessine le survol et son indication à côté du panneau, sans masquer la ligne.
+fn draw_hover_hint(pixmap: &mut Pixmap, font: &FontVec, hover: Hover, alpha: u8) {
+    stroke_round(
+        pixmap,
+        hover.x,
+        hover.y,
+        hover.width,
+        hover.height,
+        CARD_RADIUS,
+        with_alpha((206, 208, 211, 190), alpha),
+    );
+    let size = 13.0;
+    let max_width = (pixmap.width() as f32 - 24.0).max(1.0);
+    let label = fit_text(font, hover.hint, (max_width - 24.0).max(1.0), size);
+    let w = (text_width(font, &label, size) + 24.0).min(max_width);
+    let h = 32.0;
+    let right = hover.x + hover.width + 12.0;
+    let x = if right + w <= pixmap.width() as f32 - 12.0 {
+        right
+    } else {
+        (hover.x + hover.width - w).clamp(0.0, (pixmap.width() as f32 - w).max(0.0))
+    };
+    let y = if right + w <= pixmap.width() as f32 - 12.0 {
+        hover.y + (hover.height - h) / 2.0
+    } else {
+        hover.y - h - 6.0
+    };
+    let y = y.clamp(0.0, (pixmap.height() as f32 - h).max(0.0));
+    fill_round(
+        pixmap,
+        x,
+        y,
+        w,
+        h,
+        6.0,
+        with_alpha((39, 40, 43, 250), alpha),
+    );
+    stroke_round(
+        pixmap,
+        x,
+        y,
+        w,
+        h,
+        6.0,
+        with_alpha((100, 102, 106, 255), alpha),
+    );
+    draw_text_centered_y(
+        pixmap,
+        font,
+        &label,
+        x + 12.0,
+        y + h / 2.0,
+        size,
+        with_alpha(TEXT, alpha),
+    );
+}
+
 /// Position du panneau pour l'image courante. L'ouverture part du bord
 /// gauche, entièrement hors écran, puis glisse jusqu'à sa marge.
 pub fn panel_origin(width: u32, height: u32, menu: &MenuState) -> (f32, f32, f32, f32) {
@@ -3034,7 +3526,9 @@ fn inside_round(x: f32, y: f32, w: f32, h: f32, radius: f32, px: f32, py: f32) -
     // Une marge d'un millième évite que `clamp` reçoive une borne basse
     // légèrement supérieure à sa borne haute quand le rayon vaut exactement
     // la moitié d'un côté calculé en flottants.
-    let radius = radius.min((w / 2.0 - 0.001).max(0.0)).min((h / 2.0 - 0.001).max(0.0));
+    let radius = radius
+        .min((w / 2.0 - 0.001).max(0.0))
+        .min((h / 2.0 - 0.001).max(0.0));
     let cx = px.clamp(x + radius, x + w - radius);
     let cy = py.clamp(y + radius, y + h - radius);
     let (dx, dy) = (px - cx, py - cy);
@@ -3103,10 +3597,21 @@ pub(crate) fn fill_path(pixmap: &mut Pixmap, builder: PathBuilder, rgba: (u8, u8
     let mut paint = Paint::default();
     paint.anti_alias = true;
     paint.set_color_rgba8(rgba.0, rgba.1, rgba.2, rgba.3);
-    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
-pub(crate) fn stroke_path(pixmap: &mut Pixmap, builder: PathBuilder, rgba: (u8, u8, u8, u8), width: f32) {
+pub(crate) fn stroke_path(
+    pixmap: &mut Pixmap,
+    builder: PathBuilder,
+    rgba: (u8, u8, u8, u8),
+    width: f32,
+) {
     let Some(path) = builder.finish() else {
         return;
     };
@@ -3164,7 +3669,13 @@ fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, rgba: (u8, u8,
         builder.push_rect(rect);
         builder.finish()
     } {
-        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 }
 
@@ -3219,6 +3730,30 @@ pub fn draw_text(
     }
 }
 
+/// Centre optiquement les lettres capitales sur l'axe des pictogrammes.
+fn draw_text_centered_y(
+    pixmap: &mut Pixmap,
+    font: &FontVec,
+    text: &str,
+    x: f32,
+    center_y: f32,
+    size: f32,
+    rgba: (u8, u8, u8, u8),
+) {
+    let scaled = font.as_scaled(PxScale::from(size));
+    let glyph = scaled
+        .glyph_id('H')
+        .with_scale_and_position(size, ab_glyph::point(0.0, 0.0));
+    let offset = font
+        .outline_glyph(glyph)
+        .map(|outline| {
+            let bounds = outline.px_bounds();
+            (bounds.min.y + bounds.max.y) / 2.0
+        })
+        .unwrap_or(-scaled.ascent() / 2.0);
+    draw_text_baseline(pixmap, font, text, x, center_y - offset, size, rgba);
+}
+
 fn draw_text_right(
     pixmap: &mut Pixmap,
     font: &FontVec,
@@ -3262,14 +3797,7 @@ pub(crate) fn draw_text_right_baseline(
 
 /// Pastille « ‹ › » dessinée en traits : les flèches manquent à la police
 /// système et s'affichaient en carrés vides.
-fn arrow_hint(
-    pixmap: &mut Pixmap,
-    font: &FontVec,
-    x: f32,
-    y: f32,
-    label: &str,
-    alpha: u8,
-) -> f32 {
+fn arrow_hint(pixmap: &mut Pixmap, font: &FontVec, x: f32, y: f32, label: &str, alpha: u8) -> f32 {
     let key_w = 36.0;
     fill_round(
         pixmap,
@@ -3367,25 +3895,6 @@ fn hud_origin(
     (x, y)
 }
 
-/// Fond commun des plaques : carte sombre arrondie, dégradé léger, filet clair
-/// et trait d'accent au sommet.
-fn draw_hud_card(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32) {
-    fill_round(pixmap, x, y, w, h, 12.0, (8, 10, 14, 208));
-    shade_round(
-        pixmap,
-        x,
-        y,
-        w,
-        h,
-        12.0,
-        (46, 58, 76),
-        |t| ((1.0 - t).powf(1.7) * 34.0) as u8,
-        255,
-    );
-    stroke_round(pixmap, x, y, w, h, 12.0, (255, 255, 255, 26));
-    fill_round(pixmap, x + 12.0, y, 28.0, 2.0, 1.0, ACCENT);
-}
-
 /// Barres verticales des cœurs : une piste discrète, remplie par la charge du
 /// cœur. Les cœurs très chargés passent à l'ambre puis au rouge.
 fn draw_cores(
@@ -3414,15 +3923,7 @@ fn draw_cores(
         } else {
             (color.0, color.1, color.2, 220)
         };
-        fill_round(
-            pixmap,
-            bar_x,
-            y + height - filled,
-            bar_w,
-            filled,
-            1.0,
-            tone,
-        );
+        fill_round(pixmap, bar_x, y + height - filled, bar_w, filled, 1.0, tone);
     }
 }
 
@@ -3446,9 +3947,18 @@ fn draw_recording_status(
         _ => (148, 163, 184, 255),
     };
     let detail = match state {
-        Some(state) if state.paused => format!("PAUSE · {}", clock(state.secs)),
-        Some(state) => format!("REC · {}", clock(state.secs)),
-        None => "Aucun enregistrement en cours".into(),
+        Some(state) if state.paused => {
+            format!("{} · {}", t("overlay.tag_paused"), clock(state.secs))
+        }
+        Some(state) => {
+            let label = menu.hud_style.badge.label.trim();
+            if label.is_empty() {
+                clock(state.secs)
+            } else {
+                format!("{label} · {}", clock(state.secs))
+            }
+        }
+        None => t("overlay.no_recording").into(),
     };
     let cy = y + height / 2.0;
     fill_round(
@@ -3463,7 +3973,7 @@ fn draw_recording_status(
     draw_text_baseline(
         pixmap,
         font,
-        "ENREGISTREMENT",
+        t("overlay.recording_label"),
         x + 30.0,
         cy - 5.0,
         8.5,
@@ -3476,15 +3986,12 @@ fn draw_recording_status(
         x + 30.0,
         cy + 10.0,
         13.0,
-        with_alpha(
-            if state.is_some() { accent } else { TEXT_DIM },
-            alpha,
-        ),
+        with_alpha(if state.is_some() { accent } else { TEXT_DIM }, alpha),
     );
     let tag = match state {
-        Some(state) if state.paused => "EN PAUSE",
-        Some(_) => "EN COURS",
-        None => "À L'ARRÊT",
+        Some(state) if state.paused => t("overlay.tag_paused"),
+        Some(_) => t("overlay.tag_running"),
+        None => t("overlay.tag_stopped"),
     };
     let tag_w = text_width(font, tag, 9.0) + 16.0;
     let tag_x = x + w - tag_w - 12.0;
@@ -3569,7 +4076,7 @@ fn draw_record_settings(
         panel_x + PADDING,
         panel_y + menu.perf_row_y(3) - PERF_SECTION + 7.0,
         panel_w - 2.0 * PADDING,
-        "POSITION",
+        t("overlay.section_position"),
         alpha,
     );
     draw_perf_card(
@@ -3588,7 +4095,7 @@ fn draw_record_settings(
         panel_x + PADDING,
         panel_y + menu.perf_row_y(4) - PERF_SECTION + 7.0,
         panel_w - 2.0 * PADDING,
-        "TAILLE",
+        t("overlay.section_size"),
         alpha,
     );
     draw_perf_card(
@@ -3642,12 +4149,12 @@ fn draw_value_track(
     let track_w = (right - left).max(1.0);
     let track_y = card_y + card_h - 12.0;
     let track_color = if selected {
-        with_alpha((24, 26, 30, 38), alpha)
+        with_alpha((255, 255, 255, 55), alpha)
     } else {
         with_alpha((255, 255, 255, 30), alpha)
     };
     let fill_color = if selected {
-        with_alpha((24, 26, 30, 255), alpha)
+        with_alpha((235, 236, 238, 255), alpha)
     } else {
         with_alpha((236, 237, 239, 190), alpha)
     };
@@ -3668,22 +4175,21 @@ fn draw_value_track(
     );
     for index in 0..9 {
         let tick = left + track_w * index as f32 / 8.0;
-        fill_round(
-            pixmap,
-            tick - 0.5,
-            track_y + 5.0,
-            1.0,
-            3.0,
-            0.5,
-            tick_color,
-        );
+        fill_round(pixmap, tick - 0.5, track_y + 5.0, 1.0, 3.0, 0.5, tick_color);
     }
     let knob_x = left + track_w * ratio.clamp(0.0, 1.0);
-    fill_round(pixmap, knob_x - 4.0, track_y - 3.5, 8.0, 10.0, 4.0, fill_color);
+    fill_round(
+        pixmap,
+        knob_x - 4.0,
+        track_y - 3.5,
+        8.0,
+        10.0,
+        4.0,
+        fill_color,
+    );
 }
 
-
-/// Courbe de frametime de MangoHud : la ligne verte monte quand une image met
+/// Courbe de frametime du HUD natif : la ligne verte monte quand une image met
 /// plus de temps à arriver. Elle se trace à partir de la cadence mesurée
 /// seconde par seconde (ms = 1000 / i/s), avec une aire légère dessous.
 fn draw_frametime_graph(
@@ -3771,12 +4277,90 @@ mod tests {
         menu.anim = 1.0;
         let pixmap = renderer.render(&menu);
         assert_eq!(pixmap.width(), 1280);
-        let opaque = pixmap
-            .data()
-            .chunks(4)
-            .filter(|px| px[3] > 200)
-            .count();
+        let opaque = pixmap.data().chunks(4).filter(|px| px[3] > 200).count();
         assert!(opaque > 5000, "pixels opaques : {opaque}");
+    }
+
+    #[test]
+    fn pointer_hover_has_context_without_changing_controller_selection() {
+        let mut menu = MenuState::new("Jeu");
+        menu.anim = 1.0;
+        let (x, y, _, _) = panel_bounds(1280, 800, &menu);
+        let screenshot = menu
+            .items()
+            .iter()
+            .position(|item| *item == Item::Screenshot)
+            .unwrap();
+        let hover = hover_at(
+            1280,
+            800,
+            &menu,
+            x + PADDING + 40.0,
+            y + menu.row_y(screenshot) + 10.0,
+        )
+        .unwrap();
+        assert_eq!(hover.hint, "Prendre une capture d'écran");
+        assert_eq!(menu.current(), Item::Resume);
+        assert!(hover_at(1280, 800, &menu, 1200.0, 100.0).is_none());
+        menu.set_page(Page::Performance);
+        let (x, y, _, _) = panel_bounds(1280, 800, &menu);
+        let fps = hover_at(
+            1280,
+            800,
+            &menu,
+            x + PADDING + 40.0,
+            y + menu.perf_row_y(1) + 10.0,
+        )
+        .unwrap();
+        assert!(fps.hint.contains("prochain lancement"));
+        menu.live.gamescope = true;
+        let fps = hover_at(
+            1280,
+            800,
+            &menu,
+            x + PADDING + 40.0,
+            y + menu.perf_row_y(1) + 10.0,
+        )
+        .unwrap();
+        assert!(fps.hint.contains("à chaud"));
+        menu.perf_advanced = true;
+        let (x, y, _, _) = panel_bounds(1280, 800, &menu);
+        let hover = hover_at(
+            1280,
+            800,
+            &menu,
+            x + PADDING + 40.0,
+            y + menu.perf_row_y(8) + 10.0,
+        )
+        .unwrap();
+        assert!(hover.hint.contains("graphique"));
+    }
+
+    #[test]
+    fn hovered_row_and_tooltip_are_drawn() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let mut menu = MenuState::new("Jeu");
+        menu.anim = 1.0;
+        let plain = renderer.render(&menu);
+        let (x, y, _, _) = panel_bounds(1280, 800, &menu);
+        menu.hover = hover_at(
+            1280,
+            800,
+            &menu,
+            x + PADDING + 30.0,
+            y + menu.row_y(1) + 10.0,
+        );
+        let hover = menu.hover.unwrap();
+        let shown = renderer.render(&menu);
+        assert_ne!(plain.data(), shown.data());
+        let tooltip_x = (hover.x + hover.width + 20.0) as u32;
+        let tooltip_y = (hover.y + hover.height / 2.0) as u32;
+        assert_ne!(
+            plain.pixel(tooltip_x, tooltip_y),
+            shown.pixel(tooltip_x, tooltip_y)
+        );
     }
 
     #[test]
@@ -3829,7 +4413,155 @@ mod tests {
         let first = renderer.render(&menu);
         menu.activate();
         let second = renderer.render(&menu);
-        assert_ne!(first.data(), second.data(), "la conversation doit être visible");
+        assert_ne!(
+            first.data(),
+            second.data(),
+            "la conversation doit être visible"
+        );
+    }
+
+    #[test]
+    fn invite_page_draws_the_invite_button_with_a_lobby() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let mut menu = MenuState::new("Portal 2");
+        menu.anim = 1.0;
+        menu.set_invite(lapinux_core::social::SteamFriendsState {
+            live: true,
+            friends: vec![lapinux_core::social::SteamFriend {
+                steam_id: 111,
+                name: "Alice".into(),
+                presence: lapinux_core::social::SteamPresence::Online,
+                ..Default::default()
+            }],
+            lobby: Some(109775240000000001),
+            ..Default::default()
+        });
+        menu.set_page(Page::Invite);
+        let (panel_x, panel_y, panel_w, panel_h) = panel_bounds(1280, 800, &menu);
+        let (bx, by, bw, bh) = menu
+            .invite_button_rect(0, panel_x, panel_y, panel_w, panel_h)
+            .expect("bouton visible avec un lobby");
+        let with_button = renderer.render(&menu);
+        let with_data = with_button.data().to_vec();
+        let center = with_button
+            .pixel((bx + bw / 2.0) as u32, (by + bh / 2.0) as u32)
+            .expect("pixel du bouton");
+        assert!(center.alpha() > 200, "le bouton doit être peint");
+        assert!(menu.mark_invite_sent(111));
+        let sent = renderer.render(&menu);
+        assert_ne!(
+            with_button.data(),
+            sent.data(),
+            "le retour « Invitation envoyée » doit changer le dessin"
+        );
+
+        menu.invite.lobby = None;
+        let without_button = renderer.render(&menu);
+        let without_data = without_button.data().to_vec();
+        let mut changed = 0;
+        for y in by.max(0.0) as u32..(by + bh).min(800.0) as u32 {
+            for x in bx.max(0.0) as u32..(bx + bw).min(1280.0) as u32 {
+                let at = ((y * 1280 + x) * 4) as usize;
+                if with_data[at..at + 4] != without_data[at..at + 4] {
+                    changed += 1;
+                }
+            }
+        }
+        assert!(
+            changed > 50,
+            "la zone du bouton doit changer : {changed} pixels"
+        );
+    }
+
+    #[test]
+    fn invite_failure_message_is_drawn() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let mut menu = MenuState::new("Portal 2");
+        menu.anim = 1.0;
+        menu.set_invite(lapinux_core::social::SteamFriendsState {
+            live: true,
+            friends: vec![lapinux_core::social::SteamFriend {
+                steam_id: 111,
+                name: "Alice".into(),
+                presence: lapinux_core::social::SteamPresence::Online,
+                ..Default::default()
+            }],
+            lobby: Some(109775240000000001),
+            ..Default::default()
+        });
+        menu.set_page(Page::Invite);
+        assert!(menu.mark_invite_sent(111));
+        assert!(menu.apply_action_failure("invite:111", "Steam a refusé l'invitation (eresult 2)"));
+        assert_eq!(menu.invite_button_label(111), "Inviter");
+        let with_error = renderer.render(&menu);
+        // Même bouton réarmé, sans le message : seule la ligne d'erreur change.
+        menu.invite_failure = None;
+        let without_error = renderer.render(&menu);
+        assert_ne!(
+            with_error.data(),
+            without_error.data(),
+            "le message d'échec doit être peint"
+        );
+    }
+
+    #[test]
+    fn chat_page_draws_the_invite_button_with_a_lobby() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let mut menu = MenuState::new("Portal 2");
+        menu.anim = 1.0;
+        menu.set_invite(lapinux_core::social::SteamFriendsState {
+            live: true,
+            friends: vec![lapinux_core::social::SteamFriend {
+                steam_id: 111,
+                name: "Alice".into(),
+                presence: lapinux_core::social::SteamPresence::Online,
+                ..Default::default()
+            }],
+            lobby: Some(109775240000000001),
+            ..Default::default()
+        });
+        menu.set_page(Page::Invite);
+        assert!(menu.open_chat());
+        let (panel_x, panel_y, panel_w, _) = panel_bounds(1280, 800, &menu);
+        let (bx, by, bw, bh) = menu
+            .chat_invite_button_rect(panel_x, panel_y, panel_w)
+            .expect("bouton visible dans la conversation");
+        let with_button = renderer.render(&menu);
+        let with_data = with_button.data().to_vec();
+        let center = with_button
+            .pixel((bx + bw / 2.0) as u32, (by + bh / 2.0) as u32)
+            .expect("pixel du bouton");
+        assert!(center.alpha() > 200, "le bouton doit être peint");
+        assert!(menu.mark_invite_sent(111));
+        let sent = renderer.render(&menu);
+        assert_ne!(
+            with_button.data(),
+            sent.data(),
+            "le retour « Invitation envoyée » doit changer le dessin"
+        );
+
+        menu.invite.lobby = None;
+        let without_button = renderer.render(&menu);
+        let without_data = without_button.data().to_vec();
+        let mut changed = 0;
+        for y in by.max(0.0) as u32..(by + bh).min(800.0) as u32 {
+            for x in bx.max(0.0) as u32..(bx + bw).min(1280.0) as u32 {
+                let at = ((y * 1280 + x) * 4) as usize;
+                if with_data[at..at + 4] != without_data[at..at + 4] {
+                    changed += 1;
+                }
+            }
+        }
+        assert!(
+            changed > 50,
+            "la zone du bouton doit changer : {changed} pixels"
+        );
     }
 
     #[test]
@@ -3854,6 +4586,7 @@ mod tests {
                     text: "Tu joues ce soir ?".into(),
                     at: 0,
                     outgoing: false,
+                    received_live: false,
                 }],
             )]
             .into_iter()
@@ -3864,7 +4597,11 @@ mod tests {
         let list = renderer.render(&menu);
         assert!(menu.open_chat());
         let conversation = renderer.render(&menu);
-        assert_ne!(list.data(), conversation.data(), "la conversation doit être dessinée");
+        assert_ne!(
+            list.data(),
+            conversation.data(),
+            "la conversation doit être dessinée"
+        );
         menu.push_chat_char('O');
         menu.push_chat_char('k');
         let typed = renderer.render(&menu);
@@ -3961,9 +4698,88 @@ mod tests {
     #[test]
     fn capsule_keeps_its_slot_at_the_top() {
         let menu = MenuState::new("Jeu");
-        // L'en-tête réserve la carte capsule et sa marge.
-        assert!(CAPSULE_HEIGHT + 2.0 * PADDING <= crate::menu::HEADER_HEIGHT);
+        assert_eq!(CAPSULE_TOP, 0.0);
+        assert_eq!(PANEL_RADIUS, 0.0);
+        assert_eq!(CARD_RADIUS, 0.0);
+        assert!(CAPSULE_TOP + CAPSULE_HEIGHT < LIVE_TOP);
         assert_eq!(menu.row_y(0), crate::menu::HEADER_HEIGHT);
+        assert!(menu.panel_height() <= 720.0 - 28.0);
+    }
+
+    #[test]
+    fn active_proton_is_drawn_in_the_capsule() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let mut menu = MenuState::new("Jeu");
+        menu.anim = 1.0;
+        menu.proton = "natif".into();
+        let native = renderer.render(&menu);
+        menu.proton = "GE-Proton9-20".into();
+        let proton = renderer.render(&menu);
+        let (x, y, width, _) = panel_bounds(1280, 800, &menu);
+        let mut changed = 0;
+        for py in (y + 12.0) as u32..(y + 76.0) as u32 {
+            for px in x as u32..(x + width) as u32 {
+                if native.pixel(px, py) != proton.pixel(px, py) {
+                    changed += 1;
+                }
+            }
+        }
+        assert!(
+            changed > 20,
+            "la version Proton doit apparaître dans la capsule"
+        );
+    }
+
+    #[test]
+    fn capsule_has_translucent_label_and_game_icon() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let mut capsule = Pixmap::new(160, 90).unwrap();
+        capsule.fill(tiny_skia::Color::from_rgba8(220, 220, 220, 255));
+        renderer.capsule = Some(capsule);
+        let mut icon = Pixmap::new(16, 16).unwrap();
+        icon.fill(tiny_skia::Color::from_rgba8(220, 30, 20, 255));
+        renderer.game_icon = Some(icon);
+        let mut menu = MenuState::new("Jeu");
+        menu.anim = 1.0;
+        let (x, y, _, _) = panel_bounds(1280, 800, &menu);
+        let image = renderer.render(&menu);
+        let icon_pixel = image.pixel((x + 30.0) as u32, (y + 30.0) as u32).unwrap();
+        assert!(icon_pixel.red() > 180 && icon_pixel.green() < 60);
+        let plate = image.pixel((x + 14.0) as u32, (y + 14.0) as u32).unwrap();
+        assert!(
+            plate.red() > 20 && plate.red() < 150,
+            "la plaque noire reste translucide"
+        );
+        let outside = image.pixel((x + 4.0) as u32, (y + 4.0) as u32).unwrap();
+        assert!(
+            outside.red() > 180,
+            "la capsule reste visible hors de la plaque"
+        );
+    }
+
+    #[test]
+    fn capsule_image_fills_top_of_panel() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let mut capsule = Pixmap::new(160, 90).unwrap();
+        capsule.fill(tiny_skia::Color::from_rgba8(190, 70, 30, 255));
+        renderer.capsule = Some(capsule);
+        let mut menu = MenuState::new("Jeu");
+        menu.anim = 1.0;
+        let (x, y, width, _) = panel_bounds(1280, 800, &menu);
+        let image = renderer.render(&menu);
+        for px in [x + 1.0, x + width / 2.0, x + width - 2.0] {
+            let color = image.pixel(px as u32, (y + 4.0) as u32).unwrap();
+            assert!(
+                color.red() > 160 && color.green() < 100,
+                "la capsule doit remplir le haut : {color:?}"
+            );
+        }
     }
 
     #[test]
@@ -4000,22 +4816,72 @@ mod tests {
         menu.anim = 0.0;
         menu.hud_only = true;
         menu.perf_hud = true;
-        menu.hud_layout = HudLayout::Inline;
-        menu.hud_cores = true;
-        menu.hud_graph = true;
+        menu.hud_style.layout = "inline".into();
+        menu.hud_style
+            .element_mut(HudElement::Cores)
+            .unwrap()
+            .enabled = true;
+        menu.hud_style
+            .element_mut(HudElement::Graph)
+            .unwrap()
+            .enabled = true;
         menu.system = Some(lapinux_core::system::SystemInfo {
             cpu_cores: vec![12.0, 78.0, 41.0, 63.0],
             ..Default::default()
         });
         menu.live.series = vec![58, 60, 57, 61];
         let with = renderer.render(&menu);
-        menu.hud_cores = false;
-        menu.hud_graph = false;
+        menu.hud_style
+            .element_mut(HudElement::Cores)
+            .unwrap()
+            .enabled = false;
+        menu.hud_style
+            .element_mut(HudElement::Graph)
+            .unwrap()
+            .enabled = false;
         let without = renderer.render(&menu);
         assert_ne!(
             with.data(),
             without.data(),
             "les cœurs et la courbe doivent changer la plaque en ligne"
+        );
+    }
+
+    #[test]
+    fn units_keep_their_own_text_color_slot() {
+        assert_eq!(
+            split_unit("120 FPS"),
+            ("120".to_string(), "FPS".to_string())
+        );
+        assert_eq!(
+            split_unit("7.5 / 14.9 GiB"),
+            ("7.5 / 14.9".to_string(), "GiB".to_string())
+        );
+        assert_eq!(split_unit("—"), ("—".to_string(), String::new()));
+    }
+
+    #[test]
+    fn element_size_changes_the_block_hud() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let mut menu = MenuState::new("Jeu");
+        menu.anim = 0.0;
+        menu.hud_only = true;
+        menu.perf_hud = true;
+        menu.hud_style = lapinux_core::hud::HudStyle::builtin("simple");
+        menu.live.fps = Some(120);
+        menu.system = Some(lapinux_core::system::SystemInfo {
+            cpu_usage: 42.0,
+            ..Default::default()
+        });
+        let normal = renderer.render(&menu);
+        menu.hud_style.element_mut(HudElement::Fps).unwrap().scale = 1.5;
+        let large = renderer.render(&menu);
+        assert_ne!(
+            normal.data(),
+            large.data(),
+            "la taille par élément doit changer le rendu en bloc"
         );
     }
 
@@ -4040,12 +4906,12 @@ mod tests {
         assert_ne!(first.data(), second.data());
     }
 
-    /// La ligne native reprend l'ordre et les unités de MangoHud : matériel,
+    /// La ligne native reprend l'ordre et les unités du HUD : matériel,
     /// mémoire, puis cadence. Aucun libellé « FrameTime » ne s'y glisse.
     #[test]
-    fn inline_hud_follows_mangohud_order_and_units() {
+    fn inline_hud_follows_selected_elements_and_units() {
         let mut menu = MenuState::new("Jeu");
-        menu.hud = HudPreset::Detailed;
+        menu.hud_style = lapinux_core::hud::HudStyle::builtin("full");
         menu.live.fps = Some(120);
         menu.system = Some(lapinux_core::system::SystemInfo {
             cpu_usage: 42.0,
@@ -4067,14 +4933,13 @@ mod tests {
             .join(" | ");
         assert!(joined.contains("63%"), "{joined}");
         assert!(joined.contains("42%"), "{joined}");
-        assert!(joined.contains("RAM 7.5 GiB"), "{joined}");
+        assert!(joined.contains("RAM 7.5 / 14.9 GiB"), "{joined}");
         assert!(joined.contains("120 FPS"), "{joined}");
-        assert!(joined.contains("52°C"), "{joined}");
-        assert!(joined.contains("66°C"), "{joined}");
+        assert!(joined.contains("52 °C"), "{joined}");
+        assert!(joined.contains("66 °C"), "{joined}");
         assert!(joined.contains("8.3 ms"), "{joined}");
         assert!(!joined.contains("FrameTime"), "{joined}");
-        assert!(joined.find("RAM").unwrap() < joined.find("120 FPS").unwrap());
-        menu.hud = HudPreset::Simple;
+        menu.hud_style = lapinux_core::hud::HudStyle::builtin("simple");
         let simple = inline_hud_spans(&menu)
             .into_iter()
             .map(|(text, _)| text)

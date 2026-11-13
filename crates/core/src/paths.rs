@@ -2,10 +2,17 @@
 
 use std::path::{Path, PathBuf};
 
-/// Emplacements utilisés par Lapinux sur le disque. Les dossiers gardent
-/// leur nom historique `lapinux` : une installation existante reste lue.
+/// Emplacements utilisés par Lapinux sur le disque.
+///
+/// Trois dossiers visibles seulement, sous `~/Lapinux` : `LapinuxLibrary`
+/// (jeux, Mods, CompatData, Shaders), `Cache` (tout ce qui se supprime sans
+/// conséquence) et `Sauvegardes` (sauvegardes de jeux et profils de manettes).
+/// La configuration, les jetons, la base et les journaux restent dans les
+/// dossiers XDG internes, que l'utilisateur n'a pas à gérer.
 #[derive(Debug, Clone)]
 pub struct LapinuxPaths {
+    /// Parent visible des trois dossiers utilisateur.
+    pub root: PathBuf,
     pub config_dir: PathBuf,
     pub config_file: PathBuf,
     pub data_dir: PathBuf,
@@ -16,6 +23,9 @@ pub struct LapinuxPaths {
     pub proton_dir: PathBuf,
     pub run_dir: PathBuf,
     pub socket: PathBuf,
+    /// Chemins posés par un test ou un profil isolé : aucune migration ne
+    /// touche au dossier personnel réel.
+    isolated: bool,
 }
 
 impl LapinuxPaths {
@@ -25,6 +35,9 @@ impl LapinuxPaths {
             return Self::under(&root);
         }
         let home = home_dir();
+        let root = crate::env_var("LAPINUX_ROOT")
+            .map(|root| expand_tilde(root.trim()))
+            .unwrap_or_else(|| home.join("Lapinux"));
         let config_dir = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config"))
@@ -33,29 +46,37 @@ impl LapinuxPaths {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"))
             .join("lapinux");
-        let cache_dir = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".cache"))
-            .join("lapinux");
+        let cache_dir = root.join("Cache");
         let run_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("lapinux");
-        Self::assemble(config_dir, data_dir, cache_dir, run_dir)
+        Self::assemble(root, config_dir, data_dir, cache_dir, run_dir, false)
     }
 
     /// Tous les chemins sous une racine donnée (tests, profils isolés).
     pub fn under(root: &Path) -> Self {
         Self::assemble(
+            root.to_path_buf(),
             root.join("config"),
             root.join("data"),
-            root.join("cache"),
+            root.join("Cache"),
             root.join("run"),
+            true,
         )
     }
 
-    fn assemble(config_dir: PathBuf, data_dir: PathBuf, cache_dir: PathBuf, run_dir: PathBuf) -> Self {
+    fn assemble(
+        root: PathBuf,
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        cache_dir: PathBuf,
+        run_dir: PathBuf,
+        isolated: bool,
+    ) -> Self {
         Self {
+            root,
+            isolated,
             config_file: config_dir.join("config.toml"),
             log_dir: data_dir.join("logs"),
             db_file: data_dir.join("lapinux.redb"),
@@ -79,6 +100,22 @@ impl LapinuxPaths {
     }
 
     /// Crée les répertoires nécessaires (idempotent).
+    /// Dossier de bibliothèque par défaut : jeux, `Mods`, `CompatData` et
+    /// `Shaders`, avec un dossier par launcher à la racine.
+    pub fn library_default(&self) -> PathBuf {
+        self.root.join("LapinuxLibrary")
+    }
+
+    /// Sauvegardes de jeux et profils de manettes.
+    pub fn saves_root(&self) -> PathBuf {
+        self.root.join("Sauvegardes")
+    }
+
+    /// Profils de manettes, rangés avec les sauvegardes.
+    pub fn manettes_dir(&self) -> PathBuf {
+        self.saves_root().join("Manettes")
+    }
+
     pub fn ensure(&self) -> std::io::Result<()> {
         // Renommages : une version antérieure nommait ces dossiers en
         // français. Les cookies de connexion suivent, une session de boutique
@@ -89,9 +126,13 @@ impl LapinuxPaths {
             &self.store_web_dir().join("data"),
         );
         for dir in [
+            &self.root,
             &self.config_dir,
             &self.data_dir,
             &self.cache_dir,
+            &self.library_default(),
+            &self.saves_root(),
+            &self.manettes_dir(),
             &self.log_dir,
             &self.tools_dir,
             &self.proton_dir,
@@ -99,11 +140,97 @@ impl LapinuxPaths {
         ] {
             std::fs::create_dir_all(dir)?;
         }
+        self.migrate_legacy_folders();
         Ok(())
     }
 
+    /// Reprend les dossiers des versions précédentes : cache caché dans
+    /// `~/.cache`, sauvegardes et profils dans les données internes, jeux dans
+    /// `~/Jeux/LapinuxLibrary`. Chaque entrée est déplacée si sa nouvelle
+    /// place est libre ; un échec laisse l'ancien dossier intact.
+    fn migrate_legacy_folders(&self) {
+        if self.isolated {
+            return;
+        }
+        let legacy_cache = self.legacy_cache_dir();
+        if legacy_cache != self.cache_dir {
+            for (old, new) in [
+                ("covers", "Covers"),
+                ("art", "Art"),
+                ("stores", "Stores"),
+                ("thumbs", "Thumbs"),
+                ("previews", "Previews"),
+                ("updates", "Updates"),
+            ] {
+                migrate_dir(&legacy_cache.join(old), &self.cache_dir.join(new));
+            }
+        }
+        migrate_dir(
+            &self.data_dir.join("saves"),
+            &self.saves_root(),
+        );
+        migrate_dir(
+            &self.data_dir.join("profiles"),
+            &self.manettes_dir().join("profiles"),
+        );
+        migrate_dir(
+            &self.data_dir.join("steaminput"),
+            &self.manettes_dir().join("steaminput"),
+        );
+        migrate_dir(&home_dir().join("Jeux/LapinuxLibrary"), &self.library_default());
+    }
+
+    /// Ancien dossier de cache, commun aux versions précédentes.
+    fn legacy_cache_dir(&self) -> PathBuf {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".cache"))
+            .join("lapinux")
+    }
+
     pub fn covers_dir(&self) -> PathBuf {
-        self.cache_dir.join("covers")
+        self.cache_dir.join("Covers")
+    }
+
+    /// Installeurs et visuels téléchargés depuis les boutiques.
+    pub fn stores_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("Stores")
+    }
+
+    /// Vignettes et aperçus des captures.
+    pub fn thumbs_dir(&self) -> PathBuf {
+        self.cache_dir.join("Thumbs")
+    }
+
+    pub fn previews_dir(&self) -> PathBuf {
+        self.cache_dir.join("Previews")
+    }
+
+    /// Images d'AppImage en attente d'installation.
+    pub fn updates_dir(&self) -> PathBuf {
+        self.cache_dir.join("Updates")
+    }
+
+    /// Jaquettes choisies par l'utilisateur : données persistantes, pas cache.
+    pub fn custom_cover_path(&self, appid: u32) -> PathBuf {
+        self.data_dir
+            .join("artwork")
+            .join(format!("custom-{appid}.jpg"))
+    }
+
+    /// Ancien emplacement, conservé en lecture tant que l'utilisateur ne
+    /// remplace ou ne réinitialise pas son choix.
+    pub fn legacy_custom_cover_path(&self, appid: u32) -> PathBuf {
+        self.covers_dir().join(format!("custom-{appid}.jpg"))
+    }
+
+    pub fn existing_custom_cover_path(&self, appid: u32) -> PathBuf {
+        let path = self.custom_cover_path(appid);
+        if path.is_file() {
+            path
+        } else {
+            self.legacy_custom_cover_path(appid)
+        }
     }
 
     /// Thèmes créés par l'utilisateur. Le dossier est créé à la première
@@ -147,7 +274,7 @@ impl LapinuxPaths {
 
     /// Illustrations officielles des fiches Steam (bannière, logo, icône).
     pub fn art_dir(&self) -> PathBuf {
-        self.cache_dir.join("art")
+        self.cache_dir.join("Art")
     }
 }
 
@@ -160,7 +287,10 @@ pub fn user_dir(key: &str, fallback: &[&str]) -> PathBuf {
     if let Ok(text) = std::fs::read_to_string(home.join(".config/user-dirs.dirs")) {
         for line in text.lines() {
             let line = line.trim();
-            let Some(value) = line.strip_prefix(key).and_then(|rest| rest.trim().strip_prefix('=')) else {
+            let Some(value) = line
+                .strip_prefix(key)
+                .and_then(|rest| rest.trim().strip_prefix('='))
+            else {
                 continue;
             };
             let value = value.trim().trim_matches('"').trim();
@@ -273,6 +403,24 @@ pub fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn custom_cover_prefers_persistent_data_with_legacy_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(root.path());
+        std::fs::create_dir_all(paths.covers_dir()).unwrap();
+        std::fs::write(paths.legacy_custom_cover_path(42), b"old").unwrap();
+        assert_eq!(
+            paths.existing_custom_cover_path(42),
+            paths.legacy_custom_cover_path(42)
+        );
+        std::fs::create_dir_all(paths.data_dir.join("artwork")).unwrap();
+        std::fs::write(paths.custom_cover_path(42), b"new").unwrap();
+        assert_eq!(
+            paths.existing_custom_cover_path(42),
+            paths.custom_cover_path(42)
+        );
+    }
+
     /// Le profil des boutiques déménage de « boutique » vers « store-web »
     /// sans perdre ses cookies ni son sous-dossier « donnees » devenu « data ».
     #[test]
@@ -294,6 +442,24 @@ mod tests {
         assert!(paths.store_web_dir().join("data").is_dir());
         assert!(!paths.data_dir.join("boutique").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Trois dossiers visibles seulement, et les sous-dossiers attendus.
+    #[test]
+    fn the_user_tree_has_three_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(root.path());
+        assert_eq!(paths.root, root.path());
+        assert_eq!(paths.cache_dir, root.path().join("Cache"));
+        assert_eq!(paths.library_default(), root.path().join("LapinuxLibrary"));
+        assert_eq!(paths.saves_root(), root.path().join("Sauvegardes"));
+        assert_eq!(
+            paths.manettes_dir(),
+            root.path().join("Sauvegardes/Manettes")
+        );
+        assert_eq!(paths.covers_dir(), root.path().join("Cache/Covers"));
+        assert_eq!(paths.art_dir(), root.path().join("Cache/Art"));
+        assert_eq!(paths.updates_dir(), root.path().join("Cache/Updates"));
     }
 
     #[test]

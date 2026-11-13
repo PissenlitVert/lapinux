@@ -7,8 +7,8 @@
 //! étape échoue.
 
 use lapinux_core::configurations::{
-    self, Catalog, Configuration, ConfigurationSet, FileSpec, InstallReport, InstalledConfiguration,
-    InstalledFile,
+    self, Catalog, Configuration, ConfigurationSet, FileSpec, InstallReport,
+    InstalledConfiguration, InstalledFile,
 };
 use lapinux_core::ipc::Envelope;
 use lapinux_core::model::Game;
@@ -77,8 +77,8 @@ fn fetch() -> Result<(Catalog, String), String> {
     let body = response
         .into_string()
         .map_err(|e| format!("catalogue de configurations : {e}"))?;
-    let catalog: Catalog = serde_json::from_str(&body)
-        .map_err(|e| format!("catalogue de configurations : {e}"))?;
+    let catalog: Catalog =
+        serde_json::from_str(&body).map_err(|e| format!("catalogue de configurations : {e}"))?;
     let catalog = configurations::merged(catalog);
     for entry in &catalog.configurations {
         let problems = entry.validate();
@@ -151,11 +151,7 @@ impl super::Shared {
                 state.url.clone(),
             )
         };
-        let installed = self
-            .records()?
-            .get(&appid)
-            .cloned()
-            .unwrap_or_default();
+        let installed = self.records()?.get(&appid).cloned().unwrap_or_default();
         Ok(Envelope::ok(&ConfigurationSet {
             configurations: available,
             installed,
@@ -168,11 +164,11 @@ impl super::Shared {
 
     /// Installe une configuration sur un jeu. Tout est vérifié et sauvegardé
     /// avant la moindre écriture ; un échec remet le jeu dans son état.
-    pub fn install_configuration(
-        &self,
-        appid: u32,
-        id: &str,
-    ) -> lapinux_core::Result<Envelope> {
+    pub fn install_configuration(&self, appid: u32, id: &str) -> lapinux_core::Result<Envelope> {
+        let _guard = self
+            .save_operation
+            .try_lock()
+            .map_err(|_| lapinux_core::Error::Other("une opération est déjà en cours".into()))?;
         let game = self
             .store
             .game(appid)
@@ -297,6 +293,68 @@ impl super::Shared {
                 "dossier du jeu introuvable sur le disque".into(),
             ));
         }
+        // Les injecteurs autonomes possèdent leurs DLL, même après une interruption.
+        let injectors = self
+            .graphics_injectors(appid)?
+            .into_data::<Vec<lapinux_core::configurations::GraphicsInjector>>()?;
+        for (file, _) in &payload {
+            if injectors.iter().any(|injector| {
+                let parent = Path::new(&injector.executable)
+                    .parent()
+                    .unwrap_or(Path::new(""));
+                injector.files.iter().any(|owned| {
+                    parent
+                        .join(&owned.name)
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&file.target)
+                }) || Path::new(&file.target).starts_with(&injector.stage)
+            }) {
+                return Err(lapinux_core::Error::Other(format!(
+                    "fichier suivi par un injecteur graphique : {}",
+                    file.target
+                )));
+            }
+        }
+        // Une autre configuration ne doit pas prendre possession du même fichier.
+        if let Some(other) = records
+            .get(&appid)
+            .into_iter()
+            .flatten()
+            .filter(|record| record.id != entry.id)
+            .find(|record| {
+                record.files.iter().any(|old| {
+                    payload
+                        .iter()
+                        .any(|(file, _)| file.target.eq_ignore_ascii_case(&old.target))
+                })
+            })
+        {
+            return Err(lapinux_core::Error::Other(format!(
+                "fichier déjà suivi par la configuration {}",
+                other.id
+            )));
+        }
+        if let Some(old) = &previous {
+            // Un fichier modifié appartient au joueur. Une mise à jour ne doit ni
+            // l'écraser ni perdre sa sauvegarde quand la liste de fichiers change.
+            for file in &old.files {
+                if !payload.iter().any(|(new, _)| new.target == file.target) {
+                    return Err(lapinux_core::Error::Other(format!("mise à jour impossible : retirer d'abord la configuration pour préserver {}", file.target)));
+                }
+                let target =
+                    checked_target(&root, &file.target).map_err(lapinux_core::Error::Other)?;
+                if !target.is_file()
+                    || !sha256_file(&target)
+                        .map_err(lapinux_core::Error::Other)?
+                        .eq_ignore_ascii_case(&file.sha256)
+                {
+                    return Err(lapinux_core::Error::Other(format!(
+                        "{} a été modifié ou supprimé : mise à jour refusée",
+                        file.target
+                    )));
+                }
+            }
+        }
         let backup_root = self
             .paths
             .data_dir
@@ -318,14 +376,7 @@ impl super::Shared {
                 .and_then(|record| record.files.iter().find(|old| old.target == file.target))
                 .map(|old| !old.backed_up)
                 .unwrap_or(false);
-            match write_file(
-                &root,
-                &backup_root,
-                &txn,
-                file,
-                bytes,
-                created_by_previous,
-            ) {
+            match write_file(&root, &backup_root, &txn, file, bytes, created_by_previous) {
                 Ok(outcome) => written.push(outcome),
                 Err(err) => {
                     rollback(&root, &txn, &written);
@@ -368,9 +419,9 @@ impl super::Shared {
         if let Err(err) = self.save_records(&records) {
             // Les réglages sont déjà en place : on les retire pour ne pas
             // laisser une configuration impossible à désinstaller.
-            let mut reverted = updated.clone();
-            configurations::undo_settings(&mut reverted.settings, &record.undo);
-            let _ = self.store.save_game(&reverted);
+            // Rétablir exactement la fiche précédente, notamment lors d'une
+            // mise à jour où elle portait encore l'ancienne configuration.
+            let _ = self.store.save_game(&game);
             rollback(&root, &txn, &written);
             let _ = std::fs::remove_dir_all(&txn);
             return Err(lapinux_core::Error::Other(format!(
@@ -408,11 +459,11 @@ impl super::Shared {
 
     /// Retire une configuration et remet le jeu dans l'état d'avant. Un
     /// fichier modifié par le joueur depuis l'installation est conservé.
-    pub fn remove_configuration(
-        &self,
-        appid: u32,
-        id: &str,
-    ) -> lapinux_core::Result<Envelope> {
+    pub fn remove_configuration(&self, appid: u32, id: &str) -> lapinux_core::Result<Envelope> {
+        let _guard = self
+            .save_operation
+            .try_lock()
+            .map_err(|_| lapinux_core::Error::Other("une opération est déjà en cours".into()))?;
         let game = self
             .store
             .game(appid)
@@ -444,12 +495,19 @@ impl super::Shared {
             .join(&record.id)
             .join("backup");
         let mut warnings = Vec::new();
+        let mut unresolved = Vec::new();
         let mut removed = 0usize;
         for file in record.files.iter().rev() {
             match remove_installed_file(&root, &backup_root, file) {
-                Ok(Some(warning)) => warnings.push(warning),
+                Ok(Some(warning)) => {
+                    warnings.push(warning);
+                    unresolved.push(file.clone());
+                }
                 Ok(None) => removed += 1,
-                Err(err) => warnings.push(err),
+                Err(err) => {
+                    warnings.push(err);
+                    unresolved.push(file.clone());
+                }
             }
         }
 
@@ -463,8 +521,18 @@ impl super::Shared {
 
         let list = records.entry(appid).or_default();
         list.retain(|existing| existing.id != record.id);
+        if !unresolved.is_empty() {
+            let mut remaining = record.clone();
+            remaining.files = unresolved;
+            // Les réglages ont déjà été restaurés ; un second retrait ne doit
+            // pas les restaurer une nouvelle fois.
+            remaining.undo = Default::default();
+            list.push(remaining);
+        }
         self.save_records(&records)?;
-        let _ = std::fs::remove_dir_all(&backup_root);
+        if warnings.is_empty() {
+            let _ = std::fs::remove_dir_all(&backup_root);
+        }
 
         let bytes = record
             .files
@@ -483,6 +551,24 @@ impl super::Shared {
             bytes,
             warnings,
         }))
+    }
+
+    pub(crate) fn graphics_files_conflict_with_configurations(
+        &self,
+        appid: u32,
+        targets: &[String],
+    ) -> lapinux_core::Result<bool> {
+        let records = self.records()?;
+        Ok(records
+            .get(&appid)
+            .into_iter()
+            .flatten()
+            .flat_map(|record| &record.files)
+            .any(|file| {
+                targets
+                    .iter()
+                    .any(|target| file.target.eq_ignore_ascii_case(target))
+            }))
     }
 
     fn records(&self) -> lapinux_core::Result<HashMap<u32, Vec<InstalledConfiguration>>> {
@@ -528,8 +614,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("{} : {e}", path.display()))?;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{} : {e}", path.display()))?;
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file
@@ -554,13 +639,12 @@ fn checked_target(root: &Path, relative: &str) -> Result<PathBuf, String> {
     for component in rel.components() {
         target.push(component);
         if let Ok(meta) = std::fs::symlink_metadata(&target) {
+            // Même un lien restant dans le jeu peut masquer une cible déjà
+            // suivie ou changer de destination entre sauvegarde et retrait.
             if meta.file_type().is_symlink() {
-                let real = target
-                    .canonicalize()
-                    .map_err(|e| format!("lien {} : {e}", target.display()))?;
-                if !real.starts_with(&root) {
-                    return Err(format!("{relative} sort du dossier du jeu"));
-                }
+                return Err(format!(
+                    "{relative} traverse un lien symbolique : installation refusée"
+                ));
             }
         }
     }
@@ -598,12 +682,8 @@ fn write_file(
         if let Some(parent) = saved.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{} : {e}", parent.display()))?;
         }
-        std::fs::copy(&target, &saved).map_err(|e| {
-            format!(
-                "sauvegarde de {} avant écriture : {e}",
-                relative.display()
-            )
-        })?;
+        std::fs::copy(&target, &saved)
+            .map_err(|e| format!("sauvegarde de {} avant écriture : {e}", relative.display()))?;
     }
     let mut backed_up = false;
     if existed && !created_by_previous {
@@ -648,6 +728,12 @@ fn remove_installed_file(
 ) -> Result<Option<String>, String> {
     let target = checked_target(root, &file.target)?;
     if !target.exists() {
+        if file.backed_up {
+            return Ok(Some(format!(
+                "{} est absent : sauvegarde conservée",
+                file.target
+            )));
+        }
         return Ok(None);
     }
     let current = sha256_file(&target)?;
@@ -725,6 +811,14 @@ mod tests {
     }
 
     #[test]
+    fn un_lien_symbolique_interne_est_aussi_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("original"), b"x").unwrap();
+        std::os::unix::fs::symlink("original", dir.path().join("alias")).unwrap();
+        assert!(checked_target(dir.path(), "alias").is_err());
+    }
+
+    #[test]
     fn ecrire_then_restore() {
         let dir = tempfile::tempdir().unwrap();
         let backup = dir.path().join("backup");
@@ -785,10 +879,7 @@ mod tests {
         std::fs::write(game.join("data.pak"), b"retouche").unwrap();
         let warning = remove_installed_file(&game, &backup, &outcome).unwrap();
         assert!(warning.is_some());
-        assert_eq!(
-            std::fs::read(game.join("data.pak")).unwrap(),
-            b"retouche"
-        );
+        assert_eq!(std::fs::read(game.join("data.pak")).unwrap(), b"retouche");
     }
 
     #[test]
@@ -799,27 +890,13 @@ mod tests {
         let game = dir.path().join("game");
         std::fs::create_dir_all(&game).unwrap();
         std::fs::write(game.join("data.pak"), b"jeu").unwrap();
-        let first = write_file(
-            &game,
-            &backup,
-            &txn,
-            &file("data.pak", b"v1"),
-            b"v1",
-            false,
-        )
-        .unwrap();
+        let first =
+            write_file(&game, &backup, &txn, &file("data.pak", b"v1"), b"v1", false).unwrap();
         assert!(first.backed_up);
         // La nouvelle version remplace le fichier, la sauvegarde reste celle
         // du jeu d'origine.
-        let second = write_file(
-            &game,
-            &backup,
-            &txn,
-            &file("data.pak", b"v2"),
-            b"v2",
-            false,
-        )
-        .unwrap();
+        let second =
+            write_file(&game, &backup, &txn, &file("data.pak", b"v2"), b"v2", false).unwrap();
         assert!(second.backed_up);
         remove_installed_file(&game, &backup, &second).unwrap();
         assert_eq!(std::fs::read(game.join("data.pak")).unwrap(), b"jeu");

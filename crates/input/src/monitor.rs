@@ -287,8 +287,8 @@ impl Pad {
             return;
         }
         let sony = self.vendor == 0x054c && matches!(self.product, 0x0ce6 | 0x0df2);
-        let nintendo = self.vendor == 0x057e
-            && matches!(self.product, 0x2006 | 0x2007 | 0x2009 | 0x200e);
+        let nintendo =
+            self.vendor == 0x057e && matches!(self.product, 0x2006 | 0x2007 | 0x2009 | 0x200e);
         if !sony && !nintendo {
             return;
         }
@@ -305,11 +305,8 @@ impl Pad {
             // test lente ne doit jamais retarder la lecture des boutons. Les
             // manettes Nintendo n'ont pas cette sonde.
             if sony && self.battery_worker.is_none() {
-                self.battery_worker = BatteryWorker::start(
-                    path,
-                    self.product,
-                    self.group.starts_with("uniq:"),
-                );
+                self.battery_worker =
+                    BatteryWorker::start(path, self.product, self.group.starts_with("uniq:"));
             }
         }
     }
@@ -485,13 +482,15 @@ impl Pad {
     /// celles qu'evdev expose ; sans elles, on retombe sur les tailles des
     /// pavés courants plutôt que d'inventer une position.
     fn handle_primary_touch(&mut self, code: u16, value: i32) -> bool {
-        let (min, max) = self.ranges.get(&code).copied().unwrap_or_else(|| {
-            match code {
+        let (min, max) = self
+            .ranges
+            .get(&code)
+            .copied()
+            .unwrap_or_else(|| match code {
                 ABS_MT_POSITION_X => (0, 1919),
                 ABS_MT_POSITION_Y => (0, 1079),
                 _ => (0, 0),
-            }
-        });
+            });
         touch_event(
             &mut self.touchpad_slot,
             &mut self.touchpad_slots,
@@ -686,7 +685,7 @@ fn run(snapshot: Arc<Mutex<Vec<PadState>>>, stop: Arc<AtomicBool>) {
 
 fn scan(pads: &mut HashMap<PathBuf, Pad>) {
     let mut devices: Vec<(PathBuf, evdev::Device)> = evdev::enumerate()
-        .filter(|(path, _)| path.exists())
+        .filter(|(path, device)| path.exists() && !crate::device::is_output_pad(device.name()))
         .collect();
 
     // 1. Les nouvelles manettes emportent leurs nœuds satellites.
@@ -826,11 +825,7 @@ fn decode_dualsense(data: &[u8]) -> Option<(MotionState, TouchpadState, bool)> {
         });
     }
     let muted = data[base + 10] & 0x04 != 0;
-    Some((
-        MotionState { gyro, accel },
-        TouchpadState { points },
-        muted,
-    ))
+    Some((MotionState { gyro, accel }, TouchpadState { points }, muted))
 }
 
 /// Décode le rapport complet 0x30 d'une manette Switch. Il contient trois
@@ -920,10 +915,7 @@ fn publish(pads: &HashMap<PathBuf, Pad>, snapshot: &Mutex<Vec<PadState>>) {
                         .collect(),
                 });
             }
-            let mut battery = pad
-                .battery_worker
-                .as_ref()
-                .map(BatteryWorker::snapshot);
+            let mut battery = pad.battery_worker.as_ref().map(BatteryWorker::snapshot);
             if let Some(reading) = pad.hidraw_battery {
                 battery
                     .get_or_insert_with(BatteryInfo::default)
@@ -940,9 +932,9 @@ fn publish(pads: &HashMap<PathBuf, Pad>, snapshot: &Mutex<Vec<PadState>>) {
                 microphone_muted: pad.hidraw_muted,
                 battery,
                 report: pad.report_cadence(),
-                last_input_unix: pad.last_input.map(|at| {
-                    unix_now_secs().saturating_sub(at.elapsed().as_secs())
-                }),
+                last_input_unix: pad
+                    .last_input
+                    .map(|at| unix_now_secs().saturating_sub(at.elapsed().as_secs())),
             }
         })
         .collect();
@@ -1012,8 +1004,7 @@ fn companion_kind(name: &str) -> Option<CompanionKind> {
     let name = name.trim_end().to_lowercase();
     if name.contains("motion") || name.contains("gyro") || name.contains("accelerometer") {
         Some(CompanionKind::Motion)
-    } else if name.contains("touchpad") || name.contains("trackpad") || name.contains("touch pad")
-    {
+    } else if name.contains("touchpad") || name.contains("trackpad") || name.contains("touch pad") {
         Some(CompanionKind::Touchpad)
     } else {
         None
@@ -1444,7 +1435,7 @@ mod tests {
 
     #[test]
     fn bluetooth_addresses_are_recognised_for_grouping() {
-        assert!(is_bluetooth_address("44:46:48:2e:38:09"));
+        assert!(is_bluetooth_address("02:00:00:00:00:01"));
         assert!(!is_bluetooth_address("FXB9954802F92"));
         assert!(!is_bluetooth_address("000000000000"));
         assert!(!is_bluetooth_address(""));

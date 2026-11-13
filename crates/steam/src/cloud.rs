@@ -26,6 +26,8 @@ const BEGIN_UPLOAD_METHOD: &str = "Cloud.ClientBeginFileUpload#1";
 const COMMIT_UPLOAD_METHOD: &str = "Cloud.ClientCommitFileUpload#1";
 /// Clôture du lot : Steam le publie alors pour le compte.
 const COMPLETE_BATCH_METHOD: &str = "Cloud.CompleteAppUploadBatchBlocking#1";
+/// Suppression ou oubli d'un fichier du cloud.
+const DELETE_METHOD: &str = "Cloud.ClientDeleteFile#1";
 /// Un CM qui ne répond pas en un quart de minute est perdu.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 /// Un fichier de sauvegarde reste petit : au-delà, le transfert est coupé.
@@ -95,7 +97,34 @@ fn parse_changelist(body: &[u8]) -> CloudSaves {
             file.prefix = prefix.clone();
         }
     }
+    dedupe_paths(&mut state);
     state
+}
+
+/// Un seul fichier peut occuper un chemin du préfixe : quand l'historique en
+/// rend plusieurs versions, la plus récemment modifiée fait référence et les
+/// autres sont mises de côté (`superseded`) pour la copie de récupération.
+/// Sans ce regroupement, deux entrées désignent le même fichier local, la
+/// reprise avant lancement croit à un conflit et aucune résolution n'aboutit.
+fn dedupe_paths(state: &mut CloudSaves) {
+    let mut kept: Vec<CloudFile> = Vec::with_capacity(state.files.len());
+    let mut superseded: Vec<CloudFile> = Vec::new();
+    for file in state.files.drain(..) {
+        let same = kept
+            .iter()
+            .position(|known| known.prefix == file.prefix && known.name == file.name);
+        match same {
+            // À date égale, la dernière entrée rendue est la plus récente.
+            Some(index) if file.modified >= kept[index].modified => {
+                superseded.push(std::mem::replace(&mut kept[index], file));
+            }
+            Some(_) => superseded.push(file),
+            None => kept.push(file),
+        }
+    }
+    superseded.sort_by(|a, b| (a.name.as_str(), a.modified).cmp(&(b.name.as_str(), b.modified)));
+    state.files = kept;
+    state.superseded = superseded;
 }
 
 /// Une entrée `CCloud_AppFileInfo`.
@@ -176,9 +205,8 @@ pub async fn download_file(
     .await
     .map_err(|_| Error::Other("Steam n'a pas répondu".into()))?
     .map_err(|error| Error::Other(error.to_string()))?;
-    let download = parse_download(&answer.body).ok_or_else(|| {
-        Error::Other(format!("aucune adresse pour {filename}"))
-    })?;
+    let download = parse_download(&answer.body)
+        .ok_or_else(|| Error::Other(format!("aucune adresse pour {filename}")))?;
     if download.encrypted {
         return Err(Error::Other(format!(
             "{filename} est chiffré par le client Steam : Lapinux ne peut pas l'ouvrir"
@@ -302,11 +330,7 @@ pub async fn upload_file(
     field_varint(2, data.len() as u64, &mut body);
     field_varint(3, data.len() as u64, &mut body);
     field_bytes(4, &sha, &mut body);
-    field_varint(
-        5,
-        lapinux_core::util::now_unix().max(0) as u64,
-        &mut body,
-    );
+    field_varint(5, lapinux_core::util::now_unix().max(0) as u64, &mut body);
     field_bytes(6, filename.as_bytes(), &mut body);
     // Toutes plateformes : la sauvegarde reste celle du compte, quel que soit
     // le système d'où le jeu tourne.
@@ -367,6 +391,35 @@ pub async fn complete_batch(
     .map_err(|_| Error::Other("Steam n'a pas répondu".into()))?
     .map_err(|error| Error::Other(format!("clôture du lot refusée ({error})")))?;
     Ok(())
+}
+
+/// Supprime un fichier du cloud. `is_explicit_delete = 1` : le fichier est
+/// retiré, pas seulement oublié côté client.
+pub async fn delete_file(
+    client: &SteamClient<LoggedIn>,
+    appid: u32,
+    file: &CloudFile,
+) -> Result<(), Error> {
+    let filename = format!("{}{}", file.prefix, file.name);
+    let body = delete_body(appid, &filename);
+    tokio::time::timeout(
+        REPLY_TIMEOUT,
+        client.call_service_method(DELETE_METHOD, &body),
+    )
+    .await
+    .map_err(|_| Error::Other("Steam n'a pas répondu".into()))?
+    .map_err(|error| Error::Other(format!("{filename} : suppression refusée ({error})")))?;
+    Ok(())
+}
+
+/// Corps de `ClientDeleteFile#1` : application (1), chemin complet (2),
+/// suppression explicite (3).
+fn delete_body(appid: u32, filename: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    field_varint(1, u64::from(appid), &mut body);
+    field_bytes(2, filename.as_bytes(), &mut body);
+    field_varint(3, 1, &mut body);
+    body
 }
 
 /// Un bloc d'envoi : où et comment poser une tranche du fichier.
@@ -502,7 +555,11 @@ async fn send_block(block: &Block, data: &[u8]) -> Result<(), Error> {
 /// Steam nomme ses racines par des jetons Windows ; sous Proton elles tombent
 /// dans `drive_c`. Un jeton inconnu rend `None` : mieux vaut ne rien écrire
 /// qu'un fichier au mauvais endroit.
-pub fn local_dir(prefix: &str, install_dir: &std::path::Path, prefix_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+pub fn local_dir(
+    prefix: &str,
+    install_dir: &std::path::Path,
+    prefix_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     let prefix = prefix.trim();
     let (token, rest) = match prefix.strip_prefix('%') {
         Some(rest) => {
@@ -640,12 +697,74 @@ mod tests {
         assert!(state.has_saves());
     }
 
+    /// Deux versions du même chemin, comme l'historique en rend quand un
+    /// fichier a été envoyé plusieurs fois.
+    fn changelist_with_two_versions() -> Vec<u8> {
+        let mut body = Vec::new();
+        field_varint(1, 7, &mut body);
+        for (modified, size) in [(1_700_000_000i64, 2048u64), (1_700_000_900, 512)] {
+            let mut file = Vec::new();
+            field_bytes(1, b"SaveGame.sav", &mut file);
+            field_varint(3, modified as u64, &mut file);
+            field_varint(4, size, &mut file);
+            field_bytes(2, &file, &mut body);
+        }
+        field_bytes(4, b"%WinAppDataLocal%Jeu/Saved/SaveGames/", &mut body);
+        body
+    }
+
+    #[test]
+    fn one_path_keeps_only_its_newest_version() {
+        let state = parse_changelist(&changelist_with_two_versions());
+        assert_eq!(state.files.len(), 1, "un seul fichier par chemin local");
+        assert_eq!(state.files[0].name, "SaveGame.sav");
+        assert_eq!(state.files[0].modified, 1_700_000_900);
+        assert_eq!(state.files[0].size, 512);
+        assert_eq!(state.superseded.len(), 1, "l'ancienne version reste connue");
+        assert_eq!(state.superseded[0].size, 2048);
+        assert_eq!(state.superseded[0].modified, 1_700_000_000);
+        assert_eq!(state.superseded[0].prefix, state.files[0].prefix);
+    }
+
+    #[test]
+    fn distinct_paths_are_all_kept() {
+        let mut body = changelist_with_two_versions();
+        let mut other = Vec::new();
+        field_bytes(1, b"SaveGameSlot1.sav", &mut other);
+        field_varint(3, 1_700_000_500, &mut other);
+        field_varint(4, 4096, &mut other);
+        field_bytes(2, &other, &mut body);
+        let state = parse_changelist(&body);
+        assert_eq!(state.files.len(), 2);
+        assert_eq!(state.superseded.len(), 1);
+    }
+
     #[test]
     fn a_game_without_cloud_has_nothing_to_show() {
         let state = parse_changelist(&[]);
         assert!(!state.has_saves());
         assert_eq!(state.total_bytes(), 0);
         assert_eq!(state.last_modified(), None);
+    }
+
+    #[test]
+    fn a_delete_request_names_the_file_and_marks_it_explicit() {
+        let body = delete_body(42, "saves/slot.sav");
+        let mut reader = Reader::new(&body);
+        let mut appid = None;
+        let mut name = None;
+        let mut explicit = None;
+        while let Some((number, field)) = reader.next() {
+            match (number, field) {
+                (1, Field::Varint(value)) => appid = Some(value),
+                (2, Field::Bytes(value)) => name = Some(value),
+                (3, Field::Varint(value)) => explicit = Some(value),
+                _ => {}
+            }
+        }
+        assert_eq!(appid, Some(42));
+        assert_eq!(name.as_deref(), Some(&b"saves/slot.sav"[..]));
+        assert_eq!(explicit, Some(1));
     }
 
     /// Préfixe Proton de test : `drive_c` avec le dossier utilisateur.
@@ -668,9 +787,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             dir,
-            temp.path().join(
-                "pfx/drive_c/users/steamuser/AppData/Local/MotorSlice/Saved/SaveGames"
-            )
+            temp.path()
+                .join("pfx/drive_c/users/steamuser/AppData/Local/MotorSlice/Saved/SaveGames")
         );
     }
 

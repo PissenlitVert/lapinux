@@ -4,7 +4,9 @@ use crate::codes::*;
 use crate::mapping::{Kind, VEvent};
 use crate::{Error, Result};
 use evdev::uinput::VirtualDevice;
-use evdev::{AbsInfo, AbsoluteAxisCode, AttributeSet, InputEvent, KeyCode, UinputAbsSetup};
+use evdev::{
+    AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, InputEvent, InputId, KeyCode, UinputAbsSetup,
+};
 
 const VIRTUAL_KEYS: [u16; 13] = [
     BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_TL, BTN_TR, BTN_TL2, BTN_TR2, BTN_SELECT,
@@ -35,13 +37,15 @@ impl VirtualPad {
         let mut builder = VirtualDevice::builder()
             .map_err(|e| Error::Other(format!("uinput indisponible : {e}")))?
             .name(name)
+            // Le pad doit être reconnu comme une manette Xbox 360, pas comme
+            // un joystick anonyme : Wine/XInput se sert de ces identifiants
+            // pour créer le slot XInput attendu par le jeu.
+            .input_id(InputId::new(BusType::BUS_USB, 0x045e, 0x028e, 0x0110))
             .with_keys(&keys)
             .map_err(|e| Error::Other(format!("uinput keys : {e}")))?;
         for (code, min, max) in VIRTUAL_AXES {
-            let setup = UinputAbsSetup::new(
-                AbsoluteAxisCode(code),
-                AbsInfo::new(0, min, max, 0, 0, 0),
-            );
+            let setup =
+                UinputAbsSetup::new(AbsoluteAxisCode(code), AbsInfo::new(0, min, max, 0, 0, 0));
             builder = builder
                 .with_absolute_axis(&setup)
                 .map_err(|e| Error::Other(format!("uinput axe {code} : {e}")))?;

@@ -30,6 +30,13 @@ impl Obj {
         }
     }
 
+    pub fn obj_mut(&mut self, key: &str) -> Option<&mut Obj> {
+        match self.0.get_mut(key) {
+            Some(Value::Obj(o)) => Some(o),
+            _ => None,
+        }
+    }
+
     pub fn u64(&self, key: &str) -> u64 {
         self.str(key)
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -104,6 +111,57 @@ pub fn parse(input: &str) -> Result<Obj, VdfError> {
 }
 
 /// Parse un document VDF dont la racine est un objet nommé (ex. "AppState").
+/// Écrit un document VDF que Steam relit sans difficulté. Les clés sortent
+/// triées par le `BTreeMap` : l'ordre change, mais Steam n'y attache aucune
+/// importance. Les commentaires du fichier d'origine, eux, ne sont pas gardés.
+pub fn write(root: &Obj) -> String {
+    let mut out = String::new();
+    write_object(&mut out, root, 0);
+    out
+}
+
+fn write_object(out: &mut String, obj: &Obj, depth: usize) {
+    for (key, value) in &obj.0 {
+        indent(out, depth);
+        quote(out, key);
+        match value {
+            Value::Str(text) => {
+                out.push_str("\t\t");
+                quote(out, text);
+                out.push('\n');
+            }
+            Value::Obj(inner) => {
+                out.push('\n');
+                indent(out, depth);
+                out.push_str("{\n");
+                write_object(out, inner, depth + 1);
+                indent(out, depth);
+                out.push_str("}\n");
+            }
+        }
+    }
+}
+
+fn indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push('\t');
+    }
+}
+
+fn quote(out: &mut String, text: &str) {
+    out.push('"');
+    for character in text.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
 pub fn parse_root(input: &str) -> Result<Obj, VdfError> {
     let mut obj = parse(input)?;
     if obj.0.len() == 1 {
@@ -278,7 +336,10 @@ mod tests {
         assert_eq!(root.str("name"), Some("Steamworks Common Redistributables"));
         assert_eq!(root.u64("StateFlags"), 4);
         assert_eq!(root.u64("SizeOnDisk"), 1029003611);
-        assert_eq!(root.obj("UserConfig").unwrap().str("language"), Some("english"));
+        assert_eq!(
+            root.obj("UserConfig").unwrap().str("language"),
+            Some("english")
+        );
         assert_eq!(
             root.obj("MountedDepots").unwrap().str("228981"),
             Some("7155848575309492375")
@@ -298,7 +359,7 @@ mod tests {
 	}
 	"1"
 	{
-		"path"		"/var/mnt/Jeux/Steam"
+		"path"		"/mnt/example/Steam"
 		"totalsize"		"1967847026688"
 	}
 }
@@ -322,6 +383,17 @@ mod tests {
     fn unbalanced_braces_error() {
         assert!(parse_root("\"a\" { \"b\" \"c\"").is_err());
         assert!(parse_root("\"a\" }").is_err());
+    }
+
+    #[test]
+    fn writes_what_it_reads() {
+        let text =
+            "\"controller_config\"\n{\n\t\"620\"\n\t{\n\t\t\"workshop\"\t\t\"123\"\n\t}\n}\n";
+        let root = parse(text).unwrap();
+        let written = write(&root);
+        assert_eq!(parse(&written).unwrap(), root);
+        assert!(written.contains("\"controller_config\""));
+        assert!(written.contains("\"workshop\"\t\t\"123\""));
     }
 
     #[test]

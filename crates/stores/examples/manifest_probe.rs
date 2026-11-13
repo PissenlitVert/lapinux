@@ -22,7 +22,12 @@ fn main() {
         return;
     };
     let path = manifest.chunk_path(chunk);
-    println!("chunk {} · {} · {} octets", path, manifest.chunk_dir(), chunk.download_size());
+    println!(
+        "chunk {} · {} · {} octets",
+        path,
+        manifest.chunk_dir(),
+        chunk.download_size()
+    );
     let clean = manifest_url.split('?').next().unwrap_or(&manifest_url);
     let base = &clean[..clean.rfind('/').map(|i| i + 1).unwrap_or(0)];
     let token = manifest_url
@@ -30,7 +35,10 @@ fn main() {
         .map(|(_, q)| q.to_string())
         .unwrap_or_default();
     for (label, url) in [
-        ("sans jeton", format!("{base}{}/{path}", manifest.chunk_dir())),
+        (
+            "sans jeton",
+            format!("{base}{}/{path}", manifest.chunk_dir()),
+        ),
         (
             "avec jeton",
             format!("{base}{}/{path}?{token}", manifest.chunk_dir()),

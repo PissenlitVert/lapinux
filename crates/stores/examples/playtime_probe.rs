@@ -15,7 +15,12 @@ fn main() {
         value
             .get(key)
             .and_then(|v| v.as_str())
-            .or_else(|| value.get("tokens").and_then(|t| t.get(key)).and_then(|v| v.as_str()))
+            .or_else(|| {
+                value
+                    .get("tokens")
+                    .and_then(|t| t.get(key))
+                    .and_then(|v| v.as_str())
+            })
             .map(str::to_string)
     };
     let Some(token) = find("access_token") else {
@@ -45,7 +50,10 @@ fn main() {
             println!("{text}");
         }
         Err(ureq::Error::Status(code, response)) => {
-            println!("HTTP {code} · {}", response.into_string().unwrap_or_default());
+            println!(
+                "HTTP {code} · {}",
+                response.into_string().unwrap_or_default()
+            );
         }
         Err(error) => println!("erreur réseau : {error}"),
     }

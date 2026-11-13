@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 lapinux-core = { path = "../core" }
+lapinux-input = { path = "../input" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = "0.13"
@@ -34,6 +35,11 @@ prost = { version = "0.14", features = ["derive"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["net", "io-util"] }
+# Le test d'intégration du chat ami parle le vrai WebSocket du CM : il lui
+# faut le client/serveur WebSocket déjà utilisé par `steamroom`, et les
+# utilitaires de flux qui vont avec.
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 # Les sondes affichent la conversation avec le CM pour diagnostiquer une
 # poussée manquante (amis, famille, notifications) ; celle du QR rend le
 # défi directement dans le terminal.
@@ -59,6 +65,10 @@ required-features = ["probes"]
 
 [[example]]
 name = "cloud_upload_probe"
+required-features = ["probes"]
+
+[[example]]
+name = "cellule"
 required-features = ["probes"]
 
 [[example]]

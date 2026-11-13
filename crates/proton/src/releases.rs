@@ -20,7 +20,8 @@ pub const SOURCES: [ProtonSource; 3] = [
     ProtonSource {
         repo: "GloriousEggroll/proton-ge-custom",
         label: "GE-Proton",
-        releases_api: "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases?per_page=20",
+        releases_api:
+            "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases?per_page=20",
     },
     ProtonSource {
         repo: "CachyOS/proton-cachyos",
@@ -48,7 +49,9 @@ const ARCHIVE_SUFFIXES: [&str; 3] = [".tar.gz", ".tar.xz", ".tar.zst"];
 
 pub fn is_asset_archive(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    ARCHIVE_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
+    ARCHIVE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 fn is_x86_64(name: &str) -> bool {
@@ -231,7 +234,10 @@ mod tests {
             .iter()
             .find(|r| r.asset == "proton-cachyos-11.0-20261015-slr-x86_64.tar.xz")
             .unwrap();
-        assert_eq!(plain.checksum_url.as_deref(), Some("https://x/cachy.sha512sum"));
+        assert_eq!(
+            plain.checksum_url.as_deref(),
+            Some("https://x/cachy.sha512sum")
+        );
     }
 
     #[test]
@@ -241,7 +247,10 @@ mod tests {
 
     #[test]
     fn labels_resolve() {
-        assert_eq!(source_label("GloriousEggroll/proton-ge-custom"), "GE-Proton");
+        assert_eq!(
+            source_label("GloriousEggroll/proton-ge-custom"),
+            "GE-Proton"
+        );
         assert_eq!(source_label("inconnu"), "Proton");
     }
 }

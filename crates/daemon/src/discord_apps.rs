@@ -316,12 +316,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            Index {
-                apps,
-                fetched: 1
-            }
-            .app_for(&game)
-            .map(|app| app.id.as_str()),
+            Index { apps, fetched: 1 }
+                .app_for(&game)
+                .map(|app| app.id.as_str()),
             Some("1442721146587054180")
         );
     }
@@ -342,12 +339,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            Index {
-                apps,
-                fetched: 1
-            }
-            .app_for(&game)
-            .map(|app| app.id.as_str()),
+            Index { apps, fetched: 1 }
+                .app_for(&game)
+                .map(|app| app.id.as_str()),
             Some("42")
         );
     }
@@ -381,12 +375,7 @@ mod tests {
             exe: Some("/jeux/Motorslice/shared-engine.exe".into()),
             ..Default::default()
         };
-        assert!(Index {
-            apps,
-            fetched: 1
-        }
-        .app_for(&game)
-        .is_none());
+        assert!(Index { apps, fetched: 1 }.app_for(&game).is_none());
     }
 
     #[test]
@@ -399,12 +388,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            Index {
-                apps,
-                fetched: 1
-            }
-            .app_for(&game)
-            .map(|app| app.id.as_str()),
+            Index { apps, fetched: 1 }
+                .app_for(&game)
+                .map(|app| app.id.as_str()),
             Some("1442")
         );
     }

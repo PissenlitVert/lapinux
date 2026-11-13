@@ -165,8 +165,7 @@ pub fn watch_first_frame(
             if !damages.is_empty() && !announced {
                 let _ = attached.send(());
                 announced = true;
-                conn.flush()
-                    .map_err(|e| format!("envoi X11 : {e}"))?;
+                conn.flush().map_err(|e| format!("envoi X11 : {e}"))?;
             }
         }
 

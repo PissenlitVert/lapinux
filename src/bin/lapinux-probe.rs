@@ -37,9 +37,6 @@ fn help() {
          \x20 lapinux-probe               sonde : bibliothèque, interfaces, pipe\n\
          \x20 lapinux-probe --session     tente une session locale (processus isolé)\n\
          \x20 lapinux-probe probe         forme explicite de la sonde\n\
-         \x20 lapinux-probe runtime       runtime SteamCMD autonome (sans client)\n\
-         \x20   --prepare                   télécharge SteamCMD et obtient linux64/steamclient.so\n\
-         \x20   --probe                     inspecte puis tente un login avec le jeton\n\
          \x20 lapinux-probe account       compte Steam : session locale + CM\n\
          \x20   --login COMPTE              connexion nominative (jeton réutilisé,\n\
          \x20                               sinon mot de passe et Steam Guard)\n\
@@ -48,19 +45,15 @@ fn help() {
          \x20   --endpoint HOST:PORT        CM imposé (sinon découverte WebAPI)\n\
          \x20 lapinux-probe --version     version\n\
          \n\
-         Le parcours `runtime` ne lit ni ne lance jamais le client\n\
-         Steam installé : il vit sous\n\
-         ~/.local/share/lapinux/steam-runtime et steam-home.\n\
          Le parcours historique mesure le moteur déjà installé et ouvre une session\n\
          CM anonyme ou nominative. Le mot de passe n'est jamais passé en argument\n\
          ni conservé ; le jeton est écrit en 0600 dans le dossier de données.\n\
-         Les processus hôtes apparaissent sous les noms « {} » et « {} ».\n\
+         Le processus hôte apparaît sous le nom « {} ».\n\
          \n\
          Variables :\n\
          \x20 LAPINUX_STEAMCLIENT         force le chemin de steamclient.so (historique)\n\
          \x20 LAPINUX_STEAM_CM           liste de CMs host:port (sinon WebAPI)\n\
          \x20 (les anciennes variables LAPINUX_STEAM* restent lues)",
-        probe::HOST_PROCESS,
-        lapinux_steam::runtime::HOST_PROCESS
+        probe::HOST_PROCESS
     );
 }

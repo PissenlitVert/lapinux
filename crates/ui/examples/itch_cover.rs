@@ -1,9 +1,7 @@
 //! Sonde temporaire : téléchargement d'une jaquette itch.io et conversion.
 fn main() {
     let url = std::env::args().nth(1).expect("adresse");
-    let response = ureq::get(&url)
-        .set("User-Agent", "Lapinux/0.1")
-        .call();
+    let response = ureq::get(&url).set("User-Agent", "Lapinux/0.1").call();
     match response {
         Ok(response) => {
             let mut bytes = Vec::new();

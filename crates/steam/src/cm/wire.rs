@@ -84,8 +84,8 @@ pub fn read_packet<R: Read>(reader: &mut R) -> Result<Vec<u8>, Error> {
 
 /// Écrit une trame (longueur du message, magie, message).
 pub fn write_packet<W: Write>(writer: &mut W, payload: &[u8]) -> Result<(), Error> {
-    let len = u32::try_from(payload.len())
-        .map_err(|_| Error::Protocol("trame trop grande".into()))?;
+    let len =
+        u32::try_from(payload.len()).map_err(|_| Error::Protocol("trame trop grande".into()))?;
     writer.write_all(&len.to_le_bytes())?;
     writer.write_all(MAGIC)?;
     writer.write_all(payload)?;

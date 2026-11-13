@@ -147,7 +147,10 @@ pub enum Auth {
         guard_data: Option<String>,
     },
     /// Reconnexion sans mot de passe avec le jeton de refresh enregistré.
-    Token { name: String, refresh_token: String },
+    Token {
+        name: String,
+        refresh_token: String,
+    },
 }
 
 /// Code Steam Guard demandé en cours de connexion.
@@ -240,11 +243,7 @@ pub fn parse_server_list(value: &Value) -> Result<Vec<Endpoint>, Error> {
 
 fn endpoints(config: &Config) -> Result<Vec<Endpoint>, Error> {
     if !config.endpoints.is_empty() {
-        return config
-            .endpoints
-            .iter()
-            .map(|item| item.parse())
-            .collect();
+        return config.endpoints.iter().map(|item| item.parse()).collect();
     }
     match discover(config.timeout) {
         Ok(servers) if !servers.is_empty() => Ok(servers),
@@ -463,13 +462,7 @@ fn sign_in_qr_work(
     let deadline = started + config.auth_timeout.max(QR_BUDGET);
     let (endpoint, link) = open_first(&servers, config)?;
     let result = try_qr_endpoint(
-        &endpoint,
-        config,
-        link,
-        on_url,
-        cancelled,
-        on_tokens,
-        deadline,
+        &endpoint, config, link, on_url, cancelled, on_tokens, deadline,
     );
     // Plus de temps ou plus de serveur : la seule action utile est de relancer.
     match result {
@@ -717,9 +710,7 @@ fn open(endpoint: &Endpoint, config: &Config) -> Result<Link, Error> {
         .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("4 octets")))
         .ok_or_else(|| Error::Protocol("ChannelEncryptResult sans résultat".into()))?;
     if eresult != RESULT_OK {
-        return Err(Error::Protocol(format!(
-            "canal refusé (eresult {eresult})"
-        )));
+        return Err(Error::Protocol(format!("canal refusé (eresult {eresult})")));
     }
     // Les CM actuels envoient un nonce : le canal ajoute alors un HMAC-SHA1,
     // dont le secret est la première moitié de la clé de session.
@@ -818,7 +809,10 @@ fn logon(
                 }),
             )
         }
-        Auth::Token { name, refresh_token: token } => {
+        Auth::Token {
+            name,
+            refresh_token: token,
+        } => {
             // Le CM compare l'en-tête au `sub` du jeton : l'identifiant
             // factice d'avant-login est refusé (eresult 5).
             let steam_id = proto::refresh_token_steam_id(token)
@@ -975,7 +969,6 @@ pub fn result_label(eresult: i32) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,13 +990,12 @@ mod tests {
         assert!(recent_refusal("bob").is_none());
     }
 
-
     #[test]
     fn account_name_is_read_from_login_users() {
-        let text = "\"users\"\n{\n\t\"76561198272259682\"\n\t{\n\t\t\"AccountName\"\t\t\"nitioulol\"\n\t\t\"PersonaName\"\t\t\"Nathounette\"\n\t}\n}\n";
+        let text = "\"users\"\n{\n\t\"76561198000000000\"\n\t{\n\t\t\"AccountName\"\t\t\"test-user\"\n\t\t\"PersonaName\"\t\t\"JoueurExemple\"\n\t}\n}\n";
         assert_eq!(
-            account_name_in(text, 76561198272259682),
-            Some("nitioulol".into())
+            account_name_in(text, 76561198000000000),
+            Some("test-user".into())
         );
         assert_eq!(account_name_in(text, 1), None);
         assert_eq!(account_name_in(text, 0), None);
@@ -1050,11 +1042,7 @@ mod tests {
 
     #[test]
     fn multi_is_unwrapped() {
-        let inner = wire::proto_message(
-            CLIENT_LOGON_RESPONSE,
-            &proto::proto_header(42, 0),
-            &[],
-        );
+        let inner = wire::proto_message(CLIENT_LOGON_RESPONSE, &proto::proto_header(42, 0), &[]);
         let mut payload = Vec::new();
         payload.extend_from_slice(&(inner.len() as u32).to_le_bytes());
         payload.extend_from_slice(&inner);

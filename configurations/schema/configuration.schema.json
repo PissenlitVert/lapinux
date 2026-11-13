@@ -48,7 +48,7 @@
       "type": "array",
       "items": {
         "type": "string",
-        "enum": ["dxvk", "vkd3d", "wine", "proton", "gamescope", "mangohud", "game"]
+        "enum": ["dxvk", "vkd3d", "wine", "proton", "gamescope", "game"]
       },
       "uniqueItems": true,
       "description": "Where the change lands. Informational: it is shown in the game sheet."

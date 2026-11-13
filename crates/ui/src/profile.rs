@@ -55,8 +55,14 @@ const LINE_BREAK: char = '\u{b}';
 pub(crate) enum DescriptionPart {
     Text(String),
     /// Lien du profil : le libellé affiché et l'adresse qu'il ouvre.
-    Link { text: String, url: String },
-    Emote { name: String, url: String },
+    Link {
+        text: String,
+        url: String,
+    },
+    Emote {
+        name: String,
+        url: String,
+    },
 }
 
 /// Identité publique d'un compte Steam, telle que la renvoie le profil XML.
@@ -152,6 +158,12 @@ pub(crate) enum ProfileAction {
     SetPresence(SteamPresence),
     /// Redemander la liste d'amis au daemon.
     RefreshSocial,
+    /// Rejoindre le lobby d'un ami invitant, à l'adresse enregistrée.
+    JoinInvite {
+        appid: u32,
+        lobby: u64,
+        connect: String,
+    },
     /// Refaire une lecture complète (profil, commentaires).
     Reload,
     /// Ouvrir les réglages du compte d'une boutique.
@@ -159,7 +171,10 @@ pub(crate) enum ProfileAction {
     Copy(String),
     Open(String),
     /// Ouvrir la fiche du jeu dans la boutique Steam, dans sa fenêtre.
-    Game { appid: u32, name: String },
+    Game {
+        appid: u32,
+        name: String,
+    },
 }
 
 /// Un commentaire tel que la page publique le rend : son auteur, sa photo,
@@ -187,6 +202,14 @@ struct ShowcaseGame {
     achievements: String,
     /// Capsule du jeu, à télécharger comme les autres visuels.
     capsule: String,
+}
+
+/// Un jeu de la bibliothèque familiale d'un membre : son appid garde la
+/// vignette associée, son nom vient du catalogue quand il y est.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FamilyGame {
+    appid: u32,
+    name: String,
 }
 
 /// Une vitrine du profil Steam : « Jeux que j'aime », « Activité récente »…
@@ -218,11 +241,20 @@ enum ProfileMsg {
         comments: Vec<CommentView>,
         error: Option<String>,
     },
-    FriendAvatar { steam_id: u64, bytes: Vec<u8> },
+    FriendAvatar {
+        steam_id: u64,
+        bytes: Vec<u8>,
+    },
     /// Photo d'un auteur de commentaire.
-    CommentAvatar { url: String, bytes: Vec<u8> },
+    CommentAvatar {
+        url: String,
+        bytes: Vec<u8>,
+    },
     /// Emoji Unicode téléchargé : il remplace le glyphe monochrome.
-    Emoji { text: String, bytes: Vec<u8> },
+    Emoji {
+        text: String,
+        bytes: Vec<u8>,
+    },
     /// Identité publique d'un membre de la famille, lue sans session.
     FamilyProfile {
         steam_id: u64,
@@ -230,13 +262,22 @@ enum ProfileMsg {
         avatar: Option<Vec<u8>>,
     },
     /// Image d'une émoticône Steam de la description.
-    Emote { url: String, bytes: Vec<u8> },
+    Emote {
+        url: String,
+        bytes: Vec<u8>,
+    },
     /// Vitrines du profil, lues sur sa page publique.
     Showcases(Vec<SteamShowcase>),
     /// Image d'une vitrine.
-    ShowcaseImage { url: String, bytes: Vec<u8> },
+    ShowcaseImage {
+        url: String,
+        bytes: Vec<u8>,
+    },
     /// Capsule du jeu auquel un ami joue.
-    GameCapsule { appid: u32, bytes: Vec<u8> },
+    GameCapsule {
+        appid: u32,
+        bytes: Vec<u8>,
+    },
     Failed(FetchError),
 }
 
@@ -260,9 +301,7 @@ impl FetchError {
     /// Refus de débit de Steam (429) : la page revient d'elle-même.
     fn rate_limited() -> Self {
         Self {
-            message: "Steam limite les requêtes sur ce profil (réponse 429) : la fiche reviendra \
-                      dans un instant."
-                .into(),
+            message: lapinux_core::i18n::t("ui.profile_rate_limited").into(),
             rate_limited: true,
         }
     }
@@ -304,6 +343,8 @@ pub(crate) struct Profile {
     family_names: HashMap<u64, String>,
     /// Membres de la famille dont la page publique est déjà demandée (ou lue).
     family_profiles_asked: HashSet<u64>,
+    /// Membre dont le modal des jeux partagés est ouvert.
+    family_games: Option<u64>,
     /// La dernière panne était une limite de débit de Steam (429).
     rate_limited: bool,
     /// Fiche à relire toute seule, après une limite de débit.
@@ -352,13 +393,16 @@ impl Profile {
             showcase_images: HashMap::new(),
             showcase_pending: HashSet::new(),
             // Comme Steam : la liste des absents reste fermée.
-            collapsed_friends: HashSet::from(["Hors ligne".to_string()]),
+            collapsed_friends: HashSet::from(
+                [lapinux_core::i18n::t("profile.offline").to_string()],
+            ),
             game_capsules: HashMap::new(),
             game_capsule_pending: HashSet::new(),
             friend_avatars: HashMap::new(),
             friend_avatar_pending: HashSet::new(),
             family_names: HashMap::new(),
             family_profiles_asked: HashSet::new(),
+            family_games: None,
             rate_limited: false,
             retry_at: None,
             retries: 0,
@@ -382,6 +426,16 @@ impl Profile {
         self.fetch_friend_avatars();
         self.fetch_game_capsules();
         self.fetch_family_profiles();
+    }
+
+    /// Nom public d'un membre de la famille, quand sa fiche a répondu.
+    pub(crate) fn family_name(&self, steam_id: u64) -> Option<String> {
+        self.family_names.get(&steam_id).cloned()
+    }
+
+    /// Photo d'un membre de la famille, déjà décodée par la fiche publique.
+    pub(crate) fn family_avatar(&self, steam_id: u64) -> Option<egui::TextureHandle> {
+        self.friend_avatars.get(&steam_id).cloned()
     }
 
     /// SteamID du profil lu, s'il est connu.
@@ -555,7 +609,11 @@ impl Profile {
     /// leur rend leurs couleurs.
     fn queue_text_emojis(&mut self) {
         let mut texts: Vec<&str> = Vec::new();
-        for part in self.profile.iter().flat_map(|profile| profile.description.iter()) {
+        for part in self
+            .profile
+            .iter()
+            .flat_map(|profile| profile.description.iter())
+        {
             if let DescriptionPart::Text(text) = part {
                 texts.push(text);
             }
@@ -579,9 +637,7 @@ impl Profile {
             .flat_map(split_emoji)
             .filter(|(emoji, _)| *emoji)
             .map(|(_, text)| text.to_string())
-            .filter(|text| {
-                !self.emojis.contains_key(text) && !self.emoji_pending.contains(text)
-            })
+            .filter(|text| !self.emojis.contains_key(text) && !self.emoji_pending.contains(text))
             .collect();
         for text in pending {
             if !self.emoji_pending.insert(text.clone()) {
@@ -605,9 +661,25 @@ impl Profile {
         let Some(social) = self.social.as_ref() else {
             return;
         };
+        let appids: Vec<u32> = social
+            .friends
+            .iter()
+            .map(|friend| friend.game_appid)
+            .collect();
+        self.request_game_capsules(&appids);
+    }
+
+    /// Demande les capsules manquantes d'une poignée d'appids : le modal
+    /// familial n'appelle que les lignes visibles, pour ne pas télécharger
+    /// toute une bibliothèque partagée d'un coup.
+    fn request_game_capsules(&mut self, appids: &[u32]) {
+        // Les tests ne doivent pas ouvrir de connexion réseau : ils dessinent
+        // le modal avec les vignettes déjà en cache, ou leur repli.
+        if cfg!(test) {
+            return;
+        }
         let mut pending: Vec<u32> = Vec::new();
-        for friend in &social.friends {
-            let appid = friend.game_appid;
+        for &appid in appids {
             if appid == 0
                 || self.game_capsules.contains_key(&appid)
                 || self.game_capsule_pending.contains(&appid)
@@ -626,6 +698,18 @@ impl Profile {
                 let _ = tx.send(ProfileMsg::GameCapsule { appid, bytes });
             }
         });
+    }
+
+    /// Prépare les capsules des amis qui jouent, y compris depuis l'Accueil.
+    /// La fiche du profil et l'Accueil lisent ainsi exactement le même visuel.
+    pub(super) fn ensure_game_capsules(&mut self, ctx: &egui::Context, appids: &[u32]) {
+        self.request_game_capsules(appids);
+        self.poll_friend_avatars(ctx);
+    }
+
+    /// Capsule déjà chargée, sans nouvelle requête réseau.
+    pub(super) fn game_capsule(&self, appid: u32) -> Option<egui::TextureHandle> {
+        self.game_capsules.get(&appid).cloned()
     }
 
     /// Complète les membres de la famille que la session ne nomme pas : la
@@ -746,9 +830,12 @@ impl Profile {
         match self.retry_at {
             Some(at) => {
                 let left = at.saturating_duration_since(Instant::now()).as_secs() + 1;
-                format!("Steam limite le débit des fiches de profil ; nouvel essai dans {left} s.")
+                lapinux_core::i18n::t_args(
+                    "profile.rate_limited_left",
+                    &[("left", &left.to_string())],
+                )
             }
-            None => "Steam limite le débit des fiches de profil ; réessayez dans un instant.".into(),
+            None => lapinux_core::i18n::t("profile.rate_limited").into(),
         }
     }
 
@@ -777,10 +864,18 @@ impl Profile {
                 Ok(ProfileMsg::CommentAvatar { url, bytes }) => {
                     self.comment_avatar_pending.remove(&url);
                     if let Ok(image) = image::load_from_memory(&bytes) {
-                        self.comment_avatars.insert(
-                            url,
-                            texture_from_image(ctx, image, "comment-avatar"),
-                        );
+                        self.comment_avatars
+                            .insert(url, texture_from_image(ctx, image, "comment-avatar"));
+                    }
+                    ctx.request_repaint();
+                }
+                // Les capsules passent par le canal des amis : c'est
+                // `fetch_game_capsules` qui les publie, pas `fetch` du profil.
+                Ok(ProfileMsg::GameCapsule { appid, bytes }) => {
+                    self.game_capsule_pending.remove(&appid);
+                    if let Ok(image) = image::load_from_memory(&bytes) {
+                        self.game_capsules
+                            .insert(appid, texture_from_image(ctx, image, "game-capsule"));
                     }
                     ctx.request_repaint();
                 }
@@ -880,14 +975,6 @@ impl Profile {
                     // Les émoticônes des vitrines ne sont connues qu'ici : la
                     // première lecture du profil les cherchait avant elles.
                     self.fetch_emotes();
-                    ctx.request_repaint();
-                }
-                Ok(ProfileMsg::GameCapsule { appid, bytes }) => {
-                    self.game_capsule_pending.remove(&appid);
-                    if let Ok(image) = image::load_from_memory(&bytes) {
-                        self.game_capsules
-                            .insert(appid, texture_from_image(ctx, image, "game-capsule"));
-                    }
                     ctx.request_repaint();
                 }
                 Ok(ProfileMsg::ShowcaseImage { url, bytes }) => {
@@ -1052,7 +1139,7 @@ impl Profile {
                 ui.horizontal(|ui| {
                     ui.add_space(9.0);
                     ui.label(
-                        egui::RichText::new("Plateformes")
+                        egui::RichText::new(lapinux_core::i18n::t("ui.profile_platforms"))
                             .size(11.5)
                             .strong()
                             .color(TEXT_DIM()),
@@ -1103,7 +1190,11 @@ impl Profile {
             egui::vec2(26.0, 26.0),
         );
         let eye = (entry.connected && !session_page).then(|| {
-            ui.interact(eye_rect, ui.id().with(("account-eye", platform)), egui::Sense::click())
+            ui.interact(
+                eye_rect,
+                ui.id().with(("account-eye", platform)),
+                egui::Sense::click(),
+            )
         });
         let painter = ui.painter();
         if active || response.hovered() {
@@ -1151,7 +1242,10 @@ impl Profile {
                 ("••••••".to_string(), TEXT_DIM())
             }
         } else {
-            ("Non connecté".to_string(), TEXT_DIM())
+            (
+                lapinux_core::i18n::t("profile.not_connected").to_string(),
+                TEXT_DIM(),
+            )
         };
         painter.text(
             egui::pos2(left, rect.center().y + 7.5),
@@ -1172,9 +1266,9 @@ impl Profile {
                 if hovered { TEXT() } else { TEXT_DIM() },
             );
             let _ = eye.clone().on_hover_text(if revealed {
-                "Masquer le pseudo"
+                lapinux_core::i18n::t("profile.hide_nickname")
             } else {
-                "Afficher le pseudo"
+                lapinux_core::i18n::t("profile.show_nickname")
             });
             let _ = eye.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
             if eye.clicked() {
@@ -1235,7 +1329,13 @@ impl Profile {
             egui::Rounding::same(8.0),
         );
         let painter = ui.painter().clone();
-        for (index, label) in ["Profil", "Achats"].iter().enumerate() {
+        for (index, label) in [
+            lapinux_core::i18n::t("profile.tab_profile"),
+            lapinux_core::i18n::t("profile.tab_purchases"),
+        ]
+        .iter()
+        .enumerate()
+        {
             let slot = crate::segment_rect(rect, &widths, index);
             let ink = if active[index] { TEXT() } else { TEXT_DIM() };
             painter.text(
@@ -1258,7 +1358,10 @@ impl Profile {
 
     /// Onglet Achats : l'activation d'une clé produit sur le compte.
     fn purchases_board(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ProfileAction>) {
-        let redeem = self.social.as_ref().and_then(|social| social.redeem.clone());
+        let redeem = self
+            .social
+            .as_ref()
+            .and_then(|social| social.redeem.clone());
         let running = redeem
             .as_ref()
             .is_some_and(|redeem| redeem.state == "running");
@@ -1270,16 +1373,13 @@ impl Profile {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    egui::RichText::new("Activer un jeu")
+                    egui::RichText::new(lapinux_core::i18n::t("profile.activate_game"))
                         .size(13.0)
                         .strong()
                         .color(TEXT()),
                 );
                 ui.add_space(3.0);
-                muted(
-                    ui,
-                    "Saisissez une clé produit Steam : le jeu rejoint la bibliothèque du compte.",
-                );
+                muted(ui, lapinux_core::i18n::t("profile.product_key_hint"));
                 ui.add_space(10.0);
                 let mut submit = false;
                 let mut test = false;
@@ -1298,7 +1398,9 @@ impl Profile {
                     }
                     ui.add_space(8.0);
                     let button = egui::Button::new(
-                        egui::RichText::new("Activer").size(12.0).strong(),
+                        egui::RichText::new(lapinux_core::i18n::t("profile.activate"))
+                            .size(12.0)
+                            .strong(),
                     );
                     if ui
                         .add_enabled(!running && !self.key_input.trim().is_empty(), button)
@@ -1311,9 +1413,9 @@ impl Profile {
                     // l'animation seule, avec des jeux de démonstration.
                     if ui
                         .add(egui::Button::new(
-                            egui::RichText::new("Tester").size(12.0),
+                            egui::RichText::new(lapinux_core::i18n::t("profile.test")).size(12.0),
                         ))
-                        .on_hover_text("Joue l'animation d'activation, sans clé produit")
+                        .on_hover_text(lapinux_core::i18n::t("profile.play_activation"))
                         .clicked()
                     {
                         test = true;
@@ -1333,18 +1435,14 @@ impl Profile {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if redeem.state == "running" {
-                            ui.spinner();
+                            crate::section_icons::loading(ui, 18.0);
                         }
                         let color = match redeem.state.as_str() {
                             "ok" => OK,
                             "error" => DANGER,
                             _ => TEXT_DIM(),
                         };
-                        ui.label(
-                            egui::RichText::new(&redeem.message)
-                                .size(12.0)
-                                .color(color),
-                        );
+                        ui.label(egui::RichText::new(&redeem.message).size(12.0).color(color));
                     });
                 }
             });
@@ -1508,42 +1606,41 @@ impl Profile {
         profile: &SteamProfile,
         actions: &mut Vec<ProfileAction>,
     ) {
-        if refresh_button(ui, "Relire le profil").clicked() {
-                actions.push(ProfileAction::Reload);
-            }
-            let steam_id = profile.steam_id.clone();
-            let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-            paint_copy_glyph(ui.painter(), rect, TEXT_DIM());
-            if response
-                .clone()
-                .on_hover_text("Copier le SteamID")
-                .clicked()
-                && !steam_id.is_empty()
-            {
-                actions.push(ProfileAction::Copy(steam_id));
-            }
-            // L'identifiant est peint dans son rectangle : un libellé aligné à
-            // droite se décalerait sur le glyphe de copie.
-            let label = if self.id_revealed {
-                format!("ID {}", profile.steam_id)
+        if refresh_button(ui, lapinux_core::i18n::t("profile.reload_profile")).clicked() {
+            actions.push(ProfileAction::Reload);
+        }
+        let steam_id = profile.steam_id.clone();
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+        paint_copy_glyph(ui.painter(), rect, TEXT_DIM());
+        if response
+            .clone()
+            .on_hover_text(lapinux_core::i18n::t("profile.copy_steamid"))
+            .clicked()
+            && !steam_id.is_empty()
+        {
+            actions.push(ProfileAction::Copy(steam_id));
+        }
+        // L'identifiant est peint dans son rectangle : un libellé aligné à
+        // droite se décalerait sur le glyphe de copie.
+        let label = if self.id_revealed {
+            format!("ID {}", profile.steam_id)
+        } else {
+            masked_steam_id(&profile.steam_id)
+        };
+        let size = text_size(ui, &label, 10.5);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        painted_text_at(ui, rect.min, &label, 10.5, TEXT_DIM());
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if self.id_revealed {
+                lapinux_core::i18n::t("profile.hide_id")
             } else {
-                masked_steam_id(&profile.steam_id)
-            };
-            let size = text_size(ui, &label, 10.5);
-            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-            painted_text_at(ui, rect.min, &label, 10.5, TEXT_DIM());
-            if response
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(if self.id_revealed {
-                    "Masquer l'identifiant"
-                } else {
-                    "Afficher l'identifiant"
-                })
-                .clicked()
-            {
-                self.id_revealed = !self.id_revealed;
-            }
+                lapinux_core::i18n::t("profile.show_id")
+            })
+            .clicked()
+        {
+            self.id_revealed = !self.id_revealed;
+        }
     }
 
     fn identity_card(
@@ -1609,7 +1706,7 @@ impl Profile {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 if !profile.real_name.is_empty() {
-                                    muted(ui, "Nom réel :");
+                                    muted(ui, lapinux_core::i18n::t("profile.real_name"));
                                     ui.label(
                                         egui::RichText::new(&profile.real_name)
                                             .size(11.0)
@@ -1643,11 +1740,19 @@ impl Profile {
                     .num_columns(4)
                     .spacing([26.0, 6.0])
                     .show(ui, |ui| {
-                        fact(ui, "Membre depuis", &profile.member_since);
-                        fact(ui, "Localisation", &profile.location);
                         fact(
                             ui,
-                            "Temps de jeu (2 sem.)",
+                            lapinux_core::i18n::t("profile.member_since"),
+                            &profile.member_since,
+                        );
+                        fact(
+                            ui,
+                            lapinux_core::i18n::t("profile.location_label"),
+                            &profile.location,
+                        );
+                        fact(
+                            ui,
+                            lapinux_core::i18n::t("profile.playtime_2weeks"),
                             &format_hours(&profile.hours_2wk),
                         );
                         fact(ui, "Adresse", &profile.custom_url);
@@ -1705,8 +1810,8 @@ impl Profile {
     fn identity_placeholder(&mut self, ui: &mut egui::Ui, account: &str) {
         if self.loading {
             ui.horizontal(|ui| {
-                ui.spinner();
-                muted(ui, "Lecture du profil public…");
+                crate::section_icons::loading(ui, 18.0);
+                muted(ui, lapinux_core::i18n::t("profile.reading_public"));
             });
             return;
         }
@@ -1723,14 +1828,10 @@ impl Profile {
             if self.rate_limited {
                 muted(ui, self.rate_limit_note());
             } else {
-                muted(
-                    ui,
-                    "Le profil public n'est lisible que si le SteamID est connu : \
-                     connectez le compte dans Réglages → Comptes pour l'enregistrer.",
-                );
+                muted(ui, lapinux_core::i18n::t("ui.profile_steamid_required"));
             }
             ui.add_space(4.0);
-            if link_text(ui, "Réessayer").clicked() {
+            if link_text(ui, lapinux_core::i18n::t("configurations.retry")).clicked() {
                 if let Some(steam_id) = self.loaded_for {
                     self.reload(steam_id);
                 }
@@ -1739,18 +1840,16 @@ impl Profile {
         }
         if account.is_empty() {
             ui.label(
-                egui::RichText::new("Aucun compte Steam")
-                    .size(15.0)
-                    .strong()
-                    .color(TEXT()),
+                egui::RichText::new(lapinux_core::i18n::t(
+                    "settings.connection.no_steam_account",
+                ))
+                .size(15.0)
+                .strong()
+                .color(TEXT()),
             );
-            muted(
-                ui,
-                "Connectez votre compte dans Réglages → Comptes : la présence, les \
-                 amis, la famille et les commentaires s'afficheront ici.",
-            );
+            muted(ui, lapinux_core::i18n::t("ui.profile_connect_hint"));
         } else {
-            muted(ui, "Profil pas encore lu.");
+            muted(ui, lapinux_core::i18n::t("profile.not_read"));
         }
     }
 
@@ -1773,7 +1872,7 @@ impl Profile {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Amis")
+                        egui::RichText::new(lapinux_core::i18n::t("friends.title"))
                             .size(13.0)
                             .strong()
                             .color(TEXT()),
@@ -1786,51 +1885,98 @@ impl Profile {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if refresh_button(ui, "Actualiser la liste d'amis").clicked() {
+                        if refresh_button(ui, lapinux_core::i18n::t("profile.refresh_friends"))
+                            .clicked()
+                        {
                             actions.push(ProfileAction::RefreshSocial);
                         }
                     });
                 });
+                if !social.invites.is_empty() {
+                    ui.add_space(8.0);
+                    for invite in &social.invites {
+                        ui.horizontal(|ui| {
+                            let who = invite.inviter_name.clone().unwrap_or_else(|| {
+                                lapinux_core::i18n::t_fmt(
+                                    "profile.friend_number",
+                                    &[invite.inviter.to_string()],
+                                )
+                            });
+                            muted(
+                                ui,
+                                lapinux_core::i18n::t_args(
+                                    "profile.invite_lobby",
+                                    &[("who", &who)],
+                                ),
+                            );
+                            if ui.button(lapinux_core::i18n::t("profile.join")).clicked() {
+                                actions.push(ProfileAction::JoinInvite {
+                                    appid: invite.appid,
+                                    lobby: invite.lobby,
+                                    connect: invite.connect.clone().unwrap_or_default(),
+                                });
+                            }
+                            if invite.connect.is_none() {
+                                muted(ui, lapinux_core::i18n::t("profile.lobby_address"));
+                            }
+                        });
+                    }
+                }
                 if !social.live() {
                     ui.add_space(6.0);
                     muted(
                         ui,
                         social.error.clone().unwrap_or_else(|| {
-                            "La session sociale se connecte ; les amis apparaîtront ici.".into()
+                            lapinux_core::i18n::t("profile.social_connecting").into()
                         }),
                     );
                     return;
                 }
                 if social.friends.is_empty() {
                     ui.add_space(6.0);
-                    muted(ui, "Aucun ami renvoyé par Steam.");
+                    muted(ui, lapinux_core::i18n::t("profile.no_friends"));
                     return;
                 }
-                // Trois catégories, comme dans Steam : ceux qui jouent, ceux
-                // qui sont là, puis les autres.
+                // Quatre catégories, comme dans Steam : ceux qui jouent,
+                // ceux qui sont disponibles, les absents, puis les hors ligne.
+                // Steam considère un absent comme « en ligne » ; il ne doit
+                // pourtant jamais passer avant un ami réellement disponible.
                 let mut playing: Vec<&SteamFriend> = Vec::new();
                 let mut online: Vec<&SteamFriend> = Vec::new();
+                let mut away: Vec<&SteamFriend> = Vec::new();
                 let mut offline: Vec<&SteamFriend> = Vec::new();
                 for friend in &social.friends {
                     if friend.in_game() {
                         playing.push(friend);
+                    } else if matches!(
+                        friend.presence,
+                        lapinux_core::social::SteamPresence::Away
+                            | lapinux_core::social::SteamPresence::Snooze
+                    ) {
+                        away.push(friend);
                     } else if friend.presence.online() {
                         online.push(friend);
                     } else {
                         offline.push(friend);
                     }
                 }
-                for group in [&mut playing, &mut online, &mut offline] {
+                for group in [&mut playing, &mut online, &mut away, &mut offline] {
                     group.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                 }
                 for (label, group) in [
                     (lapinux_core::i18n::t("profile.in_game"), &playing),
                     (lapinux_core::i18n::t("profile.online"), &online),
+                    (lapinux_core::i18n::t("profile.away"), &away),
                 ] {
                     self.friend_category(ui, label, group, actions);
                 }
                 if !offline.is_empty() {
-                    self.friend_category(ui, lapinux_core::i18n::t("profile.offline"), &offline, actions);
+                    self.friend_category(
+                        ui,
+                        lapinux_core::i18n::t("profile.offline"),
+                        &offline,
+                        actions,
+                    );
                 }
                 let _ = steam_id;
             });
@@ -1873,12 +2019,7 @@ impl Profile {
 
     /// Photos des amis d'une catégorie repliée, dans la place libre de son
     /// en-tête : les premières, puis « +N ».
-    fn collapsed_friend_faces(
-        &self,
-        ui: &mut egui::Ui,
-        free: egui::Rect,
-        group: &[&SteamFriend],
-    ) {
+    fn collapsed_friend_faces(&self, ui: &mut egui::Ui, free: egui::Rect, group: &[&SteamFriend]) {
         if group.is_empty() || free.width() < 24.0 {
             return;
         }
@@ -1983,7 +2124,12 @@ impl Profile {
         );
     }
 
-    fn friend_row(&self, ui: &mut egui::Ui, friend: &SteamFriend, actions: &mut Vec<ProfileAction>) {
+    fn friend_row(
+        &self,
+        ui: &mut egui::Ui,
+        friend: &SteamFriend,
+        actions: &mut Vec<ProfileAction>,
+    ) {
         ui.horizontal(|ui| {
             self.avatar_cell(ui, friend.steam_id, &friend.name, 28.0);
             ui.add_space(8.0);
@@ -2010,13 +2156,14 @@ impl Profile {
             if playing {
                 // Le jeu mène à sa boutique, comme un lien de la fiche.
                 let mut open_game = false;
-                if let Some(capsule) = self.game_capsules.get(&friend.game_appid) {                    let response = ui
+                if let Some(capsule) = self.game_capsules.get(&friend.game_appid) {
+                    let response = ui
                         .add(
                             egui::Image::new((capsule.id(), egui::vec2(48.0, 18.0)))
                                 .rounding(egui::Rounding::same(3.0)),
                         )
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text("Ouvrir la fiche du jeu");
+                        .on_hover_text(lapinux_core::i18n::t("profile.open_game_page"));
                     open_game |= response.clicked();
                     ui.add_space(6.0);
                 }
@@ -2025,7 +2172,7 @@ impl Profile {
                 // La ligne se lit « Joue à … », comme dans Steam, au lieu d'un
                 // titre poussé contre le bord droit.
                 let title = if friend.game.trim().is_empty() {
-                    "un jeu".to_string()
+                    lapinux_core::i18n::t("profile.a_game").to_string()
                 } else {
                     friend.game.clone()
                 };
@@ -2034,15 +2181,18 @@ impl Profile {
                     .add_sized(
                         [title_width, 18.0],
                         egui::Label::new(
-                            egui::RichText::new(format!("Joue à {title}"))
-                                .size(11.5)
-                                .color(TEXT_DIM()),
+                            egui::RichText::new(lapinux_core::i18n::t_args(
+                                "profile.playing",
+                                &[("title", &title.to_string())],
+                            ))
+                            .size(11.5)
+                            .color(TEXT_DIM()),
                         )
-                            .truncate()
-                            .sense(egui::Sense::click()),
+                        .truncate()
+                        .sense(egui::Sense::click()),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("Ouvrir la fiche du jeu");
+                    .on_hover_text(lapinux_core::i18n::t("profile.open_game_page"));
                 open_game |= response.clicked();
                 if open_game && friend.game_appid != 0 {
                     actions.push(ProfileAction::Game {
@@ -2073,6 +2223,7 @@ impl Profile {
             .as_ref()
             .and_then(|social| social.family.clone())
         else {
+            self.family_games = None;
             return;
         };
         // Les noms lus sur les pages publiques complètent ceux de la session.
@@ -2086,7 +2237,7 @@ impl Profile {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Famille Steam")
+                        egui::RichText::new(lapinux_core::i18n::t("ui.profile_family"))
                             .size(13.0)
                             .strong()
                             .color(TEXT()),
@@ -2111,7 +2262,24 @@ impl Profile {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    muted(ui, format!("{} jeux", member.games));
+                                    let response = ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(lapinux_core::i18n::t_fmt(
+                                                    "profile.games_count",
+                                                    &[member.games.to_string()],
+                                                ))
+                                                .size(11.0)
+                                                .color(TEXT_DIM()),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .on_hover_text(lapinux_core::i18n::t(
+                                            "profile.family_games_hint",
+                                        ));
+                                    if response.clicked() {
+                                        self.family_games = Some(member.steam_id);
+                                    }
                                 },
                             );
                         }
@@ -2119,6 +2287,293 @@ impl Profile {
                     ui.add_space(4.0);
                 }
             });
+    }
+
+    /// Liste des jeux partagés par un membre, ouverte depuis le compteur de
+    /// la famille. Le panneau est centré au-dessus d'un voile : les vignettes
+    /// des lignes visibles se chargent au fur et à mesure du défilement.
+    pub(crate) fn family_games_modal(
+        &mut self,
+        ctx: &egui::Context,
+        catalog: Option<&lapinux_core::model::SteamCatalog>,
+    ) {
+        if !matches!(self.platform, Platform::Steam) {
+            self.family_games = None;
+            return;
+        }
+        let Some(steam_id) = self.family_games else {
+            return;
+        };
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.family_games = None;
+            return;
+        }
+        let Some(family) = self
+            .social
+            .as_ref()
+            .and_then(|social| social.family.clone())
+        else {
+            self.family_games = None;
+            return;
+        };
+        let Some(member) = family
+            .members
+            .iter()
+            .find(|member| member.steam_id == steam_id)
+            .cloned()
+        else {
+            self.family_games = None;
+            return;
+        };
+        let mut name = family_member_name(&member, &self.family_names);
+        if name.trim().is_empty() {
+            name = lapinux_core::i18n::t("profile.family_member").to_string();
+        }
+        let title =
+            lapinux_core::i18n::t_args("profile.family_games_title", &[("name", name.as_str())]);
+        let games = family_games(&member.appids, catalog);
+        let subtitle = (!games.is_empty()).then(|| {
+            lapinux_core::i18n::t_fmt("profile.family_games_count", &[games.len().to_string()])
+        });
+        const HEADER_HEIGHT: f32 = 82.0;
+        const ROW_HEIGHT: f32 = 36.0;
+        let screen = ctx.screen_rect();
+        let visible_rows = games.len().clamp(1, 10) as f32;
+        let panel_width = (screen.width() - 32.0).clamp(300.0, 480.0);
+        let panel_height = (HEADER_HEIGHT + 30.0 + visible_rows * ROW_HEIGHT)
+            .clamp(220.0, 620.0)
+            .min((screen.height() - 32.0).max(200.0));
+        let panel = egui::vec2(panel_width, panel_height);
+        let rect = egui::Rect::from_center_size(screen.center(), panel);
+        let header_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.right(), rect.top() + HEADER_HEIGHT),
+        );
+        let body_rect =
+            egui::Rect::from_min_max(egui::pos2(rect.left(), header_rect.bottom()), rect.max);
+        let mut close = false;
+        egui::Window::new("family-games")
+            .id(egui::Id::new(("family-games", steam_id)))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .fixed_pos(screen.min)
+            .fixed_size(screen.size())
+            .frame(egui::Frame::none())
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(190));
+                // Le voile absorbe les clics hors du panneau : la page en
+                // dessous ne reçoit rien pendant que le modal est ouvert.
+                let outside = [
+                    egui::Rect::from_min_max(screen.min, egui::pos2(rect.left(), screen.max.y)),
+                    egui::Rect::from_min_max(egui::pos2(rect.right(), screen.min.y), screen.max),
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), screen.min.y),
+                        egui::pos2(rect.right(), rect.top()),
+                    ),
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), rect.bottom()),
+                        egui::pos2(rect.right(), screen.max.y),
+                    ),
+                ];
+                for (index, area) in outside.into_iter().enumerate() {
+                    if area.width() > 0.0 && area.height() > 0.0 {
+                        let _ = ui.interact(
+                            area,
+                            egui::Id::new(("family-games-outside", steam_id, index)),
+                            egui::Sense::click(),
+                        );
+                    }
+                }
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    egui::Frame::none()
+                        .fill(CARD())
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER()))
+                        .rounding(egui::Rounding::same(16.0))
+                        .shadow(egui::epaint::Shadow {
+                            offset: egui::vec2(0.0, 18.0),
+                            blur: 44.0,
+                            spread: 0.0,
+                            color: egui::Color32::from_black_alpha(170),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_min_size(panel);
+                            ui.set_max_size(panel);
+                            let painter = ui.painter();
+                            painter.rect_filled(
+                                header_rect,
+                                egui::Rounding {
+                                    nw: 16.0,
+                                    ne: 16.0,
+                                    sw: 0.0,
+                                    se: 0.0,
+                                },
+                                BACKGROUND(),
+                            );
+                            painter.line_segment(
+                                [
+                                    egui::pos2(rect.left(), header_rect.bottom()),
+                                    egui::pos2(rect.right(), header_rect.bottom()),
+                                ],
+                                egui::Stroke::new(1.0_f32, BORDER()),
+                            );
+                            ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .max_rect(header_rect.shrink2(egui::vec2(16.0, 0.0))),
+                                |ui| {
+                                    ui.add_space(15.0);
+                                    ui.horizontal(|ui| {
+                                        self.avatar_cell(ui, steam_id, &name, 40.0);
+                                        ui.add_space(11.0);
+                                        let text_width = (ui.available_width() - 34.0).max(120.0);
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(text_width, 42.0),
+                                            egui::Layout::top_down(egui::Align::Min),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&title)
+                                                            .size(15.5)
+                                                            .strong()
+                                                            .color(TEXT()),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.add_space(3.0);
+                                                if let Some(subtitle) = &subtitle {
+                                                    muted(ui, subtitle.clone());
+                                                }
+                                            },
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let close_button = ui.add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("×")
+                                                            .size(19.0)
+                                                            .color(TEXT_DIM()),
+                                                    )
+                                                    .frame(false),
+                                                );
+                                                if close_button.clicked() {
+                                                    close = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                },
+                            );
+                            let body_inner = body_rect.shrink2(egui::vec2(14.0, 9.0));
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(body_inner), |ui| {
+                                ui.set_clip_rect(body_inner);
+                                if games.is_empty() {
+                                    ui.add_space(24.0);
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(8.0);
+                                        crate::section_icons::loading(ui, 18.0);
+                                        ui.add_space(8.0);
+                                        muted(
+                                            ui,
+                                            lapinux_core::i18n::t("profile.family_games_pending"),
+                                        );
+                                    });
+                                    return;
+                                }
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                let list_height = (body_inner.height() - 2.0).max(ROW_HEIGHT);
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("family-games-list", steam_id))
+                                    .auto_shrink([false, false])
+                                    .max_height(list_height)
+                                    .show_rows(ui, ROW_HEIGHT, games.len(), |ui, range| {
+                                        let start = range.start.saturating_sub(3);
+                                        let end = (range.end + 6).min(games.len());
+                                        let appids: Vec<u32> = games[start..end]
+                                            .iter()
+                                            .map(|game| game.appid)
+                                            .collect();
+                                        self.request_game_capsules(&appids);
+                                        for index in range {
+                                            let game = &games[index];
+                                            let row_rect = egui::Rect::from_min_size(
+                                                ui.cursor().min,
+                                                egui::vec2(ui.available_width(), ROW_HEIGHT),
+                                            );
+                                            if ui
+                                                .ctx()
+                                                .pointer_hover_pos()
+                                                .map_or(false, |pos| row_rect.contains(pos))
+                                            {
+                                                ui.painter().rect_filled(
+                                                    row_rect.shrink2(egui::vec2(4.0, 2.0)),
+                                                    egui::Rounding::same(7.0),
+                                                    CARD_HOVER(),
+                                                );
+                                            }
+                                            ui.allocate_ui_with_layout(
+                                                row_rect.size(),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add_space(8.0);
+                                                    let (icon_rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(56.0, 22.0),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(
+                                                        icon_rect,
+                                                        egui::Rounding::same(4.0),
+                                                        CARD_HOVER(),
+                                                    );
+                                                    if let Some(texture) =
+                                                        self.game_capsules.get(&game.appid)
+                                                    {
+                                                        egui::Image::new((
+                                                            texture.id(),
+                                                            icon_rect.size(),
+                                                        ))
+                                                        .rounding(egui::Rounding::same(4.0))
+                                                        .paint_at(ui, icon_rect);
+                                                    }
+                                                    ui.painter().rect_stroke(
+                                                        icon_rect,
+                                                        egui::Rounding::same(4.0),
+                                                        egui::Stroke::new(1.0_f32, BORDER()),
+                                                    );
+                                                    ui.add_space(11.0);
+                                                    let label_width =
+                                                        (ui.available_width() - 10.0).max(80.0);
+                                                    ui.allocate_ui_with_layout(
+                                                        egui::vec2(label_width, 20.0),
+                                                        egui::Layout::left_to_right(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(&game.name)
+                                                                        .size(12.5)
+                                                                        .color(TEXT()),
+                                                                )
+                                                                .truncate(),
+                                                            )
+                                                            .on_hover_text(&game.name);
+                                                        },
+                                                    );
+                                                    ui.add_space(8.0);
+                                                },
+                                            );
+                                        }
+                                    });
+                            });
+                        });
+                });
+            });
+        if close {
+            self.family_games = None;
+        }
     }
 
     /// Vitrines du profil, un encart chacune, sous la fiche : le joueur y
@@ -2129,9 +2584,9 @@ impl Profile {
             // La page de Steam met un instant : la carte dit ce qu'elle
             // attend, au lieu de laisser un trou dans la fiche.
             let message = if self.rate_limited {
-                "Steam limite les lectures : les vitrines reviennent dans un instant."
+                lapinux_core::i18n::t("profile.showcases_rate_limited")
             } else {
-                "Chargement des vitrines…"
+                lapinux_core::i18n::t("profile.showcases_loading")
             };
             egui::Frame::none()
                 .fill(CARD())
@@ -2141,7 +2596,7 @@ impl Profile {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(
-                        egui::RichText::new("Vitrines")
+                        egui::RichText::new(lapinux_core::i18n::t("ui.profile_showcases"))
                             .size(13.0)
                             .strong()
                             .color(TEXT()),
@@ -2149,7 +2604,7 @@ impl Profile {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if !self.rate_limited {
-                            ui.spinner();
+                            crate::section_icons::loading(ui, 18.0);
                         }
                         muted(ui, message);
                     });
@@ -2170,7 +2625,7 @@ impl Profile {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    egui::RichText::new("Vitrines")
+                    egui::RichText::new(lapinux_core::i18n::t("ui.profile_showcases"))
                         .size(13.0)
                         .strong()
                         .color(TEXT()),
@@ -2302,9 +2757,9 @@ impl Profile {
             let message = if let Some(error) = self.comments_error.clone() {
                 error
             } else if self.rate_limited {
-                "Steam limite les lectures : les commentaires reviennent dans un instant.".to_string()
+                lapinux_core::i18n::t("profile.comments_rate_limited").to_string()
             } else {
-                "Chargement des commentaires…".to_string()
+                lapinux_core::i18n::t("profile.comments_loading").to_string()
             };
             egui::Frame::none()
                 .fill(CARD())
@@ -2314,7 +2769,7 @@ impl Profile {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(
-                        egui::RichText::new("Commentaires")
+                        egui::RichText::new(lapinux_core::i18n::t("ui.profile_comments"))
                             .size(13.0)
                             .strong()
                             .color(TEXT()),
@@ -2322,7 +2777,7 @@ impl Profile {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if loading {
-                            ui.spinner();
+                            crate::section_icons::loading(ui, 18.0);
                         }
                         muted(ui, message);
                     });
@@ -2338,14 +2793,14 @@ impl Profile {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Commentaires")
+                        egui::RichText::new(lapinux_core::i18n::t("ui.profile_comments"))
                             .size(13.0)
                             .strong()
                             .color(TEXT()),
                     );
                     muted(ui, format!("· {total} au total"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if link_text(ui, "Ouvrir le profil").clicked() {
+                        if link_text(ui, lapinux_core::i18n::t("profile.open_profile")).clicked() {
                             actions.push(ProfileAction::Open(format!(
                                 "https://steamcommunity.com/profiles/{steam_id}"
                             )));
@@ -2354,7 +2809,7 @@ impl Profile {
                 });
                 if comments.is_empty() {
                     ui.add_space(6.0);
-                    muted(ui, "Aucun commentaire sur ce profil.");
+                    muted(ui, lapinux_core::i18n::t("profile.no_comments"));
                     return;
                 }
                 ui.add_space(8.0);
@@ -2416,9 +2871,9 @@ impl Profile {
                 ui.horizontal(|ui| {
                     status_dot(ui, WARN);
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Profil {} : Steam ne montre qu'une partie des informations.",
-                            privacy_label(&profile.privacy_state).to_lowercase()
+                        egui::RichText::new(lapinux_core::i18n::t_fmt(
+                            "profile.partial_privacy",
+                            &[privacy_label(&profile.privacy_state).to_lowercase()],
                         ))
                         .size(12.0)
                         .color(TEXT()),
@@ -2527,7 +2982,9 @@ fn emoji_urls(emoji: &str) -> Vec<String> {
     }
     names
         .into_iter()
-        .map(|name| format!("https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/{name}.png"))
+        .map(|name| {
+            format!("https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/{name}.png")
+        })
         .collect()
 }
 
@@ -2548,7 +3005,11 @@ fn masked_steam_id(steam_id: &str) -> String {
 /// qu'écrite — le libellé prenait la place de l'identifiant.
 fn refresh_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-    let ink = if response.hovered() { TEXT() } else { TEXT_DIM() };
+    let ink = if response.hovered() {
+        TEXT()
+    } else {
+        TEXT_DIM()
+    };
     let center = rect.center() + egui::vec2(0.0, -0.4);
     let radius = 5.0;
     let start = -1.2_f32;
@@ -2598,12 +3059,15 @@ fn last_seen_line(friend: &SteamFriend) -> String {
     if friend.last_logoff > 0 {
         let elapsed = (now - friend.last_logoff).max(0);
         if elapsed < 60 {
-            return "déconnecté à l'instant".into();
+            return lapinux_core::i18n::t("profile.offline_now").into();
         }
-        return format!("déconnecté il y a {}", short_ago(elapsed));
+        return lapinux_core::i18n::t_fmt("profile.offline_ago", &[short_ago(elapsed).to_string()]);
     }
     if friend.last_logon > 0 {
-        return format!("connecté il y a {}", short_ago((now - friend.last_logon).max(0)));
+        return lapinux_core::i18n::t_fmt(
+            "profile.connected_ago",
+            &[short_ago((now - friend.last_logon).max(0)).to_string()],
+        );
     }
     friend.presence.label().to_string()
 }
@@ -2622,11 +3086,20 @@ fn short_ago(seconds: i64) -> String {
 fn online_label(profile: &SteamProfile) -> (egui::Color32, String) {
     match profile.online_state.as_str() {
         "online" => (OK, lapinux_core::i18n::t("profile.online").to_string()),
-        "in-game" => (BLUETOOTH_BLUE, lapinux_core::i18n::t("profile.in_game").to_string()),
-        "offline" => (TEXT_DIM(), lapinux_core::i18n::t("profile.offline").to_string()),
+        "in-game" => (
+            BLUETOOTH_BLUE,
+            lapinux_core::i18n::t("profile.in_game").to_string(),
+        ),
+        "offline" => (
+            TEXT_DIM(),
+            lapinux_core::i18n::t("profile.offline").to_string(),
+        ),
         _ => {
             if profile.state_message.is_empty() {
-                (TEXT_DIM(), lapinux_core::i18n::t("profile.unknown_state").to_string())
+                (
+                    TEXT_DIM(),
+                    lapinux_core::i18n::t("profile.unknown_state").to_string(),
+                )
             } else {
                 (TEXT_DIM(), profile.state_message.clone())
             }
@@ -2636,11 +3109,11 @@ fn online_label(profile: &SteamProfile) -> (egui::Color32, String) {
 
 fn privacy_label(state: &str) -> String {
     match state {
-        "public" => "Public".to_string(),
-        "friendsonly" => "Visible par les amis".to_string(),
-        "private" => "Privé".to_string(),
+        "public" => lapinux_core::i18n::t("profile.public_state").to_string(),
+        "friendsonly" => lapinux_core::i18n::t("profile.friends_only").to_string(),
+        "private" => lapinux_core::i18n::t("profile.private").to_string(),
         other => match other.trim() {
-            "" => "Visibilité inconnue".to_string(),
+            "" => lapinux_core::i18n::t("profile.unknown_visibility").to_string(),
             value => value.to_string(),
         },
     }
@@ -2680,7 +3153,10 @@ fn format_hours(value: &str) -> String {
     if trimmed.is_empty() {
         return "—".to_string();
     }
-    lapinux_core::i18n::t_args("profile.hours", &[("hours", &lapinux_core::i18n::decimal(trimmed))])
+    lapinux_core::i18n::t_args(
+        "profile.hours",
+        &[("hours", &lapinux_core::i18n::decimal(trimmed))],
+    )
 }
 
 /// Fragment d'une ligne de description : un mot, un lien, ou une émoticône.
@@ -2748,6 +3224,42 @@ fn family_member_name(
         .unwrap_or_default()
 }
 
+/// Jeux partagés par un membre : l'appid garde la vignette, le catalogue
+/// donne le nom des jeux connus. Un appid absent garde un libellé stable
+/// plutôt que de disparaître de la liste.
+fn family_games(
+    appids: &[u32],
+    catalog: Option<&lapinux_core::model::SteamCatalog>,
+) -> Vec<FamilyGame> {
+    let names: HashMap<u32, &str> = catalog
+        .map(|catalog| {
+            catalog
+                .entries
+                .iter()
+                .filter(|entry| !entry.name.trim().is_empty())
+                .map(|entry| (entry.appid, entry.name.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut games: Vec<FamilyGame> = appids
+        .iter()
+        .map(|appid| FamilyGame {
+            appid: *appid,
+            name: names
+                .get(appid)
+                .map(|name| (*name).to_string())
+                .unwrap_or_else(|| format!("App {appid}")),
+        })
+        .collect();
+    games.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.appid.cmp(&right.appid))
+    });
+    games
+}
+
 /// Un œil : ouvert, il montre ce qu'il couvre ; barré, il le cache.
 fn paint_eye(painter: &egui::Painter, center: egui::Pos2, open: bool, color: egui::Color32) {
     const W: f32 = 14.0;
@@ -2789,7 +3301,11 @@ fn paint_platform_logo(painter: &egui::Painter, platform: Platform, tile: egui::
     };
     // Une marque plus grande que la tuile d'origine : les logos à lettrage
     // (« EPIC GAMES », « gog.com ») n'étaient qu'une bouillie à 24 px.
-    let side = if platform == Platform::Steam { 32.0 } else { 30.0 };
+    let side = if platform == Platform::Steam {
+        32.0
+    } else {
+        30.0
+    };
     let px = crate::mark_pixels(painter.ctx(), side);
     let texture = crate::store_mark_texture(painter.ctx(), store, px);
     // Le logo garde ses proportions : un glyphe large ne s'écrase pas dans la
@@ -2815,12 +3331,7 @@ fn paint_platform_logo(painter: &egui::Painter, platform: Platform, tile: egui::
 
 /// Pictogramme Discord : le visage de la mascotte, au trait, deux yeux et
 /// deux pattes — le sous-ensemble Remix n'a pas son logo.
-fn paint_discord_glyph(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    size: f32,
-    ink: egui::Color32,
-) {
+fn paint_discord_glyph(painter: &egui::Painter, center: egui::Pos2, size: f32, ink: egui::Color32) {
     let scale = size / 30.0;
     let stroke = egui::Stroke::new(1.5_f32 * scale, ink);
     let body = egui::Rect::from_center_size(
@@ -2936,9 +3447,9 @@ fn fetch(steam_id: u64, tx: &mpsc::Sender<ProfileMsg>, fresh: bool) {
     };
     let profile = profile_from_xml(&xml);
     if profile.steam_id.is_empty() {
-        let _ = tx.send(ProfileMsg::Failed(FetchError::new(
-            lapinux_core::i18n::t("profile.not_found"),
-        )));
+        let _ = tx.send(ProfileMsg::Failed(FetchError::new(lapinux_core::i18n::t(
+            "profile.not_found",
+        ))));
         return;
     }
     let _ = tx.send(ProfileMsg::Loaded(profile.clone()));
@@ -3209,7 +3720,9 @@ fn parse_showcases(html: &str) -> Vec<SteamShowcase> {
         if close <= open {
             continue;
         }
-        let title = clean_html(&after_header[open + 1..close]).trim().to_string();
+        let title = clean_html(&after_header[open + 1..close])
+            .trim()
+            .to_string();
         if title.is_empty() {
             continue;
         }
@@ -3289,7 +3802,10 @@ fn parse_showcase_games(content: &str) -> Vec<ShowcaseGame> {
         }
         // « 1 776 h en tout », puis « dernière utilisation le 20 oct. ».
         let details = tagged_text(block, "class=\"game_info_details\"").unwrap_or_default();
-        let mut lines = details.lines().map(str::trim).filter(|line| !line.is_empty());
+        let mut lines = details
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
         games.push(ShowcaseGame {
             name,
             hours: lines.next().unwrap_or_default().to_string(),
@@ -3377,11 +3893,18 @@ fn get_text_as(url: &str, agent: &str) -> Result<String, FetchError> {
             // 429 : Steam demande d'être appelé moins vite. Ce n'est pas une
             // panne, et ça se répare tout seul.
             ureq::Error::Status(429, _) => FetchError::rate_limited(),
-            other => FetchError::new(lapinux_core::i18n::t_args("profile.page_unreachable", &[("error", &other.to_string())])),
+            other => FetchError::new(lapinux_core::i18n::t_args(
+                "profile.page_unreachable",
+                &[("error", &other.to_string())],
+            )),
         })?;
     let mut text = String::new();
-    std::io::Read::read_to_string(&mut response.into_reader(), &mut text)
-        .map_err(|error| FetchError::new(lapinux_core::i18n::t_args("profile.unreadable", &[("error", &error.to_string())])))?;
+    std::io::Read::read_to_string(&mut response.into_reader(), &mut text).map_err(|error| {
+        FetchError::new(lapinux_core::i18n::t_args(
+            "profile.unreadable",
+            &[("error", &error.to_string())],
+        ))
+    })?;
     Ok(text)
 }
 
@@ -3398,7 +3921,9 @@ fn http_text(url: &str) -> Result<String, FetchError> {
 /// répondent qu'à celui d'un navigateur.
 fn http_text_as(url: &str, agent: &str) -> Result<String, FetchError> {
     if url.trim().is_empty() {
-        return Err(FetchError::new(lapinux_core::i18n::t("profile.empty_address")));
+        return Err(FetchError::new(lapinux_core::i18n::t(
+            "profile.empty_address",
+        )));
     }
     let community = url.contains("steamcommunity.com");
     if community {
@@ -3619,7 +4144,9 @@ fn with_emote_codes(parts: Vec<DescriptionPart>) -> Vec<DescriptionPart> {
 /// (pour ne pas prendre `12:30:45` pour une image).
 fn is_emote_name(name: &str) -> bool {
     (2..=32).contains(&name.len())
-        && name.chars().any(|character| character.is_ascii_alphabetic())
+        && name
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
         && name
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
@@ -3864,7 +4391,10 @@ fn comment_images(html: &str) -> Vec<String> {
         };
         let url = &tail[..end];
         rest = &tail[end..];
-        if url.contains("/economy/emoticon/") || url.contains("avatars.") || url.contains("/public/images/") {
+        if url.contains("/economy/emoticon/")
+            || url.contains("avatars.")
+            || url.contains("/public/images/")
+        {
             continue;
         }
         if !images.iter().any(|known| known == url) {
@@ -3880,11 +4410,11 @@ fn comment_images(html: &str) -> Vec<String> {
 /// Dernier pseudonyme affiché avant le commentaire.
 fn comment_author(head: &str) -> String {
     let Some(index) = head.rfind("<bdi>") else {
-        return "Quelqu'un".into();
+        return lapinux_core::i18n::t("profile_page.anonymous").into();
     };
     let rest = &head[index + 5..];
     let Some(end) = rest.find("</bdi>") else {
-        return "Quelqu'un".into();
+        return lapinux_core::i18n::t("profile_page.anonymous").into();
     };
     unescape(rest[..end].trim())
 }
@@ -3985,6 +4515,29 @@ mod tests {
     /// Un visuel de vitrine téléchargé doit devenir une texture : le message
     /// arrive par le canal des amis, et c'est là qu'il faut le lire.
     #[test]
+    fn game_capsules_reach_their_texture_through_the_friend_channel() {
+        let ctx = egui::Context::default();
+        let mut profile = Profile::new();
+        profile.game_capsule_pending.insert(620);
+        profile
+            .friend_tx
+            .send(ProfileMsg::GameCapsule {
+                appid: 620,
+                bytes: include_bytes!("../../../assets/lapinux-icon.png").to_vec(),
+            })
+            .expect("canal ouvert");
+        profile.poll_friend_avatars(&ctx);
+        assert!(
+            profile.game_capsules.contains_key(&620),
+            "la capsule reçue doit devenir une texture"
+        );
+        assert!(
+            !profile.game_capsule_pending.contains(&620),
+            "la capsule reçue ne reste pas en attente"
+        );
+    }
+
+    #[test]
     fn showcase_images_reach_their_texture() {
         let ctx = egui::Context::default();
         let mut profile = Profile::new();
@@ -4014,11 +4567,15 @@ mod tests {
         let bytes = http_bytes(url);
         println!("capsule: {:?}", bytes.as_ref().map(|b| b.len()));
         if let Some(bytes) = bytes {
-            println!("décodée: {:?}", image::load_from_memory(&bytes).is_ok());
+            println!("decoded: {:?}", image::load_from_memory(&bytes).is_ok());
         }
-        let html = http_text("https://steamcommunity.com/profiles/76561198272259682/?l=french");
+        let html = http_text("https://steamcommunity.com/profiles/76561198000000000/?l=french");
         match html {
-            Ok(html) => println!("page: {} octets, vitrines: {}", html.len(), parse_showcases(&html).len()),
+            Ok(html) => println!(
+                "page: {} octets, vitrines: {}",
+                html.len(),
+                parse_showcases(&html).len()
+            ),
             Err(error) => println!("page: ERREUR {}", error.message),
         }
     }
@@ -4094,19 +4651,14 @@ mod tests {
         // La vitrine de créations a sa propre carte, avec son visuel.
         assert_eq!(showcases[1].title, "Vitrine des créations à la une");
         assert_eq!(showcases[1].images.len(), 1, "{:?}", showcases[1].images);
-        assert!(showcases[1]
-            .images[0]
-            .starts_with("https://images.steamusercontent.com/ugc/"));
+        assert!(showcases[1].images[0].starts_with("https://images.steamusercontent.com/ugc/"));
         // Les jeux récents portent leur capsule, leurs heures et leurs succès.
         assert_eq!(showcases[2].title, "Activité récente");
         assert_eq!(
             showcases[2].subtitle, "9,5 h les 15 derniers jours",
             "le temps des quinze derniers jours suit le titre"
         );
-        let game = showcases[2]
-            .games
-            .first()
-            .expect("un jeu récent détaillé");
+        let game = showcases[2].games.first().expect("un jeu récent détaillé");
         assert_eq!(game.name, "Garry's Mod");
         assert_eq!(game.hours, "1 776 h en tout");
         assert!(
@@ -4120,8 +4672,8 @@ mod tests {
     use lapinux_core::social::{SteamFamily, SteamFamilyMember, SteamNotification};
 
     const PROFILE_XML: &str = r#"<?xml version="1.0"?><profile>
-        <steamID64>76561198272259682</steamID64>
-        <steamID><![CDATA[Nathan]]></steamID>
+        <steamID64>76561198000000000</steamID64>
+        <steamID><![CDATA[JoueurExemple]]></steamID>
         <onlineState>offline</onlineState>
         <stateMessage><![CDATA[Offline]]></stateMessage>
         <privacyState>public</privacyState>
@@ -4131,8 +4683,8 @@ mod tests {
         <hoursPlayed2Wk>0.0</hoursPlayed2Wk>
         <headline><![CDATA[]]></headline>
         <location><![CDATA[France]]></location>
-        <realname><![CDATA[&lt;Nathan&gt;]]></realname>
-        <customURL><![CDATA[nitioulol]]></customURL>
+        <realname><![CDATA[&lt;Joueur&gt;]]></realname>
+        <customURL><![CDATA[test-user]]></customURL>
         <vacBanned>0</vacBanned>
         <tradeBanState><![CDATA[None]]></tradeBanState>
         <summary><![CDATA[Fan d'<a class="bb_link" href="https://store.steampowered.com/tags/fr/Horreur/">horreur</a> et de zombies.<br>J'aime aussi les jeux cozy.]]></summary>
@@ -4155,15 +4707,15 @@ mod tests {
     #[test]
     fn a_public_profile_is_read_tag_by_tag() {
         let profile = profile_from_xml(PROFILE_XML);
-        assert_eq!(profile.steam_id, "76561198272259682");
-        assert_eq!(profile.name, "Nathan");
+        assert_eq!(profile.steam_id, "76561198000000000");
+        assert_eq!(profile.name, "JoueurExemple");
         assert_eq!(profile.privacy_state, "public");
         assert_eq!(profile.location, "France");
         // Les entités XML sont rendues : un nom ne doit pas s'afficher en
         // `&amp;` ou en `&#39;`.
-        assert_eq!(profile.real_name, "<Nathan>");
+        assert_eq!(profile.real_name, "<Joueur>");
         assert_eq!(profile.avatar_url, "https://avatars.example/medium.jpg");
-        assert_eq!(profile.custom_url, "steamcommunity.com/id/nitioulol");
+        assert_eq!(profile.custom_url, "steamcommunity.com/id/test-user");
     }
 
     /// Texte de la description, les émoticônes écrites `:nom:`.
@@ -4289,7 +4841,10 @@ mod tests {
         assert_eq!(profile.steam_id, "1");
         assert_eq!(profile.privacy_state, "private");
         assert!(profile.name.is_empty());
-        assert_eq!(privacy_label(&profile.privacy_state), "Privé");
+        assert_eq!(
+            privacy_label(&profile.privacy_state),
+            lapinux_core::i18n::t("profile.private")
+        );
     }
 
     #[test]
@@ -4301,13 +4856,13 @@ mod tests {
 
     #[test]
     fn comments_keep_author_date_and_text() {
-        // Extrait réel de la page du profil : le total et les commentaires y
+        // Exemple de page de profil : le total et les commentaires y
         // sont, donc une seule requête suffit.
         let page = r#"
 <div class="commentthread_area">
   <a class="commentthread_allcommentslink" href="https://steamcommunity.com/profiles/1/allcomments">Voir les <span id="commentthread_Profile_1_totalcount">30</span> commentaires</a>
   <div class="commentthread_comments">
-    <div class="commentthread_comment"><div class="commentthread_comment_avatar"><img src="https://avatars.fastly.steamstatic.com/ad5e5c7b447bafa6c4740fc72d391118fe3ebead.jpg"></div><a class="commentthread_author_link" href="https://steamcommunity.com/profiles/76561199001153954"><bdi>Elsiee</bdi></a><div class="commentthread_comment_timestamp" data-timestamp="1786554596">12 Aug</div><div class="commentthread_comment_text" id="comment_content_1">
+    <div class="commentthread_comment"><div class="commentthread_comment_avatar"><img src="https://avatars.example/exemple.jpg"></div><a class="commentthread_author_link" href="https://steamcommunity.com/profiles/76561198000000001"><bdi>JoueurExemple</bdi></a><div class="commentthread_comment_timestamp" data-timestamp="1786554596">12 Aug</div><div class="commentthread_comment_text" id="comment_content_1">
         super <b>jeu</b>&nbsp;! <a class="bb_link" href="https://store.steampowered.com/app/620">Portal 2</a>
     </div></div>
   </div>
@@ -4316,8 +4871,8 @@ mod tests {
         let (total, comments) = comments_from_page(page);
         assert_eq!(total, 30);
         assert_eq!(comments.len(), 1);
-        assert_eq!(comments[0].author, "Elsiee");
-        assert_eq!(comments[0].author_id, 7_656_119_900_115_395_4);
+        assert_eq!(comments[0].author, "JoueurExemple");
+        assert_eq!(comments[0].author_id, 7_656_119_800_000_000_1);
         // Le texte garde son lien, et la photo de l'auteur est retenue.
         assert!(
             comments[0].parts.iter().any(|part| matches!(
@@ -4327,9 +4882,7 @@ mod tests {
             "le lien du commentaire est lisible : {:?}",
             comments[0].parts
         );
-        assert!(comments[0]
-            .avatar
-            .ends_with("ad5e5c7b447bafa6c4740fc72d391118fe3ebead.jpg"));
+        assert!(comments[0].avatar.ends_with("exemple.jpg"));
         assert!(!comments[0].posted.is_empty());
     }
 
@@ -4362,7 +4915,10 @@ mod tests {
             let pixel = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
             let mut bytes = Vec::new();
             image::DynamicImage::ImageRgba8(pixel)
-                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
                 .expect("PNG d'essai");
             bytes
         };
@@ -4395,8 +4951,10 @@ mod tests {
         crate::install_fonts(&ctx);
         let mut profile = sample_profile();
         let (output, _) = page_frame(&ctx, &mut profile, Vec::new());
-        let playing = painted_text(&output, "En jeu").expect("catégorie en jeu");
-        let offline = painted_text(&output, "Hors ligne").expect("catégorie hors ligne");
+        let playing = painted_text(&output, lapinux_core::i18n::t("profile.in_game"))
+            .expect("catégorie en jeu");
+        let offline = painted_text(&output, lapinux_core::i18n::t("profile.offline"))
+            .expect("catégorie hors ligne");
         // Alice joue : sa ligne est là. Bob est absent : sa catégorie attend.
         assert!(painted_text(&output, "Alice").is_some());
         assert!(painted_text(&output, "Bob").is_none());
@@ -4432,7 +4990,7 @@ mod tests {
 
     #[test]
     fn a_steam_id_is_masked_until_asked() {
-        assert_eq!(masked_steam_id("76561198272259682"), "ID 765••••82");
+        assert_eq!(masked_steam_id("76561198000000000"), "ID 765••••00");
         assert_eq!(masked_steam_id("1234"), "ID 1234");
     }
 
@@ -4451,12 +5009,18 @@ mod tests {
             last_logoff: lapinux_core::util::now_unix() - 7200,
             ..SteamFriend::default()
         };
-        assert_eq!(last_seen_line(&friend), "déconnecté il y a 2 h");
+        assert_eq!(
+            last_seen_line(&friend),
+            lapinux_core::i18n::t_fmt("profile.offline_ago", &["2 h".to_string()])
+        );
         let online = SteamFriend {
             presence: SteamPresence::Online,
             ..SteamFriend::default()
         };
-        assert_eq!(last_seen_line(&online), "En ligne");
+        assert_eq!(
+            last_seen_line(&online),
+            lapinux_core::i18n::t("profile.online")
+        );
     }
 
     #[test]
@@ -4465,29 +5029,41 @@ mod tests {
             online_state: "in-game".into(),
             ..SteamProfile::default()
         };
-        assert_eq!(online_label(&profile).1, "En jeu");
+        assert_eq!(
+            online_label(&profile).1,
+            lapinux_core::i18n::t("profile.in_game")
+        );
         profile.online_state = "offline".into();
-        assert_eq!(online_label(&profile).1, "Hors ligne");
-        assert_eq!(format_hours("4.9"), "4,9 h");
-        assert_eq!(format_hours(""), "—");
+        assert_eq!(
+            online_label(&profile).1,
+            lapinux_core::i18n::t("profile.offline")
+        );
+        assert_eq!(
+            format_hours("4.9"),
+            format!("{} h", lapinux_core::i18n::decimal("4.9"))
+        );
+        assert_eq!(
+            format_hours(""),
+            lapinux_core::i18n::t("controllers.information.dash")
+        );
     }
 
     #[test]
     fn a_family_member_without_a_session_name_borrows_the_public_one() {
-        let names = HashMap::from([(7u64, "Elsiee".to_string())]);
+        let names = HashMap::from([(7u64, "JoueurExemple".to_string())]);
         let unknown = SteamFamilyMember {
             steam_id: 7,
             ..SteamFamilyMember::default()
         };
-        assert_eq!(family_member_name(&unknown, &names), "Elsiee");
+        assert_eq!(family_member_name(&unknown, &names), "JoueurExemple");
         // Le nom de la session passe devant, et un membre jamais lu reste vide
         // plutôt que de montrer son identifiant.
         let known = SteamFamilyMember {
             steam_id: 7,
-            name: "Nathan".into(),
+            name: "Alex".into(),
             ..SteamFamilyMember::default()
         };
-        assert_eq!(family_member_name(&known, &names), "Nathan");
+        assert_eq!(family_member_name(&known, &names), "Alex");
         let stranger = SteamFamilyMember {
             steam_id: 9,
             ..SteamFamilyMember::default()
@@ -4498,11 +5074,14 @@ mod tests {
     /// État de page complet : identité, amis, famille, commentaires.
     fn sample_profile() -> Profile {
         let mut profile = Profile::new();
-        profile.profile = Some(profile_from_xml(PROFILE_XML));
+        let mut identity = profile_from_xml(PROFILE_XML);
+        identity.name = "Alex".into();
+        identity.real_name = "<Alex>".into();
+        profile.profile = Some(identity);
         profile.comments = Some((
             30,
             vec![CommentView {
-                author: "Elsiee".into(),
+                author: "JoueurExemple".into(),
                 posted: "12 Aug".into(),
                 parts: vec![DescriptionPart::Text("super jeu".into())],
                 ..CommentView::default()
@@ -4513,17 +5092,17 @@ mod tests {
         // publique (déjà lue ici).
         profile
             .family_profiles_asked
-            .extend([7_656_119_827_225_968_2, 7_656_119_900_115_395_4]);
+            .extend([7_656_119_800_000_000_2, 7_656_119_800_000_000_1]);
         profile
             .friend_avatar_pending
-            .extend([7_656_119_827_225_968_2, 7_656_119_900_115_395_4]);
+            .extend([7_656_119_800_000_000_2, 7_656_119_800_000_000_1]);
         profile
             .family_names
-            .insert(7_656_119_900_115_395_4, "Elsiee".into());
+            .insert(7_656_119_800_000_000_1, "JoueurExemple".into());
         profile.set_social(Some(SteamSocial {
             state: "live".into(),
-            persona_name: "Nathan".into(),
-            steam_id: 7_656_119_827_225_968_2,
+            persona_name: "Alex".into(),
+            steam_id: 7_656_119_800_000_000_2,
             friends: vec![
                 SteamFriend {
                     steam_id: 1,
@@ -4540,14 +5119,18 @@ mod tests {
                     ..SteamFriend::default()
                 },
             ],
-            notifications: vec![SteamNotification { kind: 2, count: 1 }],
+            notifications: vec![SteamNotification {
+                kind: 2,
+                count: 1,
+                at: 0,
+            }],
             new_comments: 2,
             family: Some(SteamFamily {
                 name: "Maison".into(),
                 members: vec![
                     SteamFamilyMember {
-                        steam_id: 7_656_119_827_225_968_2,
-                        name: "Nathan".into(),
+                        steam_id: 7_656_119_800_000_000_2,
+                        name: "Alex".into(),
                         role: 1,
                         is_self: true,
                         avatar: String::new(),
@@ -4555,7 +5138,7 @@ mod tests {
                         ..SteamFamilyMember::default()
                     },
                     SteamFamilyMember {
-                        steam_id: 7_656_119_900_115_395_4,
+                        steam_id: 7_656_119_800_000_000_1,
                         role: 2,
                         games: 3,
                         ..SteamFamilyMember::default()
@@ -4575,7 +5158,7 @@ mod tests {
         vec![
             PlatformEntry {
                 platform: Platform::Steam,
-                account: "Nathan".into(),
+                account: "Alex".into(),
                 connected: true,
             },
             PlatformEntry {
@@ -4608,10 +5191,153 @@ mod tests {
         ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.set_width(width);
-                let actions = profile.page(ui, "Nathan", &sample_platforms(), &mut |_| {}, &mut |_| {});
+                let actions =
+                    profile.page(ui, "Alex", &sample_platforms(), &mut |_| {}, &mut |_| {});
                 assert!(actions.is_empty());
             });
         })
+    }
+
+    /// Rend la page et renvoie ses actions. Un libellé fourni est cliqué
+    /// (appui puis relâchement) dans la même session egui : c'est le chemin
+    /// qu'emprunte un vrai clic dans la page sociale.
+    fn render_profile_page_actions(
+        profile: &mut Profile,
+        width: f32,
+        click: Option<&str>,
+    ) -> (egui::FullOutput, Vec<ProfileAction>) {
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width + 40.0, 1600.0));
+        let mut frame = |input: egui::RawInput| {
+            let mut actions = Vec::new();
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(width);
+                    actions =
+                        profile.page(ui, "Alex", &sample_platforms(), &mut |_| {}, &mut |_| {});
+                });
+            });
+            (output, actions)
+        };
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(screen);
+        let (output, actions) = frame(input);
+        let Some(label) = click else {
+            return (output, actions);
+        };
+        let Some(rect) = painted_text(&output, label) else {
+            return (output, actions);
+        };
+        let pos = rect.center();
+        let mut press = egui::RawInput::default();
+        press.screen_rect = Some(screen);
+        press.events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ];
+        let _ = frame(press);
+        let mut release = egui::RawInput::default();
+        release.screen_rect = Some(screen);
+        release.events = vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }];
+        frame(release)
+    }
+
+    /// Une invitation avec adresse affiche son bouton, et le clic produit la
+    /// rejointe avec l'appid, le lobby et l'adresse du registre.
+    #[test]
+    fn a_lobby_invite_shows_a_join_button_and_its_click_joins() {
+        let mut profile = sample_profile();
+        let mut social = SteamSocial {
+            state: "live".into(),
+            ..SteamSocial::default()
+        };
+        social.invites = vec![lapinux_core::social::SteamLobbyInvite {
+            appid: 4_670_920,
+            lobby: 109_775_240_000_000_001,
+            inviter: 76_561_198_000_000_001,
+            inviter_name: Some("JoueurExemple".into()),
+            connect: Some("192.168.1.50:7777".into()),
+        }];
+        profile.social = Some(social);
+        let (output, without_click) = render_profile_page_actions(&mut profile, 1200.0, None);
+        assert!(without_click.is_empty(), "aucune action sans clic");
+        assert!(
+            painted_text(&output, lapinux_core::i18n::t("profile.join")).is_some(),
+            "le bouton Rejoindre sort du rendu de la page sociale"
+        );
+        assert!(
+            painted_text(
+                &output,
+                &lapinux_core::i18n::t_args("profile.invite_lobby", &[("who", "JoueurExemple")]),
+            )
+            .is_some(),
+            "l'invitation nomme l'ami qui invite"
+        );
+        let (_, actions) = render_profile_page_actions(
+            &mut profile,
+            1200.0,
+            Some(lapinux_core::i18n::t("profile.join")),
+        );
+        assert_eq!(actions.len(), 1, "un clic, une action");
+        match &actions[0] {
+            ProfileAction::JoinInvite {
+                appid,
+                lobby,
+                connect,
+            } => {
+                assert_eq!(*appid, 4_670_920);
+                assert_eq!(*lobby, 109_775_240_000_000_001);
+                assert_eq!(connect, "192.168.1.50:7777");
+            }
+            _ => panic!("action inattendue : le clic doit rejoindre le lobby"),
+        }
+    }
+
+    /// Sans adresse, le bouton reste offert : la rejointe la demandera au
+    /// lobby, et la requête part sans adresse préalable.
+    #[test]
+    fn without_an_address_the_join_button_asks_the_lobby_for_one() {
+        let mut profile = sample_profile();
+        let mut social = SteamSocial {
+            state: "live".into(),
+            ..SteamSocial::default()
+        };
+        social.invites = vec![lapinux_core::social::SteamLobbyInvite {
+            appid: 4_670_920,
+            lobby: 109_775_240_000_000_001,
+            inviter: 76_561_198_000_000_001,
+            inviter_name: None,
+            connect: None,
+        }];
+        profile.social = Some(social);
+        let (output, actions) = render_profile_page_actions(
+            &mut profile,
+            1200.0,
+            Some(lapinux_core::i18n::t("profile.join")),
+        );
+        assert!(
+            painted_text(&output, lapinux_core::i18n::t("profile.lobby_address")).is_some(),
+            "la découverte de l'adresse est annoncée"
+        );
+        assert_eq!(actions.len(), 1, "le clic émet la rejointe");
+        match &actions[0] {
+            ProfileAction::JoinInvite { lobby, connect, .. } => {
+                assert_eq!(*lobby, 109_775_240_000_000_001);
+                assert!(connect.is_empty(), "l'adresse sera demandée au lobby");
+            }
+            _ => panic!("action inattendue : le clic doit rejoindre le lobby"),
+        }
     }
 
     /// Rectangle d'un texte peint : la mise en page se vérifie sans la voir.
@@ -4684,15 +5410,13 @@ mod tests {
         fn find(shape: &egui::Shape, label: &str, left: f32, right: f32) -> Option<egui::Rect> {
             match shape {
                 egui::Shape::Text(text)
-                    if text.galley.text() == label
-                        && text.pos.x >= left
-                        && text.pos.x <= right =>
+                    if text.galley.text() == label && text.pos.x >= left && text.pos.x <= right =>
                 {
                     Some(egui::Rect::from_min_size(text.pos, text.galley.rect.size()))
                 }
-                egui::Shape::Vec(shapes) => {
-                    shapes.iter().find_map(|shape| find(shape, label, left, right))
-                }
+                egui::Shape::Vec(shapes) => shapes
+                    .iter()
+                    .find_map(|shape| find(shape, label, left, right)),
                 _ => None,
             }
         }
@@ -4707,10 +5431,13 @@ mod tests {
         fn walk(shape: &egui::Shape, marks: &mut Vec<egui::Rect>) {
             match shape {
                 egui::Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default() => {
-                    marks.push(mesh.vertices.iter().fold(
-                        egui::Rect::NOTHING,
-                        |rect, vertex| rect.union(egui::Rect::from_min_max(vertex.pos, vertex.pos)),
-                    ));
+                    marks.push(
+                        mesh.vertices
+                            .iter()
+                            .fold(egui::Rect::NOTHING, |rect, vertex| {
+                                rect.union(egui::Rect::from_min_max(vertex.pos, vertex.pos))
+                            }),
+                    );
                 }
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
@@ -4733,7 +5460,8 @@ mod tests {
     fn the_platforms_list_sits_on_the_left_of_the_steam_page() {
         let mut profile = sample_profile();
         let output = render_profile_page(&mut profile, 1200.0);
-        let list = painted_text(&output, "Plateformes").expect("le titre de la liste");
+        let list = painted_text(&output, lapinux_core::i18n::t("ui.profile_platforms"))
+            .expect("le titre de la liste");
         assert!(
             list.left() < PLATFORM_SIDE,
             "la liste est à gauche (x = {})",
@@ -4750,14 +5478,14 @@ mod tests {
             "le pseudo masqué s'écrit sous le nom"
         );
         assert!(
-            painted_text_in(&output, "Nathan", 0.0, PLATFORM_SIDE).is_none(),
+            painted_text_in(&output, "Alex", 0.0, PLATFORM_SIDE).is_none(),
             "le pseudo ne doit pas fuiter"
         );
         // L'œil de la ligne le dévoile.
         profile.revealed_accounts.insert(Platform::Steam);
         let output = render_profile_page(&mut profile, 1200.0);
         assert!(
-            painted_text_in(&output, "Nathan", 0.0, PLATFORM_SIDE).is_some(),
+            painted_text_in(&output, "Alex", 0.0, PLATFORM_SIDE).is_some(),
             "l'œil dévoile le compte"
         );
         // Le logo est dans sa tuile, sous le titre de la liste.
@@ -4767,7 +5495,8 @@ mod tests {
             .expect("le logo Steam de la liste");
         assert!(mark.width() > 12.0, "le logo est peint à taille lisible");
         // La fiche Steam commence à droite de la liste.
-        let bio = painted_text(&output, "Membre depuis").expect("fiche dessinée");
+        let bio = painted_text(&output, lapinux_core::i18n::t("profile.member_since"))
+            .expect("fiche dessinée");
         assert!(
             bio.left() >= PLATFORM_SIDE,
             "la fiche commence à droite de la liste (x = {})",
@@ -4780,8 +5509,10 @@ mod tests {
     fn a_narrow_window_stacks_the_list_over_the_page() {
         let mut profile = sample_profile();
         let output = render_profile_page(&mut profile, 700.0);
-        let list = painted_text(&output, "Plateformes").expect("le titre de la liste");
-        let bio = painted_text(&output, "Membre depuis").expect("fiche dessinée");
+        let list = painted_text(&output, lapinux_core::i18n::t("ui.profile_platforms"))
+            .expect("le titre de la liste");
+        let bio = painted_text(&output, lapinux_core::i18n::t("profile.member_since"))
+            .expect("fiche dessinée");
         assert!(
             list.left() < 200.0,
             "la liste reste à gauche (x = {})",
@@ -4801,7 +5532,11 @@ mod tests {
         let output = render_profile_page(&mut profile, 1240.0);
         // Le titre n'est plus poussé contre le bord droit : la ligne se lit
         // « Joue à … », juste après le pseudo et la capsule.
-        let line = painted_text(&output, "Joue à Portal 2").expect("ligne de jeu dessinée");
+        let line = painted_text(
+            &output,
+            &lapinux_core::i18n::t_args("profile.playing", &[("title", "Portal 2")]),
+        )
+        .expect("ligne de jeu dessinée");
         let name = painted_text_in(&output, "Alice", PLATFORM_SIDE, f32::INFINITY)
             .expect("nom de l'ami dessiné");
         assert!(
@@ -4816,12 +5551,127 @@ mod tests {
         let mut profile = sample_profile();
         let output = render_profile_page(&mut profile, 1240.0);
         assert!(
-            painted_text(&output, "42 jeux").is_some(),
+            painted_text(
+                &output,
+                &lapinux_core::i18n::t_fmt("profile.games_count", &["42".to_string()])
+            )
+            .is_some(),
             "le compte du compte connecté doit être écrit"
         );
         assert!(
-            painted_text(&output, "3 jeux").is_some(),
+            painted_text(
+                &output,
+                &lapinux_core::i18n::t_fmt("profile.games_count", &["3".to_string()])
+            )
+            .is_some(),
             "le compte du second membre doit être écrit"
+        );
+    }
+
+    #[test]
+    fn clicking_a_family_count_selects_the_member_for_the_shared_games_modal() {
+        let mut profile = sample_profile();
+        let count = lapinux_core::i18n::t_fmt("profile.games_count", &["3".to_string()]);
+        let (_, actions) = render_profile_page_actions(&mut profile, 1240.0, Some(&count));
+        assert!(actions.is_empty());
+        assert_eq!(profile.family_games, Some(7_656_119_800_000_000_1));
+    }
+
+    #[test]
+    fn shared_games_keep_their_appid_and_use_the_catalog_name() {
+        let catalog = lapinux_core::model::SteamCatalog {
+            entries: vec![lapinux_core::model::SteamCatalogGame {
+                appid: 620,
+                name: "Portal 2".into(),
+                installed: false,
+                family: false,
+                details: Default::default(),
+                dlc: Vec::new(),
+                acquired: None,
+                undated_reason: None,
+                minutes: None,
+            }],
+            ..Default::default()
+        };
+        let games = family_games(&[999, 620], Some(&catalog));
+        assert_eq!(games[0].appid, 999);
+        assert_eq!(games[0].name, "App 999");
+        assert_eq!(games[1].appid, 620);
+        assert_eq!(games[1].name, "Portal 2");
+    }
+
+    #[test]
+    fn the_family_games_modal_lists_the_shared_games_by_name() {
+        let mut profile = sample_profile();
+        if let Some(family) = profile
+            .social
+            .as_mut()
+            .and_then(|social| social.family.as_mut())
+        {
+            family.members[1].appids = vec![620, 4000];
+        }
+        profile.family_games = Some(7_656_119_800_000_000_1);
+        let catalog_game = |appid, name: &str| lapinux_core::model::SteamCatalogGame {
+            appid,
+            name: name.into(),
+            installed: false,
+            family: false,
+            details: Default::default(),
+            dlc: Vec::new(),
+            acquired: None,
+            undated_reason: None,
+            minutes: None,
+        };
+        let catalog = lapinux_core::model::SteamCatalog {
+            entries: vec![
+                catalog_game(620, "Portal 2"),
+                catalog_game(4000, "Garry's Mod"),
+            ],
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        // Une fenêtre egui prend sa taille au premier passage ; le second
+        // la peint avec son contenu, comme les images suivantes de l'app.
+        let mut run = || {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            ));
+            ctx.run(input, |ctx| {
+                profile.family_games_modal(ctx, Some(&catalog));
+            })
+        };
+        let _ = run();
+        let output = run();
+        let portal = painted_text(&output, "Portal 2").expect("Portal 2 absent du modal");
+        assert!(
+            painted_text(&output, "Garry's Mod").is_some(),
+            "Garry's Mod absent du modal"
+        );
+        assert!(
+            portal.left() < 360.0,
+            "le titre doit rester à gauche de sa vignette (x = {})",
+            portal.left()
+        );
+        assert!(
+            painted_text(
+                &output,
+                &lapinux_core::i18n::t_fmt("profile.family_games_count", &["2".to_string()]),
+            )
+            .is_some(),
+            "le compte du modal est absent"
+        );
+        let title =
+            lapinux_core::i18n::t_args("profile.family_games_title", &[("name", "JoueurExemple")]);
+        assert!(
+            painted_text(&output, &title).is_some(),
+            "le titre doit nommer le membre"
+        );
+        assert!(
+            painted_text(&output, "{name}").is_none(),
+            "le titre ne doit plus garder le gabarit"
         );
     }
 
@@ -4831,9 +5681,9 @@ mod tests {
         profile.tab = ProfileTab::Achats;
         let output = render_profile_page(&mut profile, 1240.0);
         // Les deux onglets sont là, et celui des achats est ouvert.
-        assert!(painted_text(&output, "Profil").is_some());
-        assert!(painted_text(&output, "Achats").is_some());
-        assert!(painted_text(&output, "Activer un jeu").is_some());
+        assert!(painted_text(&output, lapinux_core::i18n::t("profile.tab_profile")).is_some());
+        assert!(painted_text(&output, lapinux_core::i18n::t("profile.tab_purchases")).is_some());
+        assert!(painted_text(&output, lapinux_core::i18n::t("profile.activate_game")).is_some());
         // Plus d'historique : Steam n'aime pas qu'on relise ses licences.
         assert!(
             painted_text(&output, "Historique des achats").is_none(),
@@ -4857,21 +5707,32 @@ mod tests {
     fn the_family_card_sits_beside_the_bio_on_a_wide_page() {
         let mut profile = sample_profile();
         let narrow = render_profile_page(&mut profile, 680.0);
-        let family = painted_text(&narrow, "Famille Steam").expect("encart famille dessiné");
+        let family = painted_text(&narrow, lapinux_core::i18n::t("ui.profile_family"))
+            .expect("encart famille dessiné");
         // Étroit : les encarts s'empilent, la famille reste dans la colonne.
-        assert!(family.left() < 680.0 * 0.5, "famille empilée (x = {})", family.left());
+        assert!(
+            family.left() < 680.0 * 0.5,
+            "famille empilée (x = {})",
+            family.left()
+        );
 
         // Large : la liste des plateformes prend sa colonne, la fiche garde
         // celle qui reste — assez pour la bio et la famille côte à côte.
         let wide = render_profile_page(&mut profile, 1240.0);
-        let family = painted_text(&wide, "Famille Steam").expect("encart famille dessiné");
-        let bio = painted_text(&wide, "Membre depuis").expect("bio dessinée");
+        let family = painted_text(&wide, lapinux_core::i18n::t("ui.profile_family"))
+            .expect("encart famille dessiné");
+        let bio = painted_text(&wide, lapinux_core::i18n::t("profile.member_since"))
+            .expect("bio dessinée");
         assert!(
             family.left() > 1240.0 * 0.5,
             "famille à droite (x = {})",
             family.left()
         );
-        assert!(bio.left() < 1240.0 * 0.5, "bio à gauche (x = {})", bio.left());
+        assert!(
+            bio.left() < 1240.0 * 0.5,
+            "bio à gauche (x = {})",
+            bio.left()
+        );
         // La famille commence en haut de page, à côté de la bio : empilée,
         // elle n'apparaîtrait qu'après tout l'encart d'identité.
         assert!(
@@ -4901,7 +5762,8 @@ mod tests {
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.set_width(1100.0);
-                    actions = profile.page(ui, "Nathan", &sample_platforms(), &mut |_| {}, &mut |_| {});
+                    actions =
+                        profile.page(ui, "Alex", &sample_platforms(), &mut |_| {}, &mut |_| {});
                 });
             },
         );
@@ -4936,10 +5798,11 @@ mod tests {
         crate::apply_theme(&ctx);
         let mut profile = sample_profile();
         let (output, _) = page_frame(&ctx, &mut profile, Vec::new());
-        let header = painted_text_trimmed(&output, "En ligne").expect("menu d'état dessiné");
+        let header = painted_text_trimmed(&output, lapinux_core::i18n::t("profile.online"))
+            .expect("menu d'état dessiné");
         // Le compte s'écrit aussi dans la liste des plateformes : c'est le nom
         // de la fiche qui compte ici, donc celui à droite de cette liste.
-        let name = painted_text_in(&output, "Nathan", PLATFORM_SIDE, f32::INFINITY)
+        let name = painted_text_in(&output, "Alex", PLATFORM_SIDE, f32::INFINITY)
             .expect("nom dessiné dans la fiche");
         assert!(
             header.left() > name.right(),
@@ -4953,17 +5816,19 @@ mod tests {
         );
         // Le point vit dans le bouton, au bord gauche du libellé qu'il précède.
         assert!(
-            painted_dots(&output).iter().any(|(center, radius)| *radius <= 4.0
-                && (center.y - header.center().y).abs() < 4.0
-                && center.x >= header.left() - 2.0
-                && center.x < header.left() + 24.0),
+            painted_dots(&output)
+                .iter()
+                .any(|(center, radius)| *radius <= 4.0
+                    && (center.y - header.center().y).abs() < 4.0
+                    && center.x >= header.left() - 2.0
+                    && center.x < header.left() + 24.0),
             "le point d'état est peint dans le menu"
         );
         assert!(painted_text(&output, "Statut Steam").is_none());
         // Plus d'étiquette de session à côté du menu.
         assert!(painted_text(&output, "· Lapinux").is_none());
         // Le nom réel, puis sa visibilité à sa droite, sur la ligne du dessous.
-        let real = painted_text(&output, "<Nathan>").expect("nom réel");
+        let real = painted_text(&output, "<Alex>").expect("nom réel");
         let privacy = painted_text(&output, "· Public").expect("visibilité");
         assert!(
             privacy.left() > real.right(),
@@ -5000,11 +5865,11 @@ mod tests {
         profile.profile = Some(profile_from_xml(PROFILE_XML));
         let (output, _) = page_frame(&ctx, &mut profile, Vec::new());
         assert!(
-            painted_text(&output, "Chargement des vitrines…").is_some(),
+            painted_text(&output, lapinux_core::i18n::t("profile.showcases_loading")).is_some(),
             "la carte des vitrines attend son tour"
         );
         assert!(
-            painted_text(&output, "Chargement des commentaires…").is_some(),
+            painted_text(&output, lapinux_core::i18n::t("profile.comments_loading")).is_some(),
             "la carte des commentaires attend son tour"
         );
     }
@@ -5017,13 +5882,13 @@ mod tests {
         let output = render_profile_page(&mut profile, 1240.0);
         // L'identifiant se montre masqué : de quoi le reconnaître, pas de
         // quoi l'étaler.
-        let id = painted_text(&output, "ID 765••••82").expect("identifiant masqué");
+        let id = painted_text(&output, "ID 765••••00").expect("identifiant masqué");
         assert!(
-            painted_text(&output, "76561198272259682").is_none(),
+            painted_text(&output, "76561198000000000").is_none(),
             "l'identifiant complet reste hors de la page"
         );
         // Il partage la ligne du nom, pas une ligne au-dessus.
-        let name = painted_text(&output, "Nathan").expect("nom du compte");
+        let name = painted_text(&output, "Alex").expect("nom du compte");
         assert!(
             id.top() <= name.top() + 1.0,
             "l'identifiant reste à la hauteur du nom ({} vs {})",
@@ -5031,7 +5896,8 @@ mod tests {
             name.top()
         );
         // Et il occupe bien le bord droit de la fiche.
-        let facts = painted_text(&output, "Membre depuis").expect("fiche dessinée");
+        let facts = painted_text(&output, lapinux_core::i18n::t("profile.member_since"))
+            .expect("fiche dessinée");
         assert!(
             id.left() > facts.center().x,
             "l'identifiant reste dans la moitié droite ({} vs {})",
@@ -5046,10 +5912,14 @@ mod tests {
     fn the_board_splits_identity_comments_from_family_friends() {
         let mut profile = sample_profile();
         let output = render_profile_page(&mut profile, 1240.0);
-        let identity = painted_text(&output, "Membre depuis").expect("fiche dessinée");
-        let comments = painted_text(&output, "Commentaires").expect("commentaires dessinés");
-        let family = painted_text(&output, "Famille Steam").expect("famille dessinée");
-        let friends = painted_text(&output, "Amis").expect("amis dessinés");
+        let identity = painted_text(&output, lapinux_core::i18n::t("profile.member_since"))
+            .expect("fiche dessinée");
+        let comments = painted_text(&output, lapinux_core::i18n::t("ui.profile_comments"))
+            .expect("commentaires dessinés");
+        let family = painted_text(&output, lapinux_core::i18n::t("ui.profile_family"))
+            .expect("famille dessinée");
+        let friends =
+            painted_text(&output, lapinux_core::i18n::t("friends.title")).expect("amis dessinés");
         assert!(
             (comments.left() - identity.left()).abs() < 2.0,
             "les commentaires restent dans la colonne de la fiche (x = {})",
@@ -5163,6 +6033,30 @@ mod tests {
 
     /// Texte peint, cherché par morceau : les messages de la bannière portent
     /// un compte à rebours, on ne peut pas les comparer à l'identique.
+    /// Tout le texte peint, concaténé : une phrase coupée en lignes reste
+    /// lisible d'un bloc pour les assertions.
+    fn all_text(output: &egui::FullOutput) -> String {
+        fn walk(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push(' ');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
     fn any_text(output: &egui::FullOutput, needle: &str) -> bool {
         fn walk(shape: &egui::Shape, needle: &str) -> bool {
             match shape {
@@ -5185,7 +6079,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::install_fonts(&ctx);
         let mut profile = Profile::new();
-        profile.loaded_for = Some(7_656_119_827_225_968_2);
+        profile.loaded_for = Some(7_656_119_800_000_000_2);
         let (tx, rx) = mpsc::channel();
         profile.rx = Some(rx);
         tx.send(ProfileMsg::Failed(FetchError {
@@ -5207,11 +6101,17 @@ mod tests {
         assert!(profile.retry_at.is_some(), "l'essai attend son tour");
         let output = render_profile_page(&mut profile, 680.0);
         assert!(
-            painted_text(&output, "Réessayer").is_some(),
+            painted_text(&output, lapinux_core::i18n::t("configurations.retry")).is_some(),
             "la bannière laisse relancer tout de suite"
         );
         assert!(
-            any_text(&output, "Steam limite le débit"),
+            any_text(
+                &output,
+                lapinux_core::i18n::t("profile.rate_limited")
+                    .split(';')
+                    .next()
+                    .unwrap(),
+            ),
             "la bannière nomme la limite de débit et annonce l'essai"
         );
     }
@@ -5222,7 +6122,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::install_fonts(&ctx);
         let mut profile = Profile::new();
-        profile.loaded_for = Some(7_656_119_827_225_968_2);
+        profile.loaded_for = Some(7_656_119_800_000_000_2);
         let (tx, rx) = mpsc::channel();
         profile.rx = Some(rx);
         tx.send(ProfileMsg::Failed(FetchError::new(
@@ -5233,9 +6133,17 @@ mod tests {
         assert!(!profile.rate_limited);
         assert!(profile.retry_at.is_none(), "aucun essai automatique");
         let output = render_profile_page(&mut profile, 680.0);
+        let painted = all_text(&output)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expected = lapinux_core::i18n::t("ui.profile_steamid_required")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            any_text(&output, "connectez le compte"),
-            "une panne de réseau garde l'aide sur le compte"
+            painted.contains(&expected),
+            "une panne de réseau garde l'aide sur le compte : {painted}"
         );
     }
 
@@ -5267,8 +6175,7 @@ mod tests {
                 );
             }
         });
-        let error = get_text(&format!("http://{address}/"))
-            .expect_err("un 429 refuse la page");
+        let error = get_text(&format!("http://{address}/")).expect_err("un 429 refuse la page");
         assert!(error.rate_limited, "429 = limite de débit, pas une panne");
         server.join().expect("serveur local");
     }

@@ -36,8 +36,7 @@ impl Catalogue {
     /// fabrication : le programme s'arrête au premier libellé demandé, avec la
     /// clé fautive, plutôt que d'afficher des clés brutes.
     fn parse(source: &str) -> Self {
-        let value: toml::Value =
-            toml::from_str(source).expect("catalogue de langue illisible");
+        let value: toml::Value = toml::from_str(source).expect("catalogue de langue illisible");
         let mut entries = HashMap::new();
         flatten("", &value, &mut entries);
         Self { entries }
@@ -82,6 +81,39 @@ static CATALOGUES: LazyLock<Vec<(&'static str, Catalogue)>> = LazyLock::new(|| {
 
 /// Indice de la langue active dans `SOURCES`.
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
+
+/// Langue imposée au démarrage par l'environnement, pour lancer toute la
+/// suite de tests dans une langue donnée (`LAPINUX_LANG=en`). Une valeur
+/// inconnue est ignorée : la langue de repli reste le français.
+static ENV_LANGUAGE: std::sync::Once = std::sync::Once::new();
+
+fn apply_env_language() -> bool {
+    ENV_LANGUAGE.call_once(|| {
+        if let Ok(code) = std::env::var("LAPINUX_LANG") {
+            if let Some(index) = index_of(&normalize(&code)) {
+                ACTIVE.store(index, Ordering::Relaxed);
+            }
+        }
+    });
+    std::env::var_os("LAPINUX_LANG").is_some()
+}
+
+fn apply_env_override() -> bool {
+    apply_env_language()
+}
+
+/// Les tests changent la langue globale : sans verrou, deux tests qui la
+/// règlent en même temps se marchent dessus. En production, seul le fil de
+/// configuration appelle `set`, une fois au démarrage et à chaque sauvegarde.
+#[cfg(test)]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_language() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn catalogue(code: &str) -> Option<&'static Catalogue> {
     CATALOGUES
@@ -140,6 +172,22 @@ pub fn normalize(code: &str) -> String {
 /// Installe la langue active. Appelé au démarrage et à chaque configuration
 /// enregistrée. Une langue inconnue laisse la langue courante en place.
 pub fn set(code: &str) {
+    // `LAPINUX_LANG` fige la langue : une suite de tests peut ainsi tourner
+    // entièrement en anglais sans qu'une configuration chargée en cours de
+    // route ne la ramène au français.
+    if apply_env_override() {
+        return;
+    }
+    if let Some(index) = index_of(&normalize(code)) {
+        ACTIVE.store(index, Ordering::Relaxed);
+    }
+}
+
+/// Variante de test : installe une langue même quand `LAPINUX_LANG` fige la
+/// langue de la suite. Réservée aux tests du module, qui vérifient les deux
+/// catalogues et doivent pouvoir basculer entre eux.
+#[cfg(test)]
+fn set_forced(code: &str) {
     if let Some(index) = index_of(&normalize(code)) {
         ACTIVE.store(index, Ordering::Relaxed);
     }
@@ -147,6 +195,7 @@ pub fn set(code: &str) {
 
 /// Code de la langue active (`fr`, `en`).
 pub fn active() -> &'static str {
+    apply_env_language();
     SOURCES[usize::from(ACTIVE.load(Ordering::Relaxed))].0
 }
 
@@ -178,6 +227,23 @@ pub fn t_args(key: &'static str, args: &[(&str, &str)]) -> String {
     text
 }
 
+/// Libellé avec ses valeurs positionnelles : chaque `{}` de la phrase est
+/// remplacé, dans l'ordre, par un des textes déjà formatés de `args`.
+///
+/// Sert aux messages qui mêlent une phrase traduite et des valeurs
+/// (compteur, nom de fichier) sans jamais concaténer de grammaire à la main :
+/// l'ordre des trous appartient au catalogue, pas au code.
+pub fn t_fmt(key: &'static str, args: &[String]) -> String {
+    let mut text = t(key).to_string();
+    for value in args {
+        match text.find("{}") {
+            Some(at) => text.replace_range(at..at + 2, value),
+            None => break,
+        }
+    }
+    text
+}
+
 /// Libellé d'une clé dans une langue donnée, avec le même repli que [`t`].
 /// Sert aux tests et aux outils qui affichent une langue précise.
 pub fn t_in(code: &str, key: &'static str) -> &'static str {
@@ -186,7 +252,6 @@ pub fn t_in(code: &str, key: &'static str) -> &'static str {
         .or_else(|| catalogue(SOURCE).and_then(|catalogue| catalogue.get(key)))
         .unwrap_or(key)
 }
-
 
 /// Ponctuation décimale de la langue active : virgule en français, point
 /// ailleurs. Le nombre ne change pas, seul le séparateur suit la langue.
@@ -278,44 +343,52 @@ mod tests {
 
     #[test]
     fn une_cle_traduite_suit_la_langue_active() {
-        set("fr");
+        let _language = lock_language();
+        let previous = active().to_string();
+        set_forced("fr");
         assert_eq!(t("page.library"), "Bibliothèque");
-        set("en");
+        set_forced("en");
         assert_eq!(t("page.library"), "Library");
         assert_eq!(active(), "en");
         // La langue de départ des tests ne doit pas dépendre de la locale du
         // bureau : on remet le français, langue des autres tests d'interface.
-        set("fr");
+        set_forced("fr");
     }
 
     #[test]
     fn une_cle_inconnue_rend_la_cle() {
-        set("fr");
+        let _language = lock_language();
+        let previous = active().to_string();
+        set_forced("fr");
         assert_eq!(t("cle.inexistante"), "cle.inexistante");
     }
 
     #[test]
     fn les_nombres_suivent_la_langue() {
-        set("fr");
+        let _language = lock_language();
+        let previous = active().to_string();
+        set_forced("fr");
         assert_eq!(decimal("12.5"), "12,5");
-        set("en");
+        set_forced("en");
         assert_eq!(decimal("12.5"), "12.5");
-        set("fr");
+        set_forced("fr");
     }
 
     #[test]
     fn les_valeurs_remplissent_les_placeholders() {
-        set("fr");
+        let _language = lock_language();
+        let previous = active().to_string();
+        set_forced("fr");
         assert_eq!(
             t_args("library.filter.installed", &[("installed", "12")]),
             "Installés · 12"
         );
-        set("en");
+        set_forced("en");
         assert_eq!(
             t_args("library.filter.installed", &[("installed", "12")]),
             "Installed · 12"
         );
-        set("fr");
+        set_forced("fr");
     }
 
     #[test]
@@ -368,6 +441,10 @@ mod tests {
             .collect();
         missing.sort();
         missing.dedup();
-        assert!(missing.is_empty(), "clés inconnues :\n{}", missing.join("\n"));
+        assert!(
+            missing.is_empty(),
+            "clés inconnues :\n{}",
+            missing.join("\n")
+        );
     }
 }

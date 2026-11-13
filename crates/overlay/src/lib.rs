@@ -24,4 +24,4 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub use menu::{Action, Item, MenuState, ITEMS};
 pub use toast::{run as run_toast, ToastOptions};
-pub use wayland::{run, OverlayOptions};
+pub use wayland::{run, ActionFailed, OverlayOptions};

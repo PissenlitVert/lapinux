@@ -51,12 +51,8 @@ impl Store {
     /// Ce que la boutique vend, en une phrase.
     pub fn tagline(self) -> &'static str {
         match self {
-            Store::Steam => {
-                "La plus grande boutique de jeux PC : soldes, atelier et multijoueur."
-            }
-            Store::Epic => {
-                "Jeux gratuits chaque semaine, exclusivités et Unreal Engine."
-            }
+            Store::Steam => "La plus grande boutique de jeux PC : soldes, atelier et multijoueur.",
+            Store::Epic => "Jeux gratuits chaque semaine, exclusivités et Unreal Engine.",
             Store::Gog => "Jeux sans DRM, classiques remis au goût du jour et cloud Galaxy.",
             Store::Itch => "Jeux indépendants, prototypes et assets, souvent à prix libre.",
         }
@@ -182,6 +178,32 @@ impl StoreAccount {
     }
 }
 
+/// Une notification personnelle publiée par une boutique hors Steam.
+///
+/// Le titre porte le nom de la personne concernée ; `detail` dit ce qui
+/// attend le joueur. itch.io n'en publie aucune dans son API, le daemon
+/// répond alors par une note explicite.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoreNotification {
+    pub store: Store,
+    /// Type de la notification (`friend_request` pour les demandes d'ami).
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+}
+
+/// Ce qu'une boutique a répondu pour ses notifications personnelles.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoreNotifications {
+    pub store: Store,
+    pub connected: bool,
+    pub notifications: Vec<StoreNotification>,
+    /// Compte non branché, API sans notifications, ou refus du service.
+    pub note: String,
+}
+
 /// Un jeu possédé dans une boutique : ce que la bibliothèque affiche avant
 /// toute installation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +219,14 @@ pub struct StoreGame {
     pub cover: String,
     /// Plateformes publiées (`linux`, `windows`, `macos`).
     pub platforms: Vec<String>,
+    /// Jeu également publié sur mobile (Android/iOS) : le filtre de la
+    /// bibliothèque peut le masquer ou ne garder que lui.
+    #[serde(default)]
+    pub mobile: bool,
+    /// Plateformes mobiles publiées (`android`, `ios`), séparées des versions
+    /// de bureau : elles s'affichent en badges et ne s'installent pas ici.
+    #[serde(default)]
+    pub mobile_platforms: Vec<String>,
     /// Espace de noms Epic (le « sandbox »), sans lequel les succès et les
     /// sauvegardes ne se nomment pas. Vide pour les autres boutiques.
     #[serde(default)]
@@ -260,6 +290,8 @@ impl Default for StoreGame {
             name: String::new(),
             cover: String::new(),
             platforms: Vec::new(),
+            mobile: false,
+            mobile_platforms: Vec::new(),
             namespace: String::new(),
             catalog_item: String::new(),
             size: None,
@@ -296,6 +328,10 @@ pub struct StoreDetails {
     /// Visuel large de la fiche (bannière), quand la boutique en publie un :
     /// c'est lui qui ouvre la colonne centrale, comme la bannière Steam.
     pub banner: String,
+    /// Visuels publiés pour les différents usages ; vides si inconnus.
+    pub icon: String,
+    pub capsule: String,
+    pub cover: String,
     pub developer: String,
     pub publisher: String,
     /// Date de sortie telle que la boutique l'écrit.
@@ -495,9 +531,16 @@ pub struct FreeGame {
     pub browser_only: bool,
     /// Autres offres du même jeu, une par plateforme : Android et iOS ont
     /// chacun la leur, avec un identifiant différent. Une seule carte les
-    /// présente, mais le panier doit toutes les recevoir.
+    /// présente ; le checkout groupé d'Epic ne les accepte pas, elles se
+    /// récupèrent donc séparément.
     #[serde(default)]
     pub offers: Vec<String>,
+    /// Offres de cette carte que le compte possède déjà, sous la forme
+    /// `<espace>:<offre>`. Une carte mobile peut n'en avoir qu'une seule :
+    /// `owned` ne passe à vrai que lorsque toutes sont au compte, tandis que
+    /// cette liste permet de retirer les offres déjà prises du panier.
+    #[serde(default)]
+    pub owned_offers: Vec<String>,
 }
 
 /// Ce qu'a donné une récupération, jeu par jeu : la boutique peut refuser une
@@ -600,28 +643,9 @@ pub fn load_tokens(data_dir: &Path, store: Store) -> Option<StoreTokens> {
 /// Écrit les jetons : dossier créé au besoin, fichier en `0600`, remplacement
 /// atomique.
 pub fn save_tokens(data_dir: &Path, tokens: &StoreTokens) -> std::io::Result<()> {
-    use std::io::Write;
-    let dir = stores_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
     let path = tokens_path(data_dir, tokens.store);
-    let temp = dir.join(format!(".{}.json.tmp", tokens.store.key()));
-    let text = serde_json::to_string_pretty(tokens).unwrap_or_default();
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(text.as_bytes())?;
-        file.sync_all().ok();
-    }
-    std::fs::rename(&temp, &path)?;
-    Ok(())
+    let text = serde_json::to_vec_pretty(tokens).map_err(std::io::Error::other)?;
+    crate::util::write_private_atomic(&path, &text)
 }
 
 /// Efface les jetons enregistrés d'une boutique.
@@ -682,7 +706,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let tokens = StoreTokens {
             store: Store::Gog,
-            account: "Nathounette".into(),
+            account: "JoueurExemple".into(),
             access_token: "access".into(),
             refresh_token: "refresh".into(),
             expires_at: 4_102_444_800,
@@ -723,7 +747,10 @@ mod tests {
             build: "0123456789abcdef".into(),
             fingerprint_version: StoreMark::FINGERPRINT_VERSION,
         };
-        assert!(StoreMark::read(&root).is_none(), "dossier pas encore installé");
+        assert!(
+            StoreMark::read(&root).is_none(),
+            "dossier pas encore installé"
+        );
         mark.write(&root).expect("marque");
         assert_eq!(StoreMark::read(&root), Some(mark));
         // Un dossier Steam n'a pas de marque : il reste un jeu Steam.
@@ -742,7 +769,10 @@ mod tests {
             title_key("Shadow Tactics: Blades of the Shogun"),
             title_key("Shadow Tactics Blades of the Shogun")
         );
-        assert_eq!(title_key("Assassin’s Creed® Valhalla"), "assassin s creed valhalla");
+        assert_eq!(
+            title_key("Assassin’s Creed® Valhalla"),
+            "assassin s creed valhalla"
+        );
         // Deux jeux distincts gardent deux clés.
         assert_ne!(title_key("GTA V"), title_key("GTA V Enhanced"));
         assert_eq!(title_key("  "), "");
@@ -769,7 +799,8 @@ pub fn parse_stamp(text: &str) -> Option<i64> {
     if text.len() < 19 {
         return None;
     }
-    let number = |from: usize, len: usize| -> Option<i64> { text.get(from..from + len)?.parse().ok() };
+    let number =
+        |from: usize, len: usize| -> Option<i64> { text.get(from..from + len)?.parse().ok() };
     let (year, month, day) = (number(0, 4)?, number(5, 2)?, number(8, 2)?);
     let (hour, minute, second) = (number(11, 2)?, number(14, 2)?, number(17, 2)?);
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {

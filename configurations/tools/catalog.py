@@ -35,7 +35,7 @@ TYPES = {
     "content",
 }
 PLATFORMS = {"windows", "linux", "both"}
-LAYERS = {"dxvk", "vkd3d", "wine", "proton", "gamescope", "mangohud", "game"}
+LAYERS = {"dxvk", "vkd3d", "wine", "proton", "gamescope", "game"}
 STATUSES = {"proposed", "verified", "broken"}
 TOP_KEYS = {
     "id",

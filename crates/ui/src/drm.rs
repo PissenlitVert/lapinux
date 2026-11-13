@@ -74,10 +74,7 @@ pub(crate) fn scan(dir: &Path) -> Option<Report> {
         };
         for entry in entries.flatten() {
             let entry_path = entry.path();
-            let is_dir = entry
-                .file_type()
-                .map(|kind| kind.is_dir())
-                .unwrap_or(false);
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
             if is_dir {
                 let skipped = entry_path
                     .file_name()

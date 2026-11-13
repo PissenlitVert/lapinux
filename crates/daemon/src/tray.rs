@@ -5,15 +5,17 @@
 //! Un clic gauche affiche l'interface, un clic droit ouvre les jeux récents,
 //! « Afficher/Masquer Lapinux » et « Quitter Lapinux ».
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::Shared;
+use lapinux_core::model::{Job, JobState};
 use lapinux_core::paths::LapinuxPaths;
 use zbus::blocking::connection::Builder;
 use zbus::blocking::Proxy;
@@ -133,7 +135,7 @@ pub fn start(shared: Arc<Shared>) {
 /// l'interface. Aucun appel à l'interface n'est nécessaire.
 fn monitor(shared: Arc<Shared>, commands: Sender<Command>) {
     let mut visible = None;
-    let mut art = None;
+    let mut art_key = None;
     let mut recent = Vec::new();
     let mut recent_at = Instant::now() - RECENT_REFRESH;
     // Les icônes du menu sont décodées une fois par jeu : relire et
@@ -146,15 +148,42 @@ fn monitor(shared: Arc<Shared>, commands: Sender<Command>) {
             let _ = commands.send(Command::WindowVisible(running));
         }
 
+        let download = active_download(&shared);
         let session = shared.session_info();
-        let appid = session.as_ref().map(|session| session.appid);
-        let title = session
+        let appid = download
             .as_ref()
-            .map(|session| session.name.clone())
+            .and_then(|job| job.appid)
+            .or_else(|| session.as_ref().map(|session| session.appid));
+        let title = download
+            .as_ref()
+            .map(|job| {
+                if job.title.trim().is_empty() {
+                    job.label.clone()
+                } else {
+                    job.title.clone()
+                }
+            })
+            .or_else(|| session.as_ref().map(|session| session.name.clone()))
             .unwrap_or_else(|| lapinux_core::APP_NAME.to_string());
-        if art != Some(appid) {
-            art = Some(appid);
-            let pixmap = pixmap(&shared.paths, appid);
+        let progress = download.as_ref().map(|job| job.progress.clamp(0.0, 1.0));
+        let paused = download
+            .as_ref()
+            .is_some_and(|job| job.state == JobState::Paused);
+        let key = (appid, progress.map(|value| (value * 1000.0) as u32), paused);
+        if art_key != Some(key) {
+            art_key = Some(key);
+            let pixmap = match progress {
+                Some(progress) => progress_pixmap(
+                    &shared.paths,
+                    appid,
+                    progress,
+                    paused,
+                    download
+                        .as_ref()
+                        .is_some_and(|job| job.id.starts_with("game-")),
+                ),
+                None => pixmap(&shared.paths, appid),
+            };
             let _ = commands.send(Command::Art { pixmap, title });
         }
 
@@ -171,7 +200,18 @@ fn monitor(shared: Arc<Shared>, commands: Sender<Command>) {
             }
             recent_at = Instant::now();
         }
-        std::thread::sleep(TICK);
+        // Une aura de téléchargement doit avancer : un relevé par seconde
+        // seulement pendant un transfert, sinon le tray reste économe.
+        std::thread::sleep(
+            if download
+                .as_ref()
+                .is_some_and(|job| job.state == JobState::Running)
+            {
+                Duration::from_secs(1)
+            } else {
+                TICK
+            },
+        );
     }
 }
 
@@ -189,8 +229,7 @@ fn recent_games(shared: &Shared, icons: &mut HashMap<u32, Vec<u8>>) -> Vec<Recen
 
     // Une icône manquante n'est pas gardée : le prochain relevé la retentera,
     // au cas où la jaquette vient d'être téléchargée.
-    let live: std::collections::HashSet<u32> =
-        recent.iter().map(|(appid, _, _)| *appid).collect();
+    let live: std::collections::HashSet<u32> = recent.iter().map(|(appid, _, _)| *appid).collect();
     icons.retain(|appid, _| live.contains(appid));
     recent
         .into_iter()
@@ -506,27 +545,12 @@ fn serve(
                 }
                 // Plasma relit les propriétés sur ces signaux : sans eux,
                 // l'icône garderait le visuel du premier jeu de la session.
-                let _ = connection.emit_signal(
-                    None::<&str>,
-                    OBJECT_PATH,
-                    INTERFACE,
-                    "NewIcon",
-                    &(),
-                );
-                let _ = connection.emit_signal(
-                    None::<&str>,
-                    OBJECT_PATH,
-                    INTERFACE,
-                    "NewToolTip",
-                    &(),
-                );
-                let _ = connection.emit_signal(
-                    None::<&str>,
-                    OBJECT_PATH,
-                    INTERFACE,
-                    "NewTitle",
-                    &(),
-                );
+                let _ =
+                    connection.emit_signal(None::<&str>, OBJECT_PATH, INTERFACE, "NewIcon", &());
+                let _ =
+                    connection.emit_signal(None::<&str>, OBJECT_PATH, INTERFACE, "NewToolTip", &());
+                let _ =
+                    connection.emit_signal(None::<&str>, OBJECT_PATH, INTERFACE, "NewTitle", &());
             }
             Command::Recent(recent) => {
                 if let Ok(mut slot) = menu_data.recent.lock() {
@@ -687,13 +711,7 @@ impl Menu {
                 ));
             }
             if !recent.is_empty() {
-                entries.push((
-                    MENU_SEPARATOR,
-                    String::new(),
-                    "separator",
-                    Vec::new(),
-                    None,
-                ));
+                entries.push((MENU_SEPARATOR, String::new(), "separator", Vec::new(), None));
             }
         }
         entries.push((
@@ -738,11 +756,7 @@ impl Menu {
         props
     }
 
-    fn node(
-        &self,
-        id: i32,
-        children: Vec<OwnedValue>,
-    ) -> (i32, Props, Vec<OwnedValue>) {
+    fn node(&self, id: i32, children: Vec<OwnedValue>) -> (i32, Props, Vec<OwnedValue>) {
         (id, self.properties(id), children)
     }
 }
@@ -828,10 +842,7 @@ impl Menu {
         }
     }
 
-    fn event_group(
-        &self,
-        events: Vec<(i32, String, OwnedValue, u32)>,
-    ) -> Vec<bool> {
+    fn event_group(&self, events: Vec<(i32, String, OwnedValue, u32)>) -> Vec<bool> {
         for (id, event, data, timestamp) in events {
             self.event(id, event, data, timestamp);
         }
@@ -856,6 +867,184 @@ pub(crate) fn pixmap(paths: &LapinuxPaths, appid: Option<u32>) -> Vec<(i32, i32,
     }
 }
 
+/// Téléchargement qui mérite l'icône animée : le plus avancé des transferts
+/// actifs ou en pause. Une fois terminé, la tâche quitte la liste et le tray
+/// retrouve le jeu en cours ou le logo.
+fn active_download(shared: &Shared) -> Option<Job> {
+    let jobs = shared.jobs.lock().ok()?;
+    jobs.iter()
+        .filter(|job| {
+            job.appid.is_some()
+                && matches!(
+                    job.state,
+                    JobState::Running | JobState::Paused | JobState::Queued
+                )
+        })
+        .max_by(|left, right| {
+            let rank = |state| match state {
+                JobState::Running => 3,
+                JobState::Paused => 2,
+                JobState::Queued => 1,
+                _ => 0,
+            };
+            rank(left.state).cmp(&rank(right.state)).then_with(|| {
+                left.progress
+                    .partial_cmp(&right.progress)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .cloned()
+}
+
+/// Icône d'un jeu entourée de l'anneau de progression du téléchargement.
+fn progress_pixmap(
+    paths: &LapinuxPaths,
+    appid: Option<u32>,
+    progress: f32,
+    paused: bool,
+    steam_art: bool,
+) -> Vec<(i32, i32, Vec<u8>)> {
+    use image::{Rgba, RgbaImage};
+
+    let base = appid
+        .and_then(|appid| {
+            menu_icon_file(paths, appid)
+                .or_else(|| steam_art.then(|| fetch_steam_icon(paths, appid)).flatten())
+        })
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(square_icon)
+        .or_else(|| {
+            image::load_from_memory(include_bytes!("../../../assets/lapinux-logo.png")).ok()
+        });
+    let Some(base) = base else {
+        return logo_pixmap();
+    };
+
+    let mut canvas = RgbaImage::from_pixel(ICON_PX, ICON_PX, Rgba([0, 0, 0, 0]));
+    let inner = 40;
+    let icon = base.resize_exact(inner, inner, image::imageops::FilterType::Triangle);
+    let offset = (ICON_PX as i64 - inner as i64) / 2;
+    image::imageops::overlay(&mut canvas, &icon, offset, offset);
+
+    let center = ICON_PX as f32 / 2.0;
+    let radius = 27.0;
+    let thickness = 3.0;
+    let color = if paused {
+        [148u8, 163, 184]
+    } else {
+        [96u8, 165, 250]
+    };
+    let progress = progress.clamp(0.0, 1.0);
+    for y in 0..ICON_PX {
+        for x in 0..ICON_PX {
+            let dx = x as f32 + 0.5 - center;
+            let dy = y as f32 + 0.5 - center;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if (distance - radius).abs() > thickness / 2.0 {
+                continue;
+            }
+            let angle =
+                (dy.atan2(dx) + std::f32::consts::FRAC_PI_2).rem_euclid(std::f32::consts::TAU);
+            let (red, green, blue, alpha) = if angle <= progress * std::f32::consts::TAU {
+                (color[0], color[1], color[2], 235)
+            } else {
+                (color[0], color[1], color[2], 42)
+            };
+            let [old_r, old_g, old_b, old_a] = canvas.get_pixel(x, y).0;
+            let src = alpha as f32 / 255.0;
+            let dst = old_a as f32 / 255.0;
+            let out_a = src + dst * (1.0 - src);
+            if out_a > 0.0 {
+                let blend = |src_c: u8, dst_c: u8| -> u8 {
+                    ((src_c as f32 * src + dst_c as f32 * dst * (1.0 - src)) / out_a)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                canvas.put_pixel(
+                    x,
+                    y,
+                    Rgba([
+                        blend(red, old_r),
+                        blend(green, old_g),
+                        blend(blue, old_b),
+                        (out_a * 255.0).round() as u8,
+                    ]),
+                );
+            }
+        }
+    }
+    vec![argb(image::DynamicImage::ImageRgba8(canvas))]
+}
+
+/// Rogne une jaquette portrait au carré avant de la réduire : une icône de
+/// jeu ne doit pas être écrasée dans l'anneau du tray.
+fn square_icon(image: image::DynamicImage) -> image::DynamicImage {
+    let (width, height) = (image.width(), image.height());
+    if width == 0 || height == 0 || width == height {
+        return image;
+    }
+    let side = width.min(height);
+    image.crop_imm((width - side) / 2, (height - side) / 2, side, side)
+}
+
+/// Dernier recours pour un jeu Steam dont aucune illustration n'est encore
+/// locale : la boutique publique donne l'adresse de la capsule. Le résultat
+/// est écrit dans le cache d'illustrations, donc la requête ne repart pas à
+/// chaque pour cent du téléchargement.
+fn fetch_steam_icon(paths: &LapinuxPaths, appid: u32) -> Option<PathBuf> {
+    static ATTEMPTED: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    let attempted = ATTEMPTED.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut attempts) = attempted.lock() {
+        if !attempts.insert(appid) {
+            return None;
+        }
+    }
+
+    let url = format!(
+        "https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic&l=french"
+    );
+    let text = ureq::get(&url)
+        .set("User-Agent", "Lapinux/1.0")
+        .timeout(Duration::from_secs(4))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let data = value.get(appid.to_string())?.get("data")?;
+    let client_icon = data
+        .get("clienticon")
+        .and_then(|value| value.as_str())
+        .filter(|hash| !hash.is_empty())
+        .map(|hash| {
+            format!(
+                "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/{appid}/{hash}.jpg"
+            )
+        });
+    let image_url = client_icon.or_else(|| {
+        ["capsule_image", "header_image"]
+            .iter()
+            .find_map(|key| data.get(*key).and_then(|value| value.as_str()))
+            .filter(|url| url.starts_with("https://") && !url.is_empty())
+            .map(str::to_string)
+    })?;
+    let response = ureq::get(&image_url)
+        .set("User-Agent", "Lapinux/1.0")
+        .timeout(Duration::from_secs(4))
+        .call()
+        .ok()?;
+    let mut bytes = Vec::new();
+    response.into_reader().read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let path = paths.art_dir().join(format!("steam-capsule-{appid}.jpg"));
+    std::fs::create_dir_all(paths.art_dir()).ok()?;
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
 /// Icône PNG d'une entrée de jeu du menu. Une jaquette absente ou illisible
 /// rend un vecteur vide : l'entrée reste alors en texte seul.
 pub(crate) fn menu_icon(paths: &LapinuxPaths, appid: u32) -> Vec<u8> {
@@ -877,10 +1066,7 @@ pub(crate) fn menu_icon(paths: &LapinuxPaths, appid: u32) -> Vec<u8> {
         .to_rgba8();
     let mut png = Vec::new();
     if image::DynamicImage::ImageRgba8(small)
-        .write_to(
-            &mut std::io::Cursor::new(&mut png),
-            image::ImageFormat::Png,
-        )
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .is_err()
     {
         return Vec::new();
@@ -920,9 +1106,12 @@ pub(crate) fn menu_icon_file(paths: &LapinuxPaths, appid: u32) -> Option<PathBuf
     if let Some(path) = files.iter().find(|path| is_icon_file(path)) {
         return Some(path.clone());
     }
+    let custom = paths.existing_custom_cover_path(appid);
+    if custom.is_file() {
+        return Some(custom);
+    }
     let covers = paths.covers_dir();
     for name in [
-        format!("custom-{appid}.jpg"),
         format!("store-{appid}.jpg"),
         format!("{appid}.jpg"),
         format!("sgdb-{appid}.jpg"),
@@ -1058,6 +1247,25 @@ mod tests {
     }
 
     #[test]
+    fn une_jaquette_sert_d_icone_pendant_le_telechargement() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LapinuxPaths::under(dir.path());
+        paths.ensure().unwrap();
+        std::fs::create_dir_all(paths.covers_dir()).unwrap();
+        image::RgbImage::from_pixel(60, 90, image::Rgb([220, 30, 20]))
+            .save(paths.covers_dir().join("4242.jpg"))
+            .unwrap();
+
+        let pixmap = progress_pixmap(&paths, Some(4242), 0.5, false, false);
+        assert_eq!(pixmap.len(), 1);
+        let data = &pixmap[0].2;
+        let center = ((ICON_PX as usize / 2) * ICON_PX as usize + ICON_PX as usize / 2) * 4;
+        // ARGB : le centre est bien la jaquette du jeu, pas le logo Lapinux.
+        assert!(data[center + 1] > 150, "rouge de la jaquette attendu");
+        assert!(data[center + 2] < 100, "la jaquette ne doit pas être bleue");
+    }
+
+    #[test]
     fn une_icone_de_jeu_devient_un_png() {
         let dir = tempfile::tempdir().unwrap();
         let paths = LapinuxPaths::under(dir.path());
@@ -1164,9 +1372,6 @@ mod tests {
         assert_eq!(entries[3].0, MENU_QUIT);
         assert_eq!(entries[2].4, Some(TOGGLE_ICON));
         assert_eq!(entries[3].4, Some(QUIT_ICON));
-        assert_eq!(
-            entries[3].1,
-            lapinux_core::i18n::t("tray.quit")
-        );
+        assert_eq!(entries[3].1, lapinux_core::i18n::t("tray.quit"));
     }
 }

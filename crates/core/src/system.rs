@@ -53,7 +53,7 @@ pub struct SystemInfo {
     pub uptime_secs: u64,
     pub cpu_usage: f32,
     /// Charge de chaque cœur, dans l'ordre de `/proc/stat` : la plaque de
-    /// performance en fait les barres par cœur de MangoHud.
+    /// performance en fait les barres par cœur du HUD natif.
     #[serde(default)]
     pub cpu_cores: Vec<f32>,
     pub ram_total: u64,
@@ -359,7 +359,10 @@ fn amd_device(pci: Option<&str>) -> Option<PathBuf> {
         if let Some(pci) = pci {
             let found = std::fs::canonicalize(&device)
                 .ok()
-                .and_then(|real| real.file_name().map(|name| name.to_string_lossy().to_string()))
+                .and_then(|real| {
+                    real.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                })
                 .map(|found| found == pci)
                 .unwrap_or(false);
             if found {
@@ -372,10 +375,11 @@ fn amd_device(pci: Option<&str>) -> Option<PathBuf> {
 }
 
 fn amd_stats(device: &Path) -> Option<GpuLoad> {
-    let read = |name: &str| {
-        read_trimmed(&device.join(name).display().to_string())
-    };
-    let usage = read("gpu_busy_percent")?.parse::<f32>().ok()?.clamp(0.0, 100.0);
+    let read = |name: &str| read_trimmed(&device.join(name).display().to_string());
+    let usage = read("gpu_busy_percent")?
+        .parse::<f32>()
+        .ok()?
+        .clamp(0.0, 100.0);
     let vram_used = read("mem_info_vram_used")?.parse::<u64>().ok()?;
     let vram_total = read("mem_info_vram_total")?.parse::<u64>().ok()?;
     Some(GpuLoad {
@@ -418,9 +422,15 @@ fn cpu_temperature() -> Option<f32> {
         let label = read_trimmed(&dir.join("temp1_label").display().to_string())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let known = ["k10temp", "coretemp", "zenpower", "cpu_thermal", "soc_thermal"]
-            .iter()
-            .any(|sensor| name.contains(sensor))
+        let known = [
+            "k10temp",
+            "coretemp",
+            "zenpower",
+            "cpu_thermal",
+            "soc_thermal",
+        ]
+        .iter()
+        .any(|sensor| name.contains(sensor))
             || ["package", "tctl", "tdie", "cpu"]
                 .iter()
                 .any(|sensor| label.contains(sensor));
@@ -722,7 +732,12 @@ fn short_vendor(vendor: &str) -> String {
     } else if lower.contains("apple") {
         "Apple".into()
     } else {
-        vendor.split('[').next().unwrap_or(vendor).trim().to_string()
+        vendor
+            .split('[')
+            .next()
+            .unwrap_or(vendor)
+            .trim()
+            .to_string()
     }
 }
 

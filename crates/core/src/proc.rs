@@ -22,7 +22,10 @@ impl StreamOutcome {
 ///
 /// Le callback renvoie `true` pour continuer, `false` pour arrêter le processus.
 /// Un `Err` de spawn est remonté tel quel.
-pub fn run_streaming(cmd: &mut Command, on_line: &mut dyn FnMut(&str) -> bool) -> Result<StreamOutcome> {
+pub fn run_streaming(
+    cmd: &mut Command,
+    on_line: &mut dyn FnMut(&str) -> bool,
+) -> Result<StreamOutcome> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take();

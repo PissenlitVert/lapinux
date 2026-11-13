@@ -17,8 +17,8 @@ name = "lapinux-probe"
 path = "src/bin/lapinux-probe.rs"
 
 [workspace]
-members = ["crates/core", "crates/steam", "crates/stores", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
-default-members = [".", "crates/core", "crates/steam", "crates/stores", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
+members = ["crates/core", "crates/steam", "crates/steamshim", "crates/stores", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
+default-members = [".", "crates/core", "crates/steam", "crates/steamshim", "crates/stores", "crates/proton", "crates/perf", "crates/input", "crates/overlay", "crates/ui", "crates/daemon"]
 
 [dependencies]
 lapinux-core = { path = "crates/core" }
@@ -38,6 +38,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+# egui 0.29.1 panique dans son hit-test quand un widget reçoit une géométrie
+# NaN ; le correctif amont (#6851) n'existe qu'à partir de 0.32. On garde
+# l'API 0.29 et on applique la garde de trois lignes dans la copie locale.
+egui = { path = "vendor/egui-0.29.1" }
 
 # ThinLTO plutôt que le LTO « fat » : les deux optimisent entre crates, mais
 # Le profil `release` sert au développement courant : pas de LTO, et

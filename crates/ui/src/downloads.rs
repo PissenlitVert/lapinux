@@ -53,6 +53,9 @@ pub(crate) struct Downloads {
     art: DownloadArtCache,
     /// Débits lissés par tâche, calculés à partir des compteurs du daemon.
     rates: HashMap<String, (f32, f32)>,
+    /// Débit moyen sur une fenêtre plus longue, réservé au temps restant :
+    /// l'estimation ne doit pas sauter à chaque petit trou de réseau.
+    eta_rates: HashMap<String, f32>,
     samples: HashMap<String, VecDeque<(Instant, u64, u64)>>,
     /// Dernier état connu de chaque tâche : une reprise repart d'une fenêtre
     /// de mesure vide, sinon les chunks déjà en vol à la reprise gonflent le
@@ -112,6 +115,7 @@ impl Downloads {
             dir_draft: None,
             art: DownloadArtCache::default(),
             rates: HashMap::new(),
+            eta_rates: HashMap::new(),
             samples: HashMap::new(),
             states: HashMap::new(),
             rate_history: VecDeque::new(),
@@ -138,6 +142,48 @@ impl Downloads {
             servers: None,
             servers_rx: None,
         }
+    }
+
+    /// Construit la page avec les catégories repliées enregistrées.
+    pub(crate) fn from_config(config: &lapinux_core::config::DownloadsConfig) -> Self {
+        let mut page = Self::new();
+        page.running_open = !config.collapsed_sections.iter().any(|key| key == "running");
+        page.programs_open = !config
+            .collapsed_sections
+            .iter()
+            .any(|key| key == "programs");
+        page.paused_open = !config.collapsed_sections.iter().any(|key| key == "paused");
+        page.updates_open = !config.collapsed_sections.iter().any(|key| key == "updates");
+        page.history_open = !config.collapsed_sections.iter().any(|key| key == "history");
+        page.limits_stores_open = !config
+            .collapsed_sections
+            .iter()
+            .any(|key| key == "limits_stores");
+        page
+    }
+
+    /// Clés des catégories repliées, dans un ordre stable pour la configuration.
+    fn collapsed_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        if !self.running_open {
+            keys.push("running".to_string());
+        }
+        if !self.programs_open {
+            keys.push("programs".to_string());
+        }
+        if !self.paused_open {
+            keys.push("paused".to_string());
+        }
+        if !self.updates_open {
+            keys.push("updates".to_string());
+        }
+        if !self.history_open {
+            keys.push("history".to_string());
+        }
+        if !self.limits_stores_open {
+            keys.push("limits_stores".to_string());
+        }
+        keys
     }
 
     /// Relève la liste des serveurs Steam quand son fil a répondu.
@@ -231,7 +277,12 @@ impl Downloads {
                 continue;
             }
             let details = catalog
-                .and_then(|catalog| catalog.entries.iter().find(|item| item.appid == entry.appid))
+                .and_then(|catalog| {
+                    catalog
+                        .entries
+                        .iter()
+                        .find(|item| item.appid == entry.appid)
+                })
                 .map(|item| item.details.clone());
             let size = details.as_ref().and_then(public_download_bytes);
             rows.push(UpdateRow {
@@ -324,17 +375,19 @@ impl Downloads {
             self.speedtest.running = false;
             self.speedtest.stage = SpeedtestStage::Idle;
             if !finished && self.speedtest.note.is_none() {
-                self.speedtest.note = Some(lapinux_core::i18n::t("downloads.speedtest_interrupted").into());
+                self.speedtest.note =
+                    Some(lapinux_core::i18n::t("downloads.speedtest_interrupted").into());
             }
         }
     }
 
     /// Débits réseau et disque par tâche, mesurés sur une fenêtre de quatre
-    /// secondes : les chunks Steam arrivent par paquets d'un mégaoctet et le
+    /// secondes : les chunks arrivent par paquets d'un mégaoctet et le
     /// compteur du daemon n'avance qu'à la fin de chacun. Sur 450 ms la courbe
     /// tombait à zéro entre deux paquets et remontait d'un coup, ce qui faisait
     /// croire à une connexion instable alors que le débit moyen était constant.
     /// Quatre secondes contiennent assez de chunks pour lire une vraie vitesse.
+    /// Le temps restant, lui, se base sur quinze secondes : il bouge moins.
     fn sample_rates(&mut self, jobs: &[Job]) {
         let now = Instant::now();
         let active: Vec<(String, JobState, u64, u64)> = jobs
@@ -348,10 +401,12 @@ impl Downloads {
             .map(|job| (job.id.clone(), job.state, job.network, job.written))
             .collect();
         const WINDOW: f32 = 4.0;
+        const ETA_WINDOW: f32 = 15.0;
         for (id, state, network, written) in &active {
             if is_resume(self.states.get(id).copied(), *state) {
                 self.samples.remove(id);
                 self.rates.remove(id);
+                self.eta_rates.remove(id);
             }
             let window = self.samples.entry(id.clone()).or_default();
             let due = window
@@ -362,8 +417,10 @@ impl Downloads {
                 window.push_back((now, *network, *written));
             }
             while window.len() > 2
-                && now.duration_since(window.front().map(|s| s.0).unwrap_or(now)).as_secs_f32()
-                    > WINDOW
+                && now
+                    .duration_since(window.front().map(|s| s.0).unwrap_or(now))
+                    .as_secs_f32()
+                    > ETA_WINDOW
             {
                 window.pop_front();
             }
@@ -374,20 +431,30 @@ impl Downloads {
             if elapsed < 0.8 {
                 continue;
             }
-            let net = network.saturating_sub(first_network) as f32 / elapsed;
-            let write = written.saturating_sub(first_written) as f32 / elapsed;
+            // Le débit affiché reste réactif (4 s), mais le temps restant
+            // s'appuie sur la moyenne de 15 s et se corrige lentement.
+            let (rate_at, rate_network, rate_written) = window
+                .iter()
+                .find(|(at, _, _)| now.duration_since(*at).as_secs_f32() <= WINDOW)
+                .copied()
+                .unwrap_or((first_at, first_network, first_written));
+            let rate_elapsed = now.duration_since(rate_at).as_secs_f32().max(0.25);
+            let net = network.saturating_sub(rate_network) as f32 / rate_elapsed;
+            let write = written.saturating_sub(rate_written) as f32 / rate_elapsed;
             let (old_net, old_write) = self.rates.get(id).copied().unwrap_or((net, write));
             self.rates.insert(
                 id.clone(),
-                (
-                    old_net * 0.35 + net * 0.65,
-                    old_write * 0.35 + write * 0.65,
-                ),
+                (old_net * 0.35 + net * 0.65, old_write * 0.35 + write * 0.65),
             );
+            let eta_net = network.saturating_sub(first_network) as f32 / elapsed;
+            let old_eta = self.eta_rates.get(id).copied().unwrap_or(eta_net);
+            self.eta_rates
+                .insert(id.clone(), old_eta * 0.8 + eta_net * 0.2);
         }
         let ids: Vec<String> = active.iter().map(|(id, _, _, _)| id.clone()).collect();
         self.samples.retain(|id, _| ids.contains(id));
         self.rates.retain(|id, _| ids.contains(id));
+        self.eta_rates.retain(|id, _| ids.contains(id));
         self.states.retain(|id, _| ids.contains(id));
         for (id, state, _, _) in &active {
             self.states.insert(id.clone(), *state);
@@ -436,7 +503,8 @@ impl LapinuxApp {
         self.downloads.sample_rates(&self.jobs);
         self.load_catalog_if_needed();
         let entries = self.library_entries_all();
-        self.downloads.refresh_updates(&entries, self.catalog.as_ref());
+        self.downloads
+            .refresh_updates(&entries, self.catalog.as_ref());
 
         let history: Vec<Job> = sections.history.iter().cloned().collect();
         let empty = sections.running.is_empty()
@@ -569,10 +637,7 @@ impl LapinuxApp {
                                 .size(13.0)
                                 .color(TEXT()),
                         );
-                        muted(
-                            ui,
-                            lapinux_core::i18n::t("downloads.empty_hint"),
-                        );
+                        muted(ui, lapinux_core::i18n::t("downloads.empty_hint"));
                     });
                 });
             });
@@ -594,10 +659,8 @@ impl LapinuxApp {
     ) -> SectionHeader {
         const HEIGHT: f32 = 26.0;
         let width = ui.available_width();
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(width, HEIGHT),
-            egui::Sense::click(),
-        );
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::click());
         let response = response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(if open {
@@ -629,11 +692,7 @@ impl LapinuxApp {
         if !detail.is_empty() {
             let max_width = (right_limit - x).max(24.0);
             let text = lapinux_core::util::ellipsize(detail, (max_width / 6.0).max(3.0) as usize);
-            let galley = painter.layout_no_wrap(
-                text,
-                egui::FontId::proportional(11.5),
-                TEXT_DIM(),
-            );
+            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(11.5), TEXT_DIM());
             painter.galley(
                 egui::pos2(x, rect.center().y - galley.size().y / 2.0),
                 galley.clone(),
@@ -656,11 +715,8 @@ impl LapinuxApp {
                 );
                 let hovered = action_response.hovered();
                 if hovered || action_response.has_focus() {
-                    ui.painter().rect_filled(
-                        action_rect,
-                        egui::Rounding::same(6.0),
-                        CARD_HOVER(),
-                    );
+                    ui.painter()
+                        .rect_filled(action_rect, egui::Rounding::same(6.0), CARD_HOVER());
                 }
                 paint_hero_glyph(
                     ui.painter(),
@@ -680,7 +736,11 @@ impl LapinuxApp {
             egui::pos2(right_limit - 4.0, rect.bottom() - 2.0),
         );
 
-        let ink = if response.hovered() { TEXT() } else { TEXT_DIM() };
+        let ink = if response.hovered() {
+            TEXT()
+        } else {
+            TEXT_DIM()
+        };
         let size = 4.2;
         let points = if open {
             vec![
@@ -724,13 +784,17 @@ impl LapinuxApp {
             ui,
             lapinux_core::i18n::t("downloads.active"),
             &jobs.len().to_string(),
-            pausable.then_some((HeroGlyph::Pause, lapinux_core::i18n::t("downloads.pause_all"))),
+            pausable.then_some((
+                HeroGlyph::Pause,
+                lapinux_core::i18n::t("downloads.pause_all"),
+            )),
             open,
         );
         if header.action {
             self.pause_all(jobs, true);
         } else if header.toggle {
             self.downloads.running_open = !open;
+            self.remember_download_sections();
         }
         if !open {
             self.collapsed_icons(ui, header.free, &job_icons(jobs));
@@ -750,9 +814,16 @@ impl LapinuxApp {
             return;
         }
         let open = self.downloads.programs_open;
-        let header = Self::section_heading(ui, lapinux_core::i18n::t("downloads.programs"), &jobs.len().to_string(), None, open);
+        let header = Self::section_heading(
+            ui,
+            lapinux_core::i18n::t("downloads.programs"),
+            &jobs.len().to_string(),
+            None,
+            open,
+        );
         if header.toggle {
             self.downloads.programs_open = !open;
+            self.remember_download_sections();
         }
         if !open {
             self.collapsed_icons(ui, header.free, &job_icons(jobs));
@@ -775,13 +846,17 @@ impl LapinuxApp {
             ui,
             lapinux_core::i18n::t("downloads.paused"),
             &jobs.len().to_string(),
-            Some((HeroGlyph::Play, lapinux_core::i18n::t("downloads.resume_all"))),
+            Some((
+                HeroGlyph::Play,
+                lapinux_core::i18n::t("downloads.resume_all"),
+            )),
             open,
         );
         if header.action {
             self.pause_all(jobs, false);
         } else if header.toggle {
             self.downloads.paused_open = !open;
+            self.remember_download_sections();
         }
         if !open {
             self.collapsed_icons(ui, header.free, &job_icons(jobs));
@@ -870,7 +945,9 @@ impl LapinuxApp {
                     .and_then(|entry| entry.dlc.iter().find(|dlc| dlc.appid == *id))
                     .map(|dlc| dlc.name.clone())
                     .filter(|name| !name.trim().is_empty())
-                    .unwrap_or_else(|| lapinux_core::i18n::t_args("downloads.content", &[("id", &id.to_string())]))
+                    .unwrap_or_else(|| {
+                        lapinux_core::i18n::t_args("downloads.content", &[("id", &id.to_string())])
+                    })
             })
             .collect();
         let screen = ctx.screen_rect();
@@ -957,7 +1034,10 @@ impl LapinuxApp {
             }
         }
         if let Some(err) = failure {
-            self.notify(lapinux_core::i18n::t_args("downloads.pause_error", &[("error", &err.to_string())]));
+            self.notify(lapinux_core::i18n::t_args(
+                "downloads.pause_error",
+                &[("error", &err.to_string())],
+            ));
         } else {
             self.refresh_jobs_now();
         }
@@ -975,7 +1055,10 @@ impl LapinuxApp {
             ui,
             lapinux_core::i18n::t("downloads.finished"),
             &history.len().to_string(),
-            Some((HeroGlyph::Trash, lapinux_core::i18n::t("downloads.clear_history"))),
+            Some((
+                HeroGlyph::Trash,
+                lapinux_core::i18n::t("downloads.clear_history"),
+            )),
             open,
         );
         if header.action {
@@ -993,6 +1076,7 @@ impl LapinuxApp {
         }
         if header.toggle {
             self.downloads.history_open = !open;
+            self.remember_download_sections();
         }
         if !open {
             self.collapsed_icons(ui, header.free, &job_icons(history));
@@ -1015,7 +1099,10 @@ impl LapinuxApp {
             let label = if show_all {
                 lapinux_core::i18n::t("downloads.collapse_list").to_string()
             } else {
-                lapinux_core::i18n::t_args("downloads.show_all", &[("count", &history.len().to_string())])
+                lapinux_core::i18n::t_args(
+                    "downloads.show_all",
+                    &[("count", &history.len().to_string())],
+                )
             };
             if link_text(ui, &label).clicked() {
                 self.downloads.history_show_all = !self.downloads.history_show_all;
@@ -1027,12 +1114,7 @@ impl LapinuxApp {
     /// Catégorie repliée : les vignettes des jeux concernés, alignées à
     /// droite sur la ligne de l'en-tête, juste avant le chevron. Au-delà de
     /// la place disponible, un « +N » résume le reste.
-    fn collapsed_icons(
-        &mut self,
-        ui: &mut egui::Ui,
-        free: egui::Rect,
-        entries: &[(u32, String)],
-    ) {
+    fn collapsed_icons(&mut self, ui: &mut egui::Ui, free: egui::Rect, entries: &[(u32, String)]) {
         if entries.is_empty() || free.width() < 24.0 {
             return;
         }
@@ -1043,8 +1125,7 @@ impl LapinuxApp {
         let mut x = free.left() + offset;
         let top = free.center().y - SIZE / 2.0;
         for (appid, name) in entries.iter().take(shown) {
-            let icon_rect =
-                egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(SIZE, SIZE));
+            let icon_rect = egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(SIZE, SIZE));
             painter.rect_filled(
                 icon_rect,
                 egui::Rounding::same(0.0),
@@ -1096,6 +1177,7 @@ impl LapinuxApp {
             let art = &mut self.downloads.art;
             let paths = &self.paths;
             let rates = &self.downloads.rates;
+            let eta_rates = &self.downloads.eta_rates;
             for (index, job) in jobs.iter().enumerate() {
                 if index > 0 {
                     ui.add_space(10.0);
@@ -1113,6 +1195,7 @@ impl LapinuxApp {
                     None => (None, None),
                 };
                 let net = rates.get(&job.id).map(|(net, _)| *net).unwrap_or(0.0);
+                let eta = eta_rates.get(&job.id).copied().unwrap_or(net);
                 let source = if job.kind == JobKind::InstallGame {
                     Some(crate::store_mark_texture(ui.ctx(), job_store(job), 48))
                 } else {
@@ -1127,6 +1210,7 @@ impl LapinuxApp {
                     icon.as_ref(),
                     source.as_ref(),
                     net,
+                    eta,
                 ));
             }
         }
@@ -1147,8 +1231,14 @@ impl LapinuxApp {
                 } else {
                     lapinux_core::i18n::t("downloads.notify_resumed")
                 }),
-                Ok(env) => self.notify(env.error.unwrap_or_else(|| lapinux_core::i18n::t("downloads.pause_failed").into())),
-                Err(err) => self.notify(lapinux_core::i18n::t_args("downloads.pause_error", &[("error", &err.to_string())])),
+                Ok(env) => self.notify(
+                    env.error
+                        .unwrap_or_else(|| lapinux_core::i18n::t("downloads.pause_failed").into()),
+                ),
+                Err(err) => self.notify(lapinux_core::i18n::t_args(
+                    "downloads.pause_error",
+                    &[("error", &err.to_string())],
+                )),
             }
         }
         if let Some(id) = action.cancel {
@@ -1166,8 +1256,14 @@ impl LapinuxApp {
                 } else {
                     lapinux_core::i18n::t("downloads.cancel_removed")
                 }),
-                Ok(env) => self.notify(env.error.unwrap_or_else(|| lapinux_core::i18n::t("downloads.cancel_failed").into())),
-                Err(err) => self.notify(lapinux_core::i18n::t_args("downloads.cancel_error", &[("error", &err.to_string())])),
+                Ok(env) => self
+                    .notify(env.error.unwrap_or_else(|| {
+                        lapinux_core::i18n::t("downloads.cancel_failed").into()
+                    })),
+                Err(err) => self.notify(lapinux_core::i18n::t_args(
+                    "downloads.cancel_error",
+                    &[("error", &err.to_string())],
+                )),
             }
         }
         if let Some(appid) = action.resume {
@@ -1269,7 +1365,10 @@ impl LapinuxApp {
                         ui,
                         &lapinux_core::i18n::t_args(
                             "downloads.verified",
-                            &[("when", &lapinux_core::util::format_duration(at.elapsed().as_secs()))],
+                            &[(
+                                "when",
+                                &lapinux_core::util::format_duration(at.elapsed().as_secs()),
+                            )],
                         ),
                     );
                 }
@@ -1282,7 +1381,7 @@ impl LapinuxApp {
         }
         if checking {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(12.0));
+                crate::section_icons::loading(ui, 12.0);
                 muted(ui, lapinux_core::i18n::t("downloads.reading_builds"));
             });
             ui.add_space(6.0);
@@ -1297,9 +1396,16 @@ impl LapinuxApp {
         } else {
             rows.len().to_string()
         };
-        let header = Self::section_heading(ui, lapinux_core::i18n::t("downloads.updates"), &detail, None, open);
+        let header = Self::section_heading(
+            ui,
+            lapinux_core::i18n::t("downloads.updates"),
+            &detail,
+            None,
+            open,
+        );
         if header.toggle {
             self.downloads.updates_open = !open;
+            self.remember_download_sections();
         }
         if !open {
             let icons: Vec<(u32, String)> = rows
@@ -1310,10 +1416,7 @@ impl LapinuxApp {
             return;
         }
         ui.add_space(2.0);
-        muted(
-            ui,
-            lapinux_core::i18n::t("downloads.updates_note"),
-        );
+        muted(ui, lapinux_core::i18n::t("downloads.updates_note"));
         ui.add_space(8.0);
 
         // Une mise à jour occupe la même largeur qu'un téléchargement actif :
@@ -1336,14 +1439,7 @@ impl LapinuxApp {
                     );
                 }
                 let icon = icons.icon(ui.ctx(), paths, row.appid);
-                if available_update_tile(
-                    ui,
-                    width,
-                    row.appid,
-                    &row.name,
-                    icon.as_ref(),
-                    row.size,
-                ) {
+                if available_update_tile(ui, width, row.appid, &row.name, icon.as_ref(), row.size) {
                     start = Some(row.clone());
                 }
                 ui.add_space(TILE_GAP);
@@ -1354,7 +1450,7 @@ impl LapinuxApp {
             let label = if show_all {
                 lapinux_core::i18n::t("downloads.collapse_list").to_string()
             } else {
-                format!("Tout afficher ({})", rows.len())
+                lapinux_core::i18n::t_fmt("downloads.show_all_count", &[rows.len().to_string()])
             };
             if link_text(ui, &label).clicked() {
                 self.downloads.updates_show_all = !self.downloads.updates_show_all;
@@ -1412,11 +1508,9 @@ impl LapinuxApp {
                     let Some(appid) = item.get("appid").and_then(|value| value.as_u64()) else {
                         continue;
                     };
-                    let store = item
-                        .get("store")
-                        .and_then(|value| {
-                            serde_json::from_value::<lapinux_core::stores::Store>(value.clone()).ok()
-                        });
+                    let store = item.get("store").and_then(|value| {
+                        serde_json::from_value::<lapinux_core::stores::Store>(value.clone()).ok()
+                    });
                     rows.push(UpdateRow {
                         appid: appid as u32,
                         name: item
@@ -1495,14 +1589,24 @@ impl LapinuxApp {
                 egui::pos2(inner.left(), buttons_y),
                 egui::vec2(104.0, 26.0),
             );
-            if tile_button(ui, save_rect, lapinux_core::i18n::t("downloads.save"), false) {
+            if tile_button(
+                ui,
+                save_rect,
+                lapinux_core::i18n::t("downloads.save"),
+                false,
+            ) {
                 save = true;
             }
             let cancel_rect = egui::Rect::from_min_size(
                 egui::pos2(save_rect.right() + 8.0, buttons_y),
                 egui::vec2(84.0, 26.0),
             );
-            if tile_button(ui, cancel_rect, lapinux_core::i18n::t("downloads.cancel"), false) {
+            if tile_button(
+                ui,
+                cancel_rect,
+                lapinux_core::i18n::t("downloads.cancel"),
+                false,
+            ) {
                 cancel = true;
             }
             // La colonne de droite est étroite : le rappel ne s'affiche que
@@ -1572,7 +1676,10 @@ impl LapinuxApp {
                     painter.text(
                         egui::pos2(inner.left(), info_y),
                         egui::Align2::LEFT_CENTER,
-                        lapinux_core::i18n::t_args("downloads.used_percent", &[("percent", &format!("{used:.0}"))]),
+                        lapinux_core::i18n::t_args(
+                            "downloads.used_percent",
+                            &[("percent", &format!("{used:.0}"))],
+                        ),
                         egui::FontId::proportional(12.5),
                         color,
                     );
@@ -1588,10 +1695,7 @@ impl LapinuxApp {
                     painter.text(
                         egui::pos2(label_x, info_y),
                         egui::Align2::LEFT_CENTER,
-                        lapinux_core::util::ellipsize(
-                            &free,
-                            (label_width / 5.6).max(6.0) as usize,
-                        ),
+                        lapinux_core::util::ellipsize(&free, (label_width / 5.6).max(6.0) as usize),
                         egui::FontId::proportional(12.0),
                         TEXT(),
                     );
@@ -1824,7 +1928,11 @@ impl LapinuxApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 3.0;
-                ui.label(egui::RichText::new(lapinux_core::i18n::t("downloads.limits")).size(12.5).strong());
+                ui.label(
+                    egui::RichText::new(lapinux_core::i18n::t("downloads.limits"))
+                        .size(12.5)
+                        .strong(),
+                );
                 muted(ui, lapinux_core::i18n::t("downloads.limits_note"));
                 ui.add_space(7.0);
 
@@ -1841,15 +1949,14 @@ impl LapinuxApp {
                         let text = if *value == 0 {
                             lapinux_core::i18n::t("downloads.unlimited").to_string()
                         } else {
-                            lapinux_core::i18n::t_args("downloads.mbit", &[("value", &value.to_string())])
+                            lapinux_core::i18n::t_args(
+                                "downloads.mbit",
+                                &[("value", &value.to_string())],
+                            )
                         };
                         let label_width = ui
                             .painter()
-                            .layout_no_wrap(
-                                text.clone(),
-                                egui::FontId::proportional(10.5),
-                                TEXT(),
-                            )
+                            .layout_no_wrap(text.clone(), egui::FontId::proportional(10.5), TEXT())
                             .size()
                             .x;
                         let width = (ui.available_width() - label_width - 10.0).max(80.0);
@@ -1865,7 +1972,11 @@ impl LapinuxApp {
                     *ui.spacing_mut() = spacing;
                     ui.add_space(2.0);
                 };
-                row(ui, LimitIcon::Globe(lapinux_core::i18n::t("downloads.global")), &mut draft.global_mbit_per_sec);
+                row(
+                    ui,
+                    LimitIcon::Globe(lapinux_core::i18n::t("downloads.global")),
+                    &mut draft.global_mbit_per_sec,
+                );
 
                 ui.add_space(5.0);
 
@@ -1886,8 +1997,13 @@ impl LapinuxApp {
                         .cmp(&rank(b))
                         .then_with(|| download_store_label(a).cmp(&download_store_label(b)))
                 });
-                let header =
-                    Self::section_heading(ui, lapinux_core::i18n::t("downloads.per_launcher"), &stores.len().to_string(), None, stores_open);
+                let header = Self::section_heading(
+                    ui,
+                    lapinux_core::i18n::t("downloads.per_launcher"),
+                    &stores.len().to_string(),
+                    None,
+                    stores_open,
+                );
                 if header.toggle {
                     stores_open = !stores_open;
                 }
@@ -1897,8 +2013,7 @@ impl LapinuxApp {
                         // Un store sans entrée s'affiche à 0 sans être ajouté
                         // au brouillon : sinon la carte serait toujours « en
                         // attente », même sans aucune modification.
-                        let mut value =
-                            draft.store_mbit_per_sec.get(&store).copied().unwrap_or(0);
+                        let mut value = draft.store_mbit_per_sec.get(&store).copied().unwrap_or(0);
                         match marks.iter().find(|(key, _)| *key == store) {
                             Some((_, texture)) => row(
                                 ui,
@@ -1939,10 +2054,13 @@ impl LapinuxApp {
                         lapinux_core::i18n::t("downloads.concurrent_off")
                     },
                 );
-
             });
 
+        let stores_changed = self.downloads.limits_stores_open != stores_open;
         self.downloads.limits_stores_open = stores_open;
+        if stores_changed {
+            self.remember_download_sections();
+        }
 
         // On ne fige le brouillon que s'il diffère réellement de la
         // configuration. Au lancement, la configuration du daemon arrive
@@ -2002,25 +2120,22 @@ impl LapinuxApp {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(lapinux_core::i18n::t("downloads.servers")).size(12.5).strong());
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if help_button(
-                                ui,
-                                self.downloads.servers_help_open,
-                                lapinux_core::i18n::t("downloads.servers_why"),
-                            ) {
-                                self.downloads.servers_help_open =
-                                    !self.downloads.servers_help_open;
-                            }
-                        },
+                    ui.label(
+                        egui::RichText::new(lapinux_core::i18n::t("downloads.servers"))
+                            .size(12.5)
+                            .strong(),
                     );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if help_button(
+                            ui,
+                            self.downloads.servers_help_open,
+                            lapinux_core::i18n::t("downloads.servers_why"),
+                        ) {
+                            self.downloads.servers_help_open = !self.downloads.servers_help_open;
+                        }
+                    });
                 });
-                muted(
-                    ui,
-                    lapinux_core::i18n::t("downloads.servers_note"),
-                );
+                muted(ui, lapinux_core::i18n::t("downloads.servers_note"));
                 ui.add_space(4.0);
 
                 let label_width = 96.0;
@@ -2051,7 +2166,10 @@ impl LapinuxApp {
                         .width(230.0)
                         .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(current.is_empty(), lapinux_core::i18n::t("downloads.automatic"))
+                                .selectable_label(
+                                    current.is_empty(),
+                                    lapinux_core::i18n::t("downloads.automatic"),
+                                )
                                 .clicked()
                             {
                                 draft.steam_server.clear();
@@ -2094,7 +2212,13 @@ impl LapinuxApp {
                         Some(list) if list.is_empty() => {
                             muted(ui, lapinux_core::i18n::t("downloads.dir_offline"))
                         }
-                        Some(list) => muted(ui, &lapinux_core::i18n::t_args("downloads.cache_count", &[("count", &list.len().to_string())])),
+                        Some(list) => muted(
+                            ui,
+                            &lapinux_core::i18n::t_args(
+                                "downloads.cache_count",
+                                &[("count", &list.len().to_string())],
+                            ),
+                        ),
                     }
                 });
 
@@ -2111,9 +2235,7 @@ impl LapinuxApp {
                                 TEXT_DIM(),
                             );
                             ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new("Epic Games").size(11.5).color(TEXT()),
-                            );
+                            ui.label(egui::RichText::new("Epic Games").size(11.5).color(TEXT()));
                         },
                     );
                     let current = draft.epic_cdn.trim().to_string();
@@ -2128,10 +2250,26 @@ impl LapinuxApp {
                         .width(230.0)
                         .show_ui(ui, |ui| {
                             for (id, label, detail) in [
-                                ("", lapinux_core::i18n::t("downloads.automatic"), lapinux_core::i18n::t("downloads.cdn.epic_auto")),
-                                ("cloudfront", "CloudFront", lapinux_core::i18n::t("downloads.cdn.cloudfront")),
-                                ("akamai", "Akamai", lapinux_core::i18n::t("downloads.cdn.akamai")),
-                                ("fastly", "Fastly", lapinux_core::i18n::t("downloads.cdn.fastly")),
+                                (
+                                    "",
+                                    lapinux_core::i18n::t("downloads.automatic"),
+                                    lapinux_core::i18n::t("downloads.cdn.epic_auto"),
+                                ),
+                                (
+                                    "cloudfront",
+                                    "CloudFront",
+                                    lapinux_core::i18n::t("downloads.cdn.cloudfront"),
+                                ),
+                                (
+                                    "akamai",
+                                    "Akamai",
+                                    lapinux_core::i18n::t("downloads.cdn.akamai"),
+                                ),
+                                (
+                                    "fastly",
+                                    "Fastly",
+                                    lapinux_core::i18n::t("downloads.cdn.fastly"),
+                                ),
                             ] {
                                 if ui
                                     .selectable_label(
@@ -2150,7 +2288,10 @@ impl LapinuxApp {
 
                 // GOG et itch n'ont qu'un CDN : la ligne l'annonce plutôt
                 // que d'offrir un choix qui ne changerait rien.
-                for store in [lapinux_core::stores::Store::Gog, lapinux_core::stores::Store::Itch] {
+                for store in [
+                    lapinux_core::stores::Store::Gog,
+                    lapinux_core::stores::Store::Itch,
+                ] {
                     ui.horizontal(|ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(label_width, 20.0),
@@ -2205,6 +2346,29 @@ impl LapinuxApp {
         }
     }
 
+    /// Enregistre l'état replié/déplié des catégories. Un clic sur un chevron
+    /// ne doit pas se perdre au prochain redémarrage.
+    fn remember_download_sections(&mut self) {
+        let collapsed = self.downloads.collapsed_keys();
+        if collapsed == self.config.downloads.collapsed_sections {
+            return;
+        }
+        let mut config = self.config.clone();
+        config.downloads.collapsed_sections = collapsed.clone();
+        match self.client.request(&Req::SetConfig {
+            config: config.clone(),
+        }) {
+            Ok(envelope) if envelope.ok => {
+                self.config = config;
+                if let Some(draft) = self.settings_draft.as_mut() {
+                    draft.downloads.collapsed_sections = collapsed;
+                }
+            }
+            Ok(envelope) => self.notify(envelope.error.unwrap_or_default()),
+            Err(err) => self.notify(format!("{err}")),
+        }
+    }
+
     fn speedtest_card(&mut self, ui: &mut egui::Ui) {
         let mut run = false;
         let mut copy = false;
@@ -2239,37 +2403,40 @@ impl LapinuxApp {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(lapinux_core::i18n::t("downloads.throughput")).size(12.5).strong());
+                        ui.label(
+                            egui::RichText::new(lapinux_core::i18n::t("downloads.throughput"))
+                                .size(12.5)
+                                .strong(),
+                        );
                         match elapsed {
                             Some(seconds) => muted(ui, format!("· {}", format_seconds(seconds))),
-                            None if running => muted(ui, lapinux_core::i18n::t("downloads.running")),
+                            None if running => {
+                                muted(ui, lapinux_core::i18n::t("downloads.running"))
+                            }
                             None => {}
                         }
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                // Une mesure existe : l'icône copie le relevé
-                                // complet, prêt à coller ailleurs.
-                                if ping.is_some() || down.is_some() || up.is_some() {
-                                    let (icon_rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(20.0, 20.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    if hero_glyph_button(
-                                        ui,
-                                        icon_rect,
-                                        "speedtest-copy",
-                                        HeroGlyph::Copy,
-                                        egui::Color32::from_black_alpha(80),
-                                        TEXT(),
-                                        lapinux_core::i18n::t("downloads.copy_speeds"),
-                                    ) {
-                                        copy = true;
-                                    }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Une mesure existe : l'icône copie le relevé
+                            // complet, prêt à coller ailleurs.
+                            if ping.is_some() || down.is_some() || up.is_some() {
+                                let (icon_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(20.0, 20.0),
+                                    egui::Sense::hover(),
+                                );
+                                if hero_glyph_button(
+                                    ui,
+                                    icon_rect,
+                                    "speedtest-copy",
+                                    HeroGlyph::Copy,
+                                    egui::Color32::from_black_alpha(80),
+                                    TEXT(),
+                                    lapinux_core::i18n::t("downloads.copy_speeds"),
+                                ) {
+                                    copy = true;
                                 }
-                                muted(ui, "Cloudflare");
-                            },
-                        );
+                            }
+                            muted(ui, "Cloudflare");
+                        });
                     });
                     ui.add_space(2.0);
                     speedtest_row(
@@ -2299,7 +2466,7 @@ impl LapinuxApp {
                     ui.add_space(2.0);
                     if running {
                         ui.horizontal(|ui| {
-                            ui.spinner();
+                            crate::section_icons::loading(ui, 18.0);
                             ui.label(
                                 egui::RichText::new(lapinux_core::i18n::t("downloads.testing"))
                                     .size(10.5)
@@ -2325,12 +2492,7 @@ impl LapinuxApp {
         }
         if copy {
             ui.ctx().copy_text(speedtest_summary(
-                ping,
-                down,
-                down_range,
-                up,
-                up_range,
-                elapsed,
+                ping, down, down_range, up, up_range, elapsed,
             ));
         }
         if run {
@@ -2387,10 +2549,10 @@ impl LapinuxApp {
             egui::pos2(inner.right() - 14.0, inner.top() + 6.0),
             egui::Align2::RIGHT_CENTER,
             if running {
-            lapinux_core::i18n::t("downloads.avg_4s")
-        } else {
-            lapinux_core::i18n::t("downloads.paused_short")
-        },
+                lapinux_core::i18n::t("downloads.avg_4s")
+            } else {
+                lapinux_core::i18n::t("downloads.paused_short")
+            },
             egui::FontId::proportional(10.5),
             TEXT_DIM(),
         );
@@ -2417,11 +2579,7 @@ impl LapinuxApp {
             RATE_WRITE,
             HeroGlyph::Disk,
         );
-        let _ = response.on_hover_text(
-            "Débit réseau et écriture disque des téléchargements, moyennés sur 4 s : \
-             les chunks Steam arrivent par paquets, une valeur instantanée saute entre \
-             0 et le double du débit réel",
-        );
+        let _ = response.on_hover_text(lapinux_core::i18n::t("ui.downloads_rate_hint"));
     }
 
     /// Ouvre l'emplacement du dossier dans le gestionnaire de fichiers du
@@ -2434,7 +2592,7 @@ impl LapinuxApp {
     fn set_download_dir(&mut self, input: &str) {
         let trimmed = input.trim();
         if trimmed.is_empty() {
-            self.notify("Dossier vide");
+            self.notify(lapinux_core::i18n::t("downloads.empty_folder"));
             return;
         }
         let mut path = lapinux_core::paths::expand_tilde(trimmed);
@@ -2443,14 +2601,16 @@ impl LapinuxApp {
         }
         let mut config = self.config.clone();
         config.general.library_root = path.display().to_string();
-        match self.client.request(&Req::SetConfig { config: config.clone() }) {
+        match self.client.request(&Req::SetConfig {
+            config: config.clone(),
+        }) {
             Ok(envelope) if envelope.ok => {
                 self.config = config;
                 self.settings_draft = None;
                 self.downloads.dir_draft = None;
                 self.disk = lapinux_core::system::disk_usage(&self.config.library_root());
                 self.disk_poll = Instant::now();
-                self.notify("Dossier de téléchargements mis à jour");
+                self.notify(lapinux_core::i18n::t("downloads.folder_updated"));
             }
             Ok(envelope) => self.notify(envelope.error.unwrap_or_default()),
             Err(err) => self.notify(format!("{err}")),
@@ -2464,10 +2624,7 @@ impl LapinuxApp {
 /// les réglages, le même hôte que celui que Steam choisirait.
 fn steam_content_servers() -> Vec<lapinux_core::model::DownloadServer> {
     let url = "https://api.steampowered.com/IContentServerDirectoryService/GetServersForSteamPipe/v1/?cell_id=0&max_servers=40";
-    let Ok(response) = ureq::get(url)
-        .timeout(Duration::from_secs(8))
-        .call()
-    else {
+    let Ok(response) = ureq::get(url).timeout(Duration::from_secs(8)).call() else {
         return Vec::new();
     };
     let mut text = String::new();
@@ -2503,9 +2660,12 @@ fn steam_content_servers() -> Vec<lapinux_core::model::DownloadServer> {
             id: host.to_string(),
             label: host.to_string(),
             detail: if group.is_empty() {
-                format!("charge {load} %")
+                lapinux_core::i18n::t_args("downloads.load_percent", &[("load", &load.to_string())])
             } else {
-                format!("{group} · charge {load} %")
+                lapinux_core::i18n::t_args(
+                    "downloads.group_load",
+                    &[("group", &group), ("load", &load.to_string())],
+                )
             },
         });
     }
@@ -2648,13 +2808,16 @@ pub(crate) mod wording {
     /// télécharger, jamais le volume déjà installé. La tuile, la pastille et
     /// la fiche du jeu partagent ce libellé.
     pub(crate) fn update_download_label(bytes: u64) -> String {
-        format!("{} à télécharger", format_bytes(bytes))
+        lapinux_core::i18n::t_fmt("downloads.to_download", &[format_bytes(bytes).to_string()])
     }
 
     pub(crate) fn update_announcement(size: Option<u64>) -> String {
         match size {
-            Some(bytes) => format!("Mise à jour · {}", update_download_label(bytes)),
-            None => "Mise à jour · taille inconnue".to_string(),
+            Some(bytes) => lapinux_core::i18n::t_fmt(
+                "downloads.update_with",
+                &[update_download_label(bytes).to_string()],
+            ),
+            None => lapinux_core::i18n::t("downloads.update_unknown_size").to_string(),
         }
     }
 
@@ -2663,7 +2826,6 @@ pub(crate) mod wording {
     pub(crate) fn reused_bytes(job: &Job) -> u64 {
         job.downloaded.saturating_sub(job.network)
     }
-
 }
 
 /// Vrai pour un état d'installation qui attend encore quelque chose de
@@ -2740,7 +2902,7 @@ fn job_sections(jobs: &[Job]) -> JobSections {
             }
             None => {
                 if active {
-                    if job.kind == JobKind::InstallProton {
+                    if matches!(job.kind, JobKind::InstallProton | JobKind::InstallGraphics) {
                         sections.programs.push(job.clone());
                     } else if matches!(job.state, JobState::Paused | JobState::Interrupted) {
                         sections.paused.push(job.clone());
@@ -2753,9 +2915,9 @@ fn job_sections(jobs: &[Job]) -> JobSections {
             }
         }
     }
-    sections.history.sort_by_key(|job| {
-        std::cmp::Reverse(job.finished.unwrap_or(job.started))
-    });
+    sections
+        .history
+        .sort_by_key(|job| std::cmp::Reverse(job.finished.unwrap_or(job.started)));
     sections
 }
 
@@ -2863,9 +3025,11 @@ impl JobTileAction {
 fn phase_label(phase: &str) -> String {
     let phase = phase.trim();
     if phase.eq_ignore_ascii_case("nettoyage des doublages") {
-        sentence("suppression des autres langues audio")
+        sentence(lapinux_core::i18n::t(
+            "downloads.removing_audio_langs_title",
+        ))
     } else if let Some(rest) = phase.strip_prefix("manifeste ") {
-        format!("Lecture des manifestes {rest}")
+        lapinux_core::i18n::t_args("ui.reading_manifests", &[("rest", &rest.to_string())])
     } else {
         sentence(phase)
     }
@@ -2876,9 +3040,9 @@ fn phase_label(phase: &str) -> String {
 /// des applications séparées, d'où « Jeu de base » plutôt que « Jeu ».
 fn job_kind_label(job: &Job) -> String {
     let base = match job.kind {
-        JobKind::InstallGame if job.updating => "Mise à jour",
-        JobKind::InstallGame => "Jeu de base",
-        _ => "Programme",
+        JobKind::InstallGame if job.updating => lapinux_core::i18n::t("downloads.update"),
+        JobKind::InstallGame => lapinux_core::i18n::t("downloads.base_game"),
+        _ => lapinux_core::i18n::t("downloads.program"),
     };
     // Les contenus additionnels partent avec le jeu : la carte le dit, sinon
     // rien n'indique ce qui sera installé en plus du build public.
@@ -2891,13 +3055,13 @@ fn job_kind_label(job: &Job) -> String {
 
 fn state_title(state: JobState) -> &'static str {
     match state {
-        JobState::Queued => "En attente",
+        JobState::Queued => lapinux_core::i18n::t("downloads.state_queued"),
         JobState::Running => lapinux_core::i18n::t("downloads.active"),
         JobState::Paused => lapinux_core::i18n::t("downloads.paused"),
-        JobState::Done => "Terminé",
-        JobState::Failed => "Échec",
-        JobState::Cancelled => "Annulé",
-        JobState::Interrupted => "Interrompu",
+        JobState::Done => lapinux_core::i18n::t("downloads.done_title"),
+        JobState::Failed => lapinux_core::i18n::t("downloads.failed"),
+        JobState::Cancelled => lapinux_core::i18n::t("downloads.cancelled"),
+        JobState::Interrupted => lapinux_core::i18n::t("downloads.state_interrupted"),
     }
 }
 
@@ -2905,13 +3069,16 @@ fn state_title(state: JobState) -> &'static str {
 fn job_when(job: &Job) -> String {
     let unix = job.finished.unwrap_or(job.started);
     if unix <= 0 {
-        return "date inconnue".to_string();
+        return lapinux_core::i18n::t("downloads.unknown_date").to_string();
     }
     let seconds = (lapinux_core::util::now_unix() - unix).max(0) as u64;
     if seconds < 60 {
-        "à l'instant".to_string()
+        lapinux_core::i18n::t("downloads.just_now").to_string()
     } else {
-        format!("il y a {}", lapinux_core::util::format_duration(seconds))
+        lapinux_core::i18n::t_args(
+            "downloads.ago",
+            &[("time", &lapinux_core::util::format_duration(seconds))],
+        )
     }
 }
 
@@ -2930,8 +3097,7 @@ fn job_remaining_seconds(job: &Job, net_rate: f32) -> Option<u64> {
 /// chunks déjà demandés terminent d'un coup au redémarrage ; mesurés dans
 /// l'ancienne fenêtre, ils affichaient un débit de plusieurs Gb/s.
 fn is_resume(previous: Option<JobState>, current: JobState) -> bool {
-    current == JobState::Running
-        && matches!(previous, Some(JobState::Paused | JobState::Queued))
+    current == JobState::Running && matches!(previous, Some(JobState::Paused | JobState::Queued))
 }
 
 /// Poids du téléchargement annoncé par Steam pour le build public. Notre
@@ -2973,36 +3139,34 @@ fn folder_icon_button(ui: &mut egui::Ui, rect: egui::Rect, action: FolderAction)
     let response = ui.interact(rect, id, egui::Sense::click());
     let hovered = response.hovered();
     let pressed = response.is_pointer_button_down_on();
-    let rounding = egui::Rounding::same(9.0);
-    // Une ombre courte décolle le bouton de la carte, puis un fond plus clair
-    // au survol : deux icônes discrètes, sans cadre brut.
-    ui.painter().rect_filled(
-        rect.translate(egui::vec2(0.0, 1.5)),
-        rounding,
-        egui::Color32::from_black_alpha(45),
-    );
+    let rounding = egui::Rounding::same(8.0);
+    // Un fond de carte, sans ombre ni cadre lourd : les deux pictogrammes
+    // restent les seuls éléments visibles.
     ui.painter().rect(
         rect,
         rounding,
         if pressed {
-            egui::Color32::from_white_alpha(22)
+            CARD_ACTIVE()
         } else if hovered {
-            egui::Color32::from_white_alpha(14)
+            CARD_HOVER()
         } else {
-            egui::Color32::from_black_alpha(55)
+            CARD()
         },
         egui::Stroke::new(
             1.0_f32,
             if hovered || response.has_focus() {
-                with_alpha(ACCENT(), 0.59)
+                with_alpha(ACCENT(), 0.65)
             } else {
-                egui::Color32::from_white_alpha(26)
+                BORDER()
             },
         ),
     );
     if response.has_focus() {
-        ui.painter()
-            .rect_stroke(rect.shrink(2.0), rounding, egui::Stroke::new(1.0_f32, ACCENT()));
+        ui.painter().rect_stroke(
+            rect.shrink(2.0),
+            rounding,
+            egui::Stroke::new(1.0_f32, ACCENT()),
+        );
     }
     let ink = if hovered || response.has_focus() {
         ACCENT()
@@ -3016,52 +3180,46 @@ fn folder_icon_button(ui: &mut egui::Ui, rect: egui::Rect, action: FolderAction)
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(match action {
-            FolderAction::Edit => "Modifier le dossier",
-            FolderAction::Open => "Ouvrir le dossier",
+            FolderAction::Edit => lapinux_core::i18n::t("downloads.edit_folder"),
+            FolderAction::Open => lapinux_core::i18n::t("downloads.open_folder"),
         })
         .clicked()
 }
 
-/// Crayon : corps diagonal et pointe, lisible même à 24 px.
+/// Crayon au trait : deux flancs, une pointe et un talon, lisible à 24 px.
 fn paint_pencil(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
-    let back = center + egui::vec2(-4.5, 4.5);
-    let front = center + egui::vec2(3.0, -3.0);
-    painter.line_segment([back, front], egui::Stroke::new(2.6_f32, color));
+    let stroke = egui::Stroke::new(1.35_f32, color);
+    let back = center + egui::vec2(-4.8, 4.8);
+    let front = center + egui::vec2(3.8, -3.8);
+    let offset = egui::vec2(1.3, 1.3);
+    painter.line_segment([back + offset, front + offset], stroke);
+    painter.line_segment([back - offset, front - offset], stroke);
+    painter.line_segment([back - offset, back + offset], stroke);
     painter.add(egui::Shape::convex_polygon(
         vec![
-            center + egui::vec2(-6.2, 6.2),
-            center + egui::vec2(-4.6, 2.2),
-            center + egui::vec2(-2.2, 4.6),
+            front - offset,
+            front + offset,
+            front + egui::vec2(2.4, -2.4),
         ],
         color,
         egui::Stroke::NONE,
     ));
 }
 
-/// Dossier ouvert : un corps et son onglet, dessinés au trait.
+/// Dossier et flèche sortante : le pictogramme « ouvrir le dossier ».
 fn paint_folder(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
-    let body = egui::Rect::from_center_size(center + egui::vec2(0.0, 1.5), egui::vec2(13.0, 9.0));
-    painter.rect_stroke(
-        body,
-        egui::Rounding::same(1.5),
-        egui::Stroke::new(1.3_f32, color),
-    );
-    let tab = egui::Rect::from_min_size(
-        body.min + egui::vec2(0.0, -3.0),
-        egui::vec2(6.0, 3.0),
-    );
-    painter.line_segment(
-        [body.left_top(), tab.left_top()],
-        egui::Stroke::new(1.3_f32, color),
-    );
-    painter.line_segment(
-        [tab.left_top(), tab.right_top()],
-        egui::Stroke::new(1.3_f32, color),
-    );
-    painter.line_segment(
-        [tab.right_top(), tab.right_bottom()],
-        egui::Stroke::new(1.3_f32, color),
-    );
+    let stroke = egui::Stroke::new(1.35_f32, color);
+    let body = egui::Rect::from_center_size(center + egui::vec2(0.0, 2.0), egui::vec2(12.0, 8.0));
+    painter.rect_stroke(body, egui::Rounding::same(2.0), stroke);
+    let tab = egui::Rect::from_min_size(body.min + egui::vec2(0.0, -3.0), egui::vec2(5.5, 3.0));
+    painter.line_segment([body.left_top(), tab.left_top()], stroke);
+    painter.line_segment([tab.left_top(), tab.right_top()], stroke);
+    painter.line_segment([tab.right_top(), tab.right_bottom()], stroke);
+    let start = center + egui::vec2(0.0, 1.0);
+    let tip = center + egui::vec2(4.7, -4.7);
+    painter.line_segment([start, tip], stroke);
+    painter.line_segment([tip, tip + egui::vec2(-3.0, 0.0)], stroke);
+    painter.line_segment([tip, tip + egui::vec2(0.0, 3.0)], stroke);
 }
 
 /// Bouton de carte : un vrai widget egui, donc focusable au clavier et à la
@@ -3107,7 +3265,7 @@ fn download_facts(job: &Job) -> Vec<String> {
     // installation de jeu ne les comprend pas. Placé tôt pour rester visible
     // quand la carte compacte coupe la fin de la ligne.
     if job.kind == JobKind::InstallGame {
-        facts.push("sans DLC".to_string());
+        facts.push(lapinux_core::i18n::t("downloads.no_dlc").to_string());
     }
     if !job.server.is_empty() {
         let source = if job.kind == JobKind::InstallGame {
@@ -3132,14 +3290,24 @@ fn download_facts(job: &Job) -> Vec<String> {
     // Le pas du daemon cite déjà le dépôt (« dépôt 1/11 · téléchargement ») :
     // inutile de répéter « dépôt 1/11 » juste à côté.
     let step_lower = step.to_lowercase();
-    if job.depots > 1 && !step_lower.contains("partie") && !step_lower.contains("dépôt") {
-        facts.push(format!("partie {}/{}", job.depot, job.depots));
+    let part_word = lapinux_core::i18n::t("downloads.part");
+    let part_token = part_word.split(" {}").next().unwrap_or("partie");
+    if job.depots > 1
+        && !step_lower.contains("partie")
+        && !step_lower.contains(part_token)
+        && !step_lower.contains("dépôt")
+        && !step_lower.contains("depot")
+    {
+        facts.push(lapinux_core::i18n::t_fmt(
+            "downloads.part",
+            &[job.depot.to_string(), job.depots.to_string()],
+        ));
     }
     if job.started > 0 {
         let elapsed = (lapinux_core::util::now_unix() - job.started).max(0) as u64;
-        facts.push(format!(
-            "depuis {}",
-            lapinux_core::util::format_duration(elapsed)
+        facts.push(lapinux_core::i18n::t_fmt(
+            "downloads.since",
+            &[lapinux_core::util::format_duration(elapsed)],
         ));
     }
     facts
@@ -3181,11 +3349,11 @@ fn download_hero_tile(
     icon: Option<&egui::TextureHandle>,
     source: Option<&egui::TextureHandle>,
     net_rate: f32,
+    eta_rate: f32,
 ) -> JobTileAction {
     const HEIGHT: f32 = 96.0;
     const PAD: f32 = 20.0;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
     let painter = ui.painter().clone();
     // Bords droits, comme la vignette du jeu : une carte sobre, sans arrondi.
     painter.rect_filled(rect, egui::Rounding::same(0.0), CARD());
@@ -3221,14 +3389,7 @@ fn download_hero_tile(
         _ => ACCENT(),
     };
     // Le fond se remplit de gauche à droite, sous le texte.
-    paint_card_fill(
-        &painter,
-        rect,
-        ratio,
-        palette,
-        progress_color,
-        paused,
-    );
+    paint_card_fill(&painter, rect, ratio, palette, progress_color, paused);
     // Poignée de glisser-déposer, dans la marge gauche : six points discrets.
     // Elle ne prend la place ni de l'icône ni du titre.
     if working {
@@ -3259,7 +3420,7 @@ fn download_hero_tile(
             }
         }
         handle.dnd_set_drag_payload::<String>(job.id.clone());
-        let _ = handle.on_hover_text("Glisser pour changer l'ordre des téléchargements");
+        let _ = handle.on_hover_text(lapinux_core::i18n::t("downloads.drag_order"));
     }
 
     let icon_rect = egui::Rect::from_min_size(
@@ -3339,14 +3500,14 @@ fn download_hero_tile(
                 HeroGlyph::Play,
                 ACCENT(),
                 egui::Color32::from_rgb(24, 25, 27),
-                "Reprendre",
+                lapinux_core::i18n::t("downloads.resume"),
             )
         } else {
             (
                 HeroGlyph::Pause,
                 egui::Color32::from_black_alpha(80),
                 TEXT(),
-                "Mettre en pause",
+                lapinux_core::i18n::t("downloads.pause"),
             )
         };
         if hero_glyph_button(ui, primary_rect, &job.id, glyph, fill, ink, tip) {
@@ -3354,7 +3515,7 @@ fn download_hero_tile(
         }
     } else if can_resume {
         let tip = if matches!(job.state, JobState::Cancelled | JobState::Interrupted) {
-            "Reprendre"
+            lapinux_core::i18n::t("downloads.resume")
         } else {
             lapinux_core::i18n::t("downloads.retry")
         };
@@ -3377,12 +3538,12 @@ fn download_hero_tile(
             HeroGlyph::Document,
             egui::Color32::from_black_alpha(80),
             TEXT(),
-            "Rapport de téléchargement",
+            lapinux_core::i18n::t("downloads.report_title"),
         ) {
             action.report = Some(job.id.clone());
         }
     }
-    if working {
+    if working || job.state == JobState::Interrupted {
         if hero_cancel(ui, cancel_rect, &job.id) {
             action.cancel = Some(job.id.clone());
         }
@@ -3394,7 +3555,7 @@ fn download_hero_tile(
             HeroGlyph::Trash,
             egui::Color32::from_black_alpha(80),
             TEXT(),
-            "Supprimer de l'historique",
+            lapinux_core::i18n::t("downloads.remove_history"),
         )
     {
         action.delete = Some(job.id.clone());
@@ -3406,7 +3567,7 @@ fn download_hero_tile(
         HeroGlyph::Info,
         egui::Color32::from_black_alpha(80),
         TEXT(),
-        "Informations du téléchargement",
+        lapinux_core::i18n::t("downloads.info_title"),
     ) {
         action.info = Some(job.id.clone());
     }
@@ -3440,10 +3601,7 @@ fn download_hero_tile(
     let kind_rect = text_painter.text(
         egui::pos2(text_x, icon_rect.center().y + 11.0),
         egui::Align2::LEFT_CENTER,
-        lapinux_core::util::ellipsize(
-            &job_kind_label(job),
-            (text_width / 6.0).max(6.0) as usize,
-        ),
+        lapinux_core::util::ellipsize(&job_kind_label(job), (text_width / 6.0).max(6.0) as usize),
         egui::FontId::proportional(10.5),
         TEXT_DIM(),
     );
@@ -3462,7 +3620,8 @@ fn download_hero_tile(
     } else {
         bytes(job.downloaded)
     };
-    let meaningful_phase = !phase.is_empty() && !phase.eq_ignore_ascii_case("téléchargement");
+    let meaningful_phase = !phase.is_empty()
+        && !phase.eq_ignore_ascii_case(lapinux_core::i18n::t("downloads.download_lower"));
     let detail = if job.state == JobState::Queued {
         "En attente…".to_string()
     } else if paused {
@@ -3471,7 +3630,7 @@ fn download_hero_tile(
         let mut text = if meaningful_phase {
             phase_label(phase)
         } else {
-            "Préparation".to_string()
+            lapinux_core::i18n::t("downloads.preparing").to_string()
         };
         if !text.ends_with('…') {
             text.push('…');
@@ -3499,7 +3658,10 @@ fn download_hero_tile(
         // confond pas avec une tâche qui avance.
         format!("{} · {volume}", state_title(job.state))
     } else if job.state == JobState::Done {
-        format!("Terminé · {volume}")
+        lapinux_core::i18n::t_args(
+            "downloads.finished_volume",
+            &[("volume", &volume.to_string())],
+        )
     } else {
         volume
     };
@@ -3513,7 +3675,11 @@ fn download_hero_tile(
         egui::Align2::CENTER_CENTER,
         lapinux_core::util::ellipsize(&detail, detail_chars),
         display_font(13.5),
-        if working && !paused { TEXT() } else { TEXT_DIM() },
+        if working && !paused {
+            TEXT()
+        } else {
+            TEXT_DIM()
+        },
     );
     // Tant que le poids exact n'est pas connu (manifestes en cours), un
     // « 0 % » serait faux : la carte affiche une attente discrète.
@@ -3528,20 +3694,20 @@ fn download_hero_tile(
     } else {
         let percent = format!("{:.0} %", (ratio * 100.0).round());
         let extra = if working && !paused {
-            job_remaining_seconds(job, net_rate)
+            job_remaining_seconds(job, eta_rate)
                 .filter(|seconds| *seconds > 0)
                 .map(|seconds| {
-                    format!(
-                        " · reste {}",
-                        lapinux_core::util::format_duration(seconds)
+                    lapinux_core::i18n::t_args(
+                        "downloads.time_left_suffix",
+                        &[("time", &lapinux_core::util::format_duration(seconds))],
                     )
                 })
                 .unwrap_or_default()
         } else if paused {
-            " · en pause".to_string()
+            lapinux_core::i18n::t("downloads.paused_suffix").to_string()
         } else if job.state == JobState::Done {
             match job_when(job) {
-                when if when == "date inconnue" => String::new(),
+                when if when == lapinux_core::i18n::t("downloads.unknown_date") => String::new(),
                 when => format!(" · {when}"),
             }
         } else {
@@ -3556,7 +3722,10 @@ fn download_hero_tile(
         let total = percent_galley.size().x + extra_galley.size().x;
         let start = center_x - total / 2.0;
         text_painter.galley(
-            egui::pos2(start, rect.center().y + 11.0 - percent_galley.size().y / 2.0),
+            egui::pos2(
+                start,
+                rect.center().y + 11.0 - percent_galley.size().y / 2.0,
+            ),
             percent_galley.clone(),
             TEXT(),
         );
@@ -3574,39 +3743,41 @@ fn download_hero_tile(
 
     paint_card_border(&painter, rect);
 
-    let mut tooltip = format!(
-        "{} · {}\nTraité : {} / {}\nRéseau : {}\nÉcrit : {}\nServeur : {}\nPartie : {}/{}",
-        state_title(job.state),
-        job.backend,
-        bytes(job.downloaded),
-        if job.total > 0 {
-            bytes(job.total)
-        } else {
-            "?".to_string()
-        },
-        bytes(job.network),
-        bytes(job.written),
-        if job.server.is_empty() {
-            "—"
-        } else {
-            job.server.as_str()
-        },
-        job.depot,
-        job.depots
+    let mut tooltip = lapinux_core::i18n::t_fmt(
+        "downloads.summary_block",
+        &[
+            state_title(job.state).to_string(),
+            job.backend.to_string(),
+            bytes(job.downloaded),
+            if job.total > 0 {
+                bytes(job.total)
+            } else {
+                "?".to_string()
+            },
+            bytes(job.network),
+            bytes(job.written),
+            if job.server.is_empty() {
+                "—".to_string()
+            } else {
+                job.server.clone()
+            },
+            job.depot.to_string(),
+            job.depots.to_string(),
+        ],
     );
     if job.state == JobState::Running {
-        if let Some(seconds) = job_remaining_seconds(job, net_rate).filter(|seconds| *seconds > 0) {
-            tooltip.push_str(&format!(
-                "\nReste estimé : {}",
-                lapinux_core::util::format_duration(seconds)
+        if let Some(seconds) = job_remaining_seconds(job, eta_rate).filter(|seconds| *seconds > 0) {
+            tooltip.push_str(&lapinux_core::i18n::t_fmt(
+                "downloads.remaining",
+                &[lapinux_core::util::format_duration(seconds)],
             ));
         }
     }
     let reused = wording::reused_bytes(job);
     if reused >= 1024 * 1024 {
-        tooltip.push_str(&format!(
-            "\n{} réutilisés du disque",
-            bytes(reused)
+        tooltip.push_str(&lapinux_core::i18n::t_fmt(
+            "downloads.reused_from_disk",
+            &[bytes(reused)],
         ));
     }
     let facts = download_facts(job);
@@ -3615,12 +3786,12 @@ fn download_hero_tile(
         tooltip.push_str(&facts.join(" · "));
     }
     if job.kind == JobKind::InstallGame {
-        tooltip.push_str("\nContenu : jeu de base, DLC installés séparément");
+        tooltip.push_str(lapinux_core::i18n::t("downloads.content_line"));
     }
     if job.started > 0 {
-        tooltip.push_str(&format!(
-            "\nDémarré le {}",
-            lapinux_core::util::format_datetime(job.started)
+        tooltip.push_str(&lapinux_core::i18n::t_fmt(
+            "downloads.started_at",
+            &[lapinux_core::util::format_datetime(job.started)],
         ));
     }
     let response = response.on_hover_text(tooltip);
@@ -3899,12 +4070,8 @@ fn paint_hero_overlay(painter: &egui::Painter, rect: egui::Rect, radius: f32) {
             165.0 + (95.0 - 165.0) * ((t - 0.58) / 0.42)
         };
         let top = egui::Color32::from_rgba_unmultiplied(13, 14, 16, alpha as u8);
-        let bottom = egui::Color32::from_rgba_unmultiplied(
-            13,
-            14,
-            16,
-            (alpha + 40.0).min(230.0) as u8,
-        );
+        let bottom =
+            egui::Color32::from_rgba_unmultiplied(13, 14, 16, (alpha + 40.0).min(230.0) as u8);
         let x = rect.left() + rect.width() * t;
         let (top_y, bottom_y) = rounded_extent(rect, x, radius);
         mesh.colored_vertex(egui::pos2(x, top_y), top);
@@ -3991,14 +4158,14 @@ fn hero_cancel(ui: &mut egui::Ui, rect: egui::Rect, job_id: &str) -> bool {
             HeroGlyph::Check,
             DANGER,
             egui::Color32::from_rgb(24, 25, 27),
-            "Confirmer l'annulation",
+            lapinux_core::i18n::t("downloads.confirm_cancel"),
         )
     } else {
         (
             HeroGlyph::Close,
             egui::Color32::from_black_alpha(80),
             TEXT(),
-            "Annuler le téléchargement",
+            lapinux_core::i18n::t("downloads.cancel"),
         )
     };
     if !hero_glyph_button(ui, rect, job_id, glyph, fill, ink, tooltip) {
@@ -4031,7 +4198,12 @@ fn paint_rate_row(
         egui::pos2(inner.right() - graph_width, top + 4.0),
         egui::pos2(inner.right(), top + 40.0),
     );
-    paint_hero_glyph(painter, egui::pos2(inner.left() + 5.0, top + 11.0), glyph, color);
+    paint_hero_glyph(
+        painter,
+        egui::pos2(inner.left() + 5.0, top + 11.0),
+        glyph,
+        color,
+    );
     painter.text(
         egui::pos2(inner.left() + 16.0, top + 11.0),
         egui::Align2::LEFT_CENTER,
@@ -4093,10 +4265,7 @@ fn paint_rate_graph(
         points.clone(),
         egui::Stroke::new(4.0_f32, with_alpha(color, 0.22)),
     ));
-    painter.add(egui::Shape::line(
-        points,
-        egui::Stroke::new(1.6_f32, color),
-    ));
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.6_f32, color)));
 }
 
 pub(crate) fn paint_hero_glyph(
@@ -4326,11 +4495,14 @@ fn available_update_tile(
     // actives : une mise à jour n'est pas une autre sorte de contenu.
     const HEIGHT: f32 = 96.0;
     const PAD: f32 = 20.0;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
     let hovered = response.hovered();
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, egui::Rounding::same(0.0), if hovered { CARD_HOVER() } else { CARD() });
+    painter.rect_filled(
+        rect,
+        egui::Rounding::same(0.0),
+        if hovered { CARD_HOVER() } else { CARD() },
+    );
     painter.rect_filled(
         egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
         egui::Rounding::same(0.0),
@@ -4366,10 +4538,15 @@ fn available_update_tile(
         egui::pos2(rect.right() - button_width - 16.0, rect.center().y - 15.0),
         egui::vec2(button_width, 30.0),
     );
-    let clicked = tile_button(ui, button, "Mettre à jour", false);
-    let _ = response.on_hover_text(format!(
-        "{} · build {}\nLe build public remplace l'installation existante.",
-        name, appid
+    let clicked = tile_button(
+        ui,
+        button,
+        lapinux_core::i18n::t("configurations.update"),
+        false,
+    );
+    let _ = response.on_hover_text(lapinux_core::i18n::t_fmt(
+        "downloads.build_replaces",
+        &[name.to_string(), appid.to_string()],
     ));
     // Même précaution que la carte dossier : `ui.put` recule le curseur, la
     // tuile suivante de la grille pourrait sinon se poser par-dessus.
@@ -4446,12 +4623,7 @@ impl DownloadArtCache {
 
     /// Illustration large de la carte (capsule Steam ou héros), chargée une
     /// fois puis gardée en texture.
-    fn cover(
-        &mut self,
-        ctx: &egui::Context,
-        paths: &LapinuxPaths,
-        appid: u32,
-    ) -> Option<CoverArt> {
+    fn cover(&mut self, ctx: &egui::Context, paths: &LapinuxPaths, appid: u32) -> Option<CoverArt> {
         if let Some(art) = self.covers.get(&appid) {
             return Some(art.clone());
         }
@@ -4474,11 +4646,7 @@ impl DownloadArtCache {
 /// Plusieurs sources, de la plus large à la plus modeste : l'image de
 /// bibliothèque Steam est déjà en cache pour un jeu installé ; le cache
 /// d'illustrations du client fournit la capsule sinon.
-fn download_cover_art(
-    ctx: &egui::Context,
-    paths: &LapinuxPaths,
-    appid: u32,
-) -> Option<CoverArt> {
+fn download_cover_art(ctx: &egui::Context, paths: &LapinuxPaths, appid: u32) -> Option<CoverArt> {
     let dir = paths.art_dir();
     // Bannière large d'abord : les capsules portrait ne servent qu'en dernier
     // recours, sinon le fond de la carte serait un portrait rogné.
@@ -4856,10 +5024,7 @@ impl Read for UploadBody {
         if self.remaining == 0 || buffer.is_empty() {
             return Ok(0);
         }
-        let count = buffer
-            .len()
-            .min(self.remaining as usize)
-            .min(64 * 1024);
+        let count = buffer.len().min(self.remaining as usize).min(64 * 1024);
         buffer[..count].fill(0);
         self.remaining -= count as u64;
         self.window_bytes += count as u64;
@@ -4917,10 +5082,7 @@ fn speedtest_run(tx: mpsc::Sender<SpeedtestEvent>) {
                 pings.push(elapsed);
                 speedtest_send(&tx, SpeedtestEvent::Ping(elapsed));
             }
-            Err(error) => speedtest_send(
-                &tx,
-                SpeedtestEvent::Warning(format!("ping : {error}")),
-            ),
+            Err(error) => speedtest_send(&tx, SpeedtestEvent::Warning(format!("ping : {error}"))),
         }
     }
     if !pings.is_empty() {
@@ -4930,11 +5092,7 @@ fn speedtest_run(tx: mpsc::Sender<SpeedtestEvent>) {
 
     speedtest_send(&tx, SpeedtestEvent::Stage(SpeedtestStage::Download));
     let url = format!("{SPEEDTEST_BASE}/__down?bytes={SPEEDTEST_DOWN_BYTES}");
-    match agent
-        .get(&url)
-        .timeout(Duration::from_secs(15))
-        .call()
-    {
+    match agent.get(&url).timeout(Duration::from_secs(15)).call() {
         Ok(response) => {
             reachable = true;
             let mut reader = response.into_reader();
@@ -4966,8 +5124,7 @@ fn speedtest_run(tx: mpsc::Sender<SpeedtestEvent>) {
                         }
                         let elapsed = now.duration_since(window_started);
                         if elapsed >= Duration::from_millis(200) {
-                            let rate =
-                                window_bytes as f32 / elapsed.as_secs_f32().max(0.001);
+                            let rate = window_bytes as f32 / elapsed.as_secs_f32().max(0.001);
                             speedtest_send(&tx, SpeedtestEvent::Down(rate));
                             if warm.is_some() {
                                 low = low.min(rate);
@@ -5033,12 +5190,9 @@ fn speedtest_run(tx: mpsc::Sender<SpeedtestEvent>) {
         }
         Ok(_) => speedtest_send(
             &tx,
-            SpeedtestEvent::Warning("ascendant : aucune donnée envoyée".into()),
+            SpeedtestEvent::Warning(lapinux_core::i18n::t("downloads.upstream_none").into()),
         ),
-        Err(error) => speedtest_send(
-            &tx,
-            SpeedtestEvent::Warning(format!("ascendant : {error}")),
-        ),
+        Err(error) => speedtest_send(&tx, SpeedtestEvent::Warning(format!("ascendant : {error}"))),
     }
 
     speedtest_send(
@@ -5048,7 +5202,7 @@ fn speedtest_run(tx: mpsc::Sender<SpeedtestEvent>) {
     if !reachable {
         speedtest_send(
             &tx,
-            SpeedtestEvent::Failed("aucun serveur de mesure joignable".into()),
+            SpeedtestEvent::Failed(lapinux_core::i18n::t("downloads.no_speedtest_server").into()),
         );
     }
     speedtest_send(&tx, SpeedtestEvent::Done);
@@ -5067,8 +5221,7 @@ fn speedtest_row(
     // même taille avant, pendant et après un test.
     const HEIGHT: f32 = 18.0;
     let width = ui.available_width();
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
     let painter = ui.painter();
     let cy = rect.center().y;
     let label_galley = painter.layout_no_wrap(
@@ -5101,11 +5254,7 @@ fn speedtest_row(
         Some(text) => (text.clone(), if active { OK } else { TEXT() }),
         None => ("--".to_string(), TEXT_DIM()),
     };
-    let value_galley = painter.layout_no_wrap(
-        text,
-        egui::FontId::proportional(12.5),
-        color,
-    );
+    let value_galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.5), color);
     let value_x = (right - value_galley.size().x).max(rect.left());
     painter.galley(
         egui::pos2(value_x, cy - value_galley.size().y / 2.0),
@@ -5153,7 +5302,7 @@ fn speedtest_row(
                 OK,
             );
         }
-        let _ = response.on_hover_text("Débit minimum et maximum mesurés, hors démarrage");
+        let _ = response.on_hover_text(lapinux_core::i18n::t("downloads.rate_hint"));
     }
 }
 
@@ -5201,9 +5350,15 @@ fn speedtest_summary(
     volet(lapinux_core::i18n::t("downloads.down"), down, down_range);
     volet(lapinux_core::i18n::t("downloads.up"), up, up_range);
     if let Some(seconds) = elapsed {
-        parts.push(lapinux_core::i18n::t_args("downloads.duration", &[("duration", &format_seconds(seconds))]));
+        parts.push(lapinux_core::i18n::t_args(
+            "downloads.duration",
+            &[("duration", &format_seconds(seconds))],
+        ));
     }
-    lapinux_core::i18n::t_args("downloads.speedtest_report", &[("results", &parts.join(" · "))])
+    lapinux_core::i18n::t_args(
+        "downloads.speedtest_report",
+        &[("results", &parts.join(" · "))],
+    )
 }
 
 /// Durée du test avec une décimale, virgule française.
@@ -5240,11 +5395,7 @@ fn report_rate(bytes_per_sec: u64) -> String {
 fn report_metric(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
-        ui.label(
-            egui::RichText::new(label)
-                .size(9.5)
-                .color(TEXT_DIM()),
-        );
+        ui.label(egui::RichText::new(label).size(9.5).color(TEXT_DIM()));
         ui.label(egui::RichText::new(value).size(12.5).strong().color(TEXT()));
     });
 }
@@ -5293,20 +5444,41 @@ fn report_source(job: &Job) -> &str {
 /// l'historique, dans l'ordre d'affichage.
 fn report_metrics(job: &Job, report: &JobReport) -> Vec<(&'static str, String)> {
     let mut metrics: Vec<(&'static str, String)> = vec![
-        ("Durée", lapinux_core::util::format_duration(report.elapsed_secs)),
         (
-            "Temps actif",
+            lapinux_core::i18n::t("downloads.duration"),
+            lapinux_core::util::format_duration(report.elapsed_secs),
+        ),
+        (
+            lapinux_core::i18n::t("downloads.active_time"),
             lapinux_core::util::format_duration(report.active_secs),
         ),
-        ("Moyenne", report_rate(report.average_bps)),
-        ("Plus haut", report_rate(report.peak_bps)),
-        ("Plus bas", report_rate(report.low_bps)),
-        ("Réseau", lapinux_core::util::format_bytes(report.network)),
-        ("Écrit", lapinux_core::util::format_bytes(report.written)),
+        (
+            lapinux_core::i18n::t("downloads.average"),
+            report_rate(report.average_bps),
+        ),
+        (
+            lapinux_core::i18n::t("downloads.peak"),
+            report_rate(report.peak_bps),
+        ),
+        (
+            lapinux_core::i18n::t("downloads.low"),
+            report_rate(report.low_bps),
+        ),
+        (
+            lapinux_core::i18n::t("downloads.network"),
+            lapinux_core::util::format_bytes(report.network),
+        ),
+        (
+            lapinux_core::i18n::t("downloads.written"),
+            lapinux_core::util::format_bytes(report.written),
+        ),
     ];
     let reused = job.downloaded.saturating_sub(report.network);
     if reused >= 1024 * 1024 {
-        metrics.push(("Réutilisé", lapinux_core::util::format_bytes(reused)));
+        metrics.push((
+            lapinux_core::i18n::t("downloads.reused"),
+            lapinux_core::util::format_bytes(reused),
+        ));
     } else {
         metrics.push(("Source", report_source(job).to_string()));
     }
@@ -5360,24 +5532,24 @@ fn report_window_body(
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             ui.label(
-                egui::RichText::new("Rapport de téléchargement")
+                egui::RichText::new(lapinux_core::i18n::t("downloads.report_title"))
                     .size(10.0)
                     .color(TEXT_DIM()),
             );
             ui.label(egui::RichText::new(&title).size(16.0).strong());
             muted(
                 ui,
-                format!("Terminé · {} · {}", job_when(job), source),
+                lapinux_core::i18n::t_fmt(
+                    "downloads.finished_two",
+                    &[job_when(job).to_string(), source.to_string()],
+                ),
             );
         });
-        ui.with_layout(
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                if link_text(ui, "Fermer").clicked() {
-                    close = true;
-                }
-            },
-        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if link_text(ui, lapinux_core::i18n::t("downloads.close")).clicked() {
+                close = true;
+            }
+        });
     });
     ui.add_space(8.0);
     ui.separator();
@@ -5397,9 +5569,9 @@ fn report_window_body(
     muted(
         ui,
         if report.samples == 0 {
-            "Rapport partiel : ce téléchargement est antérieur au suivi des débits ; durée, volumes et moyenne restent disponibles, les extrêmes non."
+            lapinux_core::i18n::t("downloads.report_partial")
         } else {
-            "Débits mesurés pendant le transfert, hors pauses ; le plus bas ignore les attentes de vérification."
+            lapinux_core::i18n::t("downloads.rates_hint")
         },
     );
     close
@@ -5418,50 +5590,34 @@ fn servers_help_body(ui: &mut egui::Ui) -> bool {
                     .color(TEXT_DIM()),
             );
             ui.label(
-                egui::RichText::new("Ce que veulent dire ces choix")
+                egui::RichText::new(lapinux_core::i18n::t("downloads.choices_help"))
                     .size(16.0)
                     .strong(),
             );
         });
-        ui.with_layout(
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                if link_text(ui, "Fermer").clicked() {
-                    close = true;
-                }
-            },
-        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if link_text(ui, lapinux_core::i18n::t("downloads.close")).clicked() {
+                close = true;
+            }
+        });
     });
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(8.0);
     for (term, text) in [
         (
-            "Automatique",
-            "Lapinux prend le serveur que la boutique annonce en premier, et bascule sur un autre si celui-ci ralentit ou échoue.",
+            lapinux_core::i18n::t("downloads.automatic"),
+            lapinux_core::i18n::t("downloads.server_choice"),
         ),
-        (
-            "Cache",
-            "Chez Steam, un cache est un miroir régional : un serveur proche de toi qui garde une copie des fichiers. Il évite de traverser l'Atlantique pour chaque paquet.",
-        ),
-        (
-            "CDN",
-            "Un réseau de diffusion de contenu : des centaines de serveurs qui servent le même fichier au plus près du joueur. Epic publie son build sur plusieurs CDN à la fois.",
-        ),
+        ("Cache", lapinux_core::i18n::t("downloads.cache_explainer")),
+        ("CDN", lapinux_core::i18n::t("downloads.cdn_definition")),
         (
             "CloudFront, Akamai, Fastly",
-            "Trois opérateurs de CDN différents. Le contenu est identique : seul le chemin vers toi change.",
+            lapinux_core::i18n::t("downloads.cdn_explainer"),
         ),
     ] {
-        ui.label(
-            egui::RichText::new(term)
-                .size(11.5)
-                .strong()
-                .color(TEXT()),
-        );
-        ui.add(
-            egui::Label::new(egui::RichText::new(text).size(11.0).color(TEXT_DIM())).wrap(),
-        );
+        ui.label(egui::RichText::new(term).size(11.5).strong().color(TEXT()));
+        ui.add(egui::Label::new(egui::RichText::new(text).size(11.0).color(TEXT_DIM())).wrap());
         ui.add_space(9.0);
     }
     close
@@ -5482,7 +5638,7 @@ fn info_window_body(ui: &mut egui::Ui, job: &Job, net_rate: f32, dlc_names: &[St
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             ui.label(
-                egui::RichText::new("Informations")
+                egui::RichText::new(lapinux_core::i18n::t("controllers.information.title"))
                     .size(10.0)
                     .color(TEXT_DIM()),
             );
@@ -5492,14 +5648,11 @@ fn info_window_body(ui: &mut egui::Ui, job: &Job, net_rate: f32, dlc_names: &[St
                 format!("{} · {}", job_kind_label(job), state_title(job.state)),
             );
         });
-        ui.with_layout(
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                if link_text(ui, "Fermer").clicked() {
-                    close = true;
-                }
-            },
-        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if link_text(ui, lapinux_core::i18n::t("downloads.close")).clicked() {
+                close = true;
+            }
+        });
     });
     ui.add_space(8.0);
     ui.separator();
@@ -5509,10 +5662,13 @@ fn info_window_body(ui: &mut egui::Ui, job: &Job, net_rate: f32, dlc_names: &[St
         .map(lapinux_core::util::format_duration)
         .unwrap_or_else(|| "—".to_string());
     let mut rows: Vec<(&str, String)> = vec![
-        ("État", state_title(job.state).to_string()),
+        (
+            lapinux_core::i18n::t("settings.captures.state"),
+            state_title(job.state).to_string(),
+        ),
         ("Contenu", job_kind_label(job)),
         (
-            "Téléchargé",
+            lapinux_core::i18n::t("downloads.downloaded"),
             if job.total > 0 {
                 format!("{} / {}", bytes(job.downloaded), bytes(job.total))
             } else {
@@ -5523,10 +5679,16 @@ fn info_window_body(ui: &mut egui::Ui, job: &Job, net_rate: f32, dlc_names: &[St
             "Progression",
             format!("{:.0} %", job.progress.clamp(0.0, 1.0) * 100.0),
         ),
-        ("Réseau", bytes(job.network)),
-        ("Écrit", bytes(job.written)),
         (
-            "Débit",
+            lapinux_core::i18n::t("downloads.network"),
+            bytes(job.network),
+        ),
+        (
+            lapinux_core::i18n::t("downloads.written"),
+            bytes(job.written),
+        ),
+        (
+            lapinux_core::i18n::t("downloads.rate"),
             if running && net_rate > 0.5 {
                 network_rate(net_rate)
             } else {
@@ -5534,8 +5696,12 @@ fn info_window_body(ui: &mut egui::Ui, job: &Job, net_rate: f32, dlc_names: &[St
             },
         ),
         (
-            "Temps restant",
-            if running { remaining } else { "—".to_string() },
+            lapinux_core::i18n::t("downloads.remaining_label"),
+            if running {
+                remaining
+            } else {
+                "—".to_string()
+            },
         ),
         (
             "Serveur",
@@ -5546,7 +5712,7 @@ fn info_window_body(ui: &mut egui::Ui, job: &Job, net_rate: f32, dlc_names: &[St
             },
         ),
         (
-            "Dépôt",
+            lapinux_core::i18n::t("downloads.depot"),
             if job.depots > 0 {
                 format!("{} / {}", job.depot, job.depots)
             } else {
@@ -5554,9 +5720,12 @@ fn info_window_body(ui: &mut egui::Ui, job: &Job, net_rate: f32, dlc_names: &[St
             },
         ),
         ("Moteur", job.backend.clone()),
-        ("Démarré", lapinux_core::util::format_datetime(job.started)),
         (
-            "Terminé",
+            lapinux_core::i18n::t("downloads.started"),
+            lapinux_core::util::format_datetime(job.started),
+        ),
+        (
+            lapinux_core::i18n::t("downloads.finished"),
             job.finished
                 .map(lapinux_core::util::format_datetime)
                 .unwrap_or_else(|| "—".to_string()),
@@ -5570,11 +5739,11 @@ fn info_window_body(ui: &mut egui::Ui, job: &Job, net_rate: f32, dlc_names: &[St
     }
     let reused = wording::reused_bytes(job);
     if reused > 0 {
-        rows.push(("Réutilisé", bytes(reused)));
+        rows.push((lapinux_core::i18n::t("downloads.reused"), bytes(reused)));
     }
     let phase = job.message.trim();
     if !phase.is_empty() {
-        rows.push(("Étape", phase_label(phase)));
+        rows.push((lapinux_core::i18n::t("downloads.step"), phase_label(phase)));
     }
     egui::Grid::new(("download-info-grid", job.id.as_str()))
         .num_columns(2)
@@ -5591,9 +5760,9 @@ fn info_window_body(ui: &mut egui::Ui, job: &Job, net_rate: f32, dlc_names: &[St
         muted(
             ui,
             if dlc_names.is_empty() {
-                "Build public du jeu seul : aucun contenu additionnel demandé."
+                lapinux_core::i18n::t("downloads.base_build_only")
             } else {
-                "Le build public et les contenus additionnels demandés sont installés dans le même téléchargement."
+                lapinux_core::i18n::t("downloads.build_and_content")
             },
         );
     }
@@ -5609,9 +5778,12 @@ mod tests {
     fn legacy_phases_use_clear_wording() {
         assert_eq!(
             phase_label("nettoyage des doublages"),
-            "Suppression des autres langues audio"
+            lapinux_core::i18n::t("downloads.removing_audio_langs_title")
         );
-        assert_eq!(phase_label("manifeste 2/2"), "Lecture des manifestes 2/2");
+        assert_eq!(
+            phase_label("manifeste 2/2"),
+            lapinux_core::i18n::t_args("ui.reading_manifests", &[("rest", "2/2")])
+        );
     }
 
     #[test]
@@ -5621,7 +5793,7 @@ mod tests {
         let job = sample_job(Some(1), JobState::Running, 1);
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                download_hero_tile(ui, 420.0, &job, &job.title, None, None, None, 0.0);
+                download_hero_tile(ui, 420.0, &job, &job.title, None, None, None, 0.0, 0.0);
             });
         });
         let mut title = None;
@@ -5630,7 +5802,9 @@ mod tests {
             if let egui::Shape::Text(shape) = &clipped.shape {
                 match shape.galley.text() {
                     text if text == job.title => title = Some((shape.pos.x, shape.pos.y)),
-                    "Mise à jour" => kind = Some((shape.pos.x, shape.pos.y)),
+                    text if text == lapinux_core::i18n::t("downloads.update") => {
+                        kind = Some((shape.pos.x, shape.pos.y))
+                    }
                     _ => {}
                 }
             }
@@ -5664,6 +5838,22 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_download_sections_survive_a_reload() {
+        let config = lapinux_core::config::DownloadsConfig {
+            collapsed_sections: vec!["paused".into(), "history".into()],
+            ..lapinux_core::config::DownloadsConfig::default()
+        };
+        let page = Downloads::from_config(&config);
+        assert!(!page.paused_open);
+        assert!(!page.history_open);
+        assert!(page.running_open);
+        assert_eq!(
+            page.collapsed_keys(),
+            vec!["paused".to_string(), "history".to_string()]
+        );
+    }
+
+    #[test]
     fn section_heading_reserves_inline_space_for_collapsed_icons() {
         let ctx = egui::Context::default();
         crate::install_fonts(&ctx);
@@ -5676,14 +5866,20 @@ mod tests {
                     ui,
                     lapinux_core::i18n::t("downloads.active"),
                     "1",
-                    Some((HeroGlyph::Pause, lapinux_core::i18n::t("downloads.pause_all"))),
+                    Some((
+                        HeroGlyph::Pause,
+                        lapinux_core::i18n::t("downloads.pause_all"),
+                    )),
                     false,
                 );
                 free_width = header.free.width();
                 row_height = ui.cursor().min.y - before;
             });
         });
-        assert!(free_width > 100.0, "espace libre trop étroit : {free_width}");
+        assert!(
+            free_width > 100.0,
+            "espace libre trop étroit : {free_width}"
+        );
         assert!(
             row_height < 30.0,
             "les vignettes ne doivent pas ajouter de ligne : {row_height}"
@@ -5701,8 +5897,18 @@ mod tests {
 
     #[test]
     fn report_rates_use_megabits() {
-        assert_eq!(report_rate(12_500_000), "100,0 Mb/s");
-        assert_eq!(report_rate(0), "—");
+        assert_eq!(
+            report_rate(12_500_000),
+            format!(
+                "{} {}",
+                lapinux_core::i18n::decimal("100.0"),
+                lapinux_core::i18n::t("downloads.unit_mbit")
+            )
+        );
+        assert_eq!(
+            report_rate(0),
+            lapinux_core::i18n::t("controllers.information.dash")
+        );
     }
 
     #[test]
@@ -5736,8 +5942,12 @@ mod tests {
         });
         assert!(!output.shapes.is_empty());
         let metrics = report_metrics(&job, job.report.as_ref().unwrap());
-        assert!(metrics.iter().any(|(label, _)| *label == "Plus haut"));
-        assert!(metrics.iter().any(|(label, _)| *label == "Plus bas"));
+        assert!(metrics
+            .iter()
+            .any(|(label, _)| *label == lapinux_core::i18n::t("downloads.peak")));
+        assert!(metrics
+            .iter()
+            .any(|(label, _)| *label == lapinux_core::i18n::t("downloads.low")));
     }
 
     #[test]
@@ -5760,9 +5970,15 @@ mod tests {
     fn speedtest_extremes_and_duration_are_readable() {
         assert_eq!(
             speedtest_range_labels(12_500_000.0, 25_000_000.0),
-            ("min 100,0".to_string(), "max 200,0".to_string())
+            (
+                format!("min {}", lapinux_core::i18n::decimal("100.0")),
+                format!("max {}", lapinux_core::i18n::decimal("200.0")),
+            )
         );
-        assert_eq!(format_seconds(8.42), "8,4 s");
+        assert_eq!(
+            format_seconds(8.42),
+            format!("{} s", lapinux_core::i18n::decimal("8.4"))
+        );
         // Le relevé copié garde les deux volets, leurs extrêmes et la durée.
         let summary = speedtest_summary(
             Some(12.4),
@@ -5773,9 +5989,34 @@ mod tests {
             Some(8.42),
         );
         assert!(summary.contains("Ping 12 ms"), "{summary}");
-        assert!(summary.contains("Descendant 200,0 Mb/s (min 100,0 · max 240,0)"), "{summary}");
-        assert!(summary.contains("Ascendant 40,0 Mb/s"), "{summary}");
-        assert!(summary.contains("Durée 8,4 s"), "{summary}");
+        assert!(
+            summary.contains(&format!(
+                "{} {} Mb/s (min {} · max {})",
+                lapinux_core::i18n::t("downloads.down"),
+                lapinux_core::i18n::decimal("200.0"),
+                lapinux_core::i18n::decimal("100.0"),
+                lapinux_core::i18n::decimal("240.0"),
+            )),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!(
+                "{} {} Mb/s",
+                lapinux_core::i18n::t("downloads.up"),
+                lapinux_core::i18n::decimal("40.0"),
+            )),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&lapinux_core::i18n::t_args(
+                "downloads.duration",
+                &[(
+                    "duration",
+                    &format!("{} s", lapinux_core::i18n::decimal("8.4"))
+                )],
+            )),
+            "{summary}"
+        );
         assert_eq!(download_store_label("steam"), "Steam");
         assert_eq!(download_store_label("epic"), "Epic");
     }
@@ -5796,10 +6037,8 @@ mod tests {
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.set_width(320.0);
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(320.0, 118.0),
-                    egui::Sense::hover(),
-                );
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(320.0, 118.0), egui::Sense::hover());
                 let field = egui::Rect::from_min_size(
                     egui::pos2(rect.left() + 14.0, rect.top() + 40.0),
                     egui::vec2(292.0, 24.0),
@@ -5809,7 +6048,7 @@ mod tests {
                     egui::pos2(rect.left() + 14.0, rect.top() + 74.0),
                     egui::vec2(100.0, 26.0),
                 );
-                let _ = tile_button(ui, button, "Enregistrer", false);
+                let _ = tile_button(ui, button, lapinux_core::i18n::t("downloads.save"), false);
                 // Sans ce geste, le curseur serait resté sous le bouton, à
                 // mi-hauteur de la carte.
                 assert!(ui.cursor().top() < rect.bottom() - 10.0);
@@ -5845,7 +6084,7 @@ mod tests {
                         ui,
                         lapinux_core::i18n::t("downloads.down"),
                         Some("590,0".into()),
-                        "Mb/s",
+                        lapinux_core::i18n::t("downloads.unit_mbit"),
                         false,
                         range.clone(),
                     );
@@ -5867,8 +6106,18 @@ mod tests {
         // 100 Mbit/s = 12,5 Mo/s : le test de débit et les téléchargements
         // doivent afficher le même 100,0 Mb/s, jamais l'un en Mo/s à côté de
         // l'autre en Mb/s.
-        assert_eq!(format_mbit(Some(12_500_000.0)).as_deref(), Some("100,0"));
-        assert_eq!(network_rate(12_500_000.0), "100,0 Mb/s");
+        assert_eq!(
+            format_mbit(Some(12_500_000.0)).as_deref(),
+            Some(lapinux_core::i18n::decimal("100.0").as_str())
+        );
+        assert_eq!(
+            network_rate(12_500_000.0),
+            format!(
+                "{} {}",
+                lapinux_core::i18n::decimal("100.0"),
+                lapinux_core::i18n::t("downloads.unit_mbit")
+            )
+        );
     }
 
     #[test]
@@ -5884,7 +6133,10 @@ mod tests {
             color.r() as i16 > color.g() as i16 + 40,
             "la couleur du logo doit primer sur le fond gris : {color:?}"
         );
-        assert!(color.r() > 150, "la teinte doit rester lumineuse : {color:?}");
+        assert!(
+            color.r() > 150,
+            "la teinte doit rester lumineuse : {color:?}"
+        );
     }
 
     #[test]
@@ -5901,7 +6153,11 @@ mod tests {
             id: format!("game-{}-{started}", appid.unwrap_or(0)),
             kind: JobKind::InstallGame,
             label: format!("Jeu {} ({})", appid.unwrap_or(0), appid.unwrap_or(0)),
-            title: format!("Jeu {}", appid.unwrap_or(0)),
+            title: format!(
+                "{} {}",
+                lapinux_core::i18n::t("steaminput.game"),
+                appid.unwrap_or(0)
+            ),
             appid,
             state,
             progress: 0.42,
@@ -5954,11 +6210,20 @@ mod tests {
     fn dlc_contents_are_named_on_the_card() {
         let mut job = sample_job(Some(1), JobState::Running, 0);
         job.updating = false;
-        assert_eq!(job_kind_label(&job), "Jeu de base");
+        assert_eq!(
+            job_kind_label(&job),
+            lapinux_core::i18n::t("downloads.base_game")
+        );
         job.dlc = vec![10, 11];
-        assert_eq!(job_kind_label(&job), "Jeu de base · 2 DLC");
+        assert_eq!(
+            job_kind_label(&job),
+            format!("{} · 2 DLC", lapinux_core::i18n::t("downloads.base_game"))
+        );
         job.dlc = vec![10];
-        assert_eq!(job_kind_label(&job), "Jeu de base · 1 DLC");
+        assert_eq!(
+            job_kind_label(&job),
+            format!("{} · 1 DLC", lapinux_core::i18n::t("downloads.base_game"))
+        );
     }
 
     #[test]
@@ -5985,12 +6250,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            texts
-                .iter()
-                .any(|text| *text == "Ce que veulent dire ces choix")
-        );
-        for term in ["Automatique", "Cache", "CDN", "CloudFront, Akamai, Fastly"] {
+        assert!(texts
+            .iter()
+            .any(|text| *text == lapinux_core::i18n::t("downloads.choices_help")));
+        for term in [
+            lapinux_core::i18n::t("downloads.automatic"),
+            lapinux_core::i18n::t("settings.application.cache"),
+            "CDN",
+            "CloudFront, Akamai, Fastly",
+        ] {
             assert!(texts.contains(&term), "{term} manque au glossaire");
         }
     }
@@ -6055,6 +6323,7 @@ mod tests {
                     Some(&cover),
                     Some(&icon),
                     None,
+                    1_000_000.0,
                     1_000_000.0,
                 );
             });
@@ -6236,8 +6505,15 @@ mod tests {
         let facts = download_facts(&job);
         assert!(facts.iter().any(|fact| fact.contains("dépôt 441")));
         assert!(facts.iter().any(|fact| fact.contains("cache1-fra1")));
-        assert!(facts.iter().any(|fact| fact.contains("depuis 2 min")));
-        assert!(facts.iter().any(|fact| fact == "sans DLC"));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.contains(&lapinux_core::i18n::t_fmt(
+                "downloads.since",
+                &["2 min".to_string()]
+            ))));
+        assert!(facts
+            .iter()
+            .any(|fact| fact == lapinux_core::i18n::t("downloads.no_dlc")));
         assert!(
             facts
                 .iter()
@@ -6245,7 +6521,8 @@ mod tests {
             "le logo Steam a un équivalent texte dans les faits"
         );
         // Le pas du daemon cite déjà le dépôt : pas de doublon.
-        assert!(!facts.iter().any(|fact| fact == "partie 2/3"));
+        assert!(!facts.iter().any(|fact| fact.as_str()
+            == lapinux_core::i18n::t_fmt("downloads.part", &["2".to_string(), "3".to_string()])));
 
         // Un message qui ne fait que répéter l'état n'est pas répété.
         let mut quiet = sample_job(
@@ -6253,9 +6530,11 @@ mod tests {
             JobState::Paused,
             lapinux_core::util::now_unix() - 120,
         );
-        quiet.message = "en pause".into();
+        quiet.message = lapinux_core::i18n::t("downloads.paused_short").into();
         let facts = download_facts(&quiet);
-        assert!(!facts.iter().any(|fact| fact.to_lowercase() == "en pause"));
+        assert!(!facts
+            .iter()
+            .any(|fact| fact.to_lowercase() == lapinux_core::i18n::t("downloads.paused_short")));
         assert!(facts.iter().any(|fact| fact.contains("cache1-fra1")));
     }
 
@@ -6286,7 +6565,10 @@ mod tests {
                 *ui.spacing_mut() = spacing;
             });
         });
-        assert_eq!(value, 500, "une image sans pointeur ne change pas la valeur");
+        assert_eq!(
+            value, 500,
+            "une image sans pointeur ne change pas la valeur"
+        );
 
         let mut tracks = Vec::new();
         let mut handles = Vec::new();
@@ -6296,10 +6578,14 @@ mod tests {
             handles: &mut Vec<(egui::Pos2, f32, egui::Color32)>,
         ) {
             match shape {
-                egui::Shape::Rect(rect) if rect.stroke.width == 0.0 && rect.rect.height() <= 8.0 => {
+                egui::Shape::Rect(rect)
+                    if rect.stroke.width == 0.0 && rect.rect.height() <= 8.0 =>
+                {
                     tracks.push((rect.rect, rect.fill));
                 }
-                egui::Shape::Circle(circle) if circle.stroke.width == 0.0 && circle.radius <= 8.0 => {
+                egui::Shape::Circle(circle)
+                    if circle.stroke.width == 0.0 && circle.radius <= 8.0 =>
+                {
                     handles.push((circle.center, circle.radius, circle.fill));
                 }
                 egui::Shape::Vec(shapes) => {
@@ -6321,10 +6607,7 @@ mod tests {
         );
         assert_eq!(handles.len(), 1, "une seule poignée");
         let (center, radius, _) = handles[0];
-        assert!(
-            radius <= 6.0,
-            "la poignée reste petite (rayon = {radius})"
-        );
+        assert!(radius <= 6.0, "la poignée reste petite (rayon = {radius})");
         // Poignée et icône partagent la même ligne de centre.
         let line = icon.center().y;
         assert!(
@@ -6332,7 +6615,9 @@ mod tests {
             "poignée (y = {}) alignée sur l'icône (y = {line})",
             center.y
         );
-        assert!(tracks.iter().all(|(rect, _)| (rect.center().y - line).abs() < 0.5));
+        assert!(tracks
+            .iter()
+            .all(|(rect, _)| (rect.center().y - line).abs() < 0.5));
         // À mi-course, la poignée est au milieu de la piste.
         let rail = tracks
             .iter()
@@ -6349,15 +6634,24 @@ mod tests {
     fn update_announcements_name_fetched_bytes() {
         assert_eq!(
             wording::update_announcement(Some(329 * 1024 * 1024)),
-            "Mise à jour · 345 Mo à télécharger"
+            lapinux_core::i18n::t_fmt(
+                "downloads.update_with",
+                &[lapinux_core::i18n::t_fmt(
+                    "downloads.to_download",
+                    &["345 Mo".to_string()]
+                )],
+            )
         );
         assert_eq!(
             wording::update_announcement(None),
-            "Mise à jour · taille inconnue"
+            lapinux_core::i18n::t("downloads.update_unknown_size")
         );
         assert_eq!(
             wording::update_download_label(64 * 1024 * 1024 * 1024),
-            "68,7 Go à télécharger"
+            lapinux_core::i18n::t_fmt(
+                "downloads.to_download",
+                &[lapinux_core::util::format_bytes(64 * 1024 * 1024 * 1024)],
+            )
         );
     }
 
@@ -6423,43 +6717,23 @@ mod tests {
                     None,
                     None,
                     5.2 * 1024.0 * 1024.0,
+                    5.2 * 1024.0 * 1024.0,
                 );
                 assert!(action.is_empty(), "aucun clic ne doit être simulé");
                 job.state = JobState::Paused;
                 assert!(download_hero_tile(
-                    ui,
-                    420.0,
-                    &job,
-                    &job.title,
-                    None,
-                    None,
-                    None,
-                    0.0
+                    ui, 420.0, &job, &job.title, None, None, None, 0.0, 0.0
                 )
                 .is_empty());
                 job.state = JobState::Cancelled;
                 assert!(download_hero_tile(
-                    ui,
-                    420.0,
-                    &job,
-                    &job.title,
-                    None,
-                    None,
-                    None,
-                    0.0
+                    ui, 420.0, &job, &job.title, None, None, None, 0.0, 0.0
                 )
                 .is_empty());
                 job.state = JobState::Done;
                 job.finished = Some(lapinux_core::util::now_unix());
                 assert!(download_hero_tile(
-                    ui,
-                    420.0,
-                    &job,
-                    &job.title,
-                    None,
-                    None,
-                    None,
-                    0.0
+                    ui, 420.0, &job, &job.title, None, None, None, 0.0, 0.0
                 )
                 .is_empty());
                 // Une mise à jour pas encore lancée n'a que son bouton.
@@ -6487,18 +6761,30 @@ mod tests {
         );
         assert!(texts.iter().any(|text| text == &job.title));
         // La ligne unique porte le volume et le débit courant.
+        assert!(texts.iter().any(|text| text.contains("Go /")
+            && text.contains(lapinux_core::i18n::t("downloads.unit_mbit"))));
         assert!(texts
             .iter()
-            .any(|text| text.contains("Go /") && text.contains("Mb/s")));
-        assert!(texts.iter().any(|text| text.starts_with("Annulé")));
-        assert!(texts.iter().any(|text| text.starts_with("Terminé")));
-        assert!(texts.iter().any(|text| text == "Mettre à jour"));
+            .any(|text| text.starts_with(lapinux_core::i18n::t("downloads.cancelled"))));
+        assert!(texts
+            .iter()
+            .any(|text| text.starts_with(state_title(JobState::Done))));
+        assert!(texts
+            .iter()
+            .any(|text| text == lapinux_core::i18n::t("configurations.update")));
         // L'annonce dit ce qui reste à télécharger, pas le volume installé.
+        assert!(texts.iter().any(|text| text.as_str()
+            == lapinux_core::i18n::t_fmt(
+                "downloads.update_with",
+                &[lapinux_core::i18n::t_fmt(
+                    "downloads.to_download",
+                    &[lapinux_core::util::format_bytes(8 * 1024 * 1024 * 1024)],
+                )],
+            )));
+        // Tous les débits sont en Mb/s, la même unité que le test de débit.
         assert!(texts
             .iter()
-            .any(|text| text == "Mise à jour · 8,6 Go à télécharger"));
-        // Tous les débits sont en Mb/s, la même unité que le test de débit.
-        assert!(texts.iter().any(|text| text.contains("Mb/s")));
+            .any(|text| text.contains(lapinux_core::i18n::t("downloads.unit_mbit"))));
     }
 
     #[test]
@@ -6512,12 +6798,18 @@ mod tests {
             on_disk: true,
             steam: true,
             family: false,
+            family_available: false,
             update: Some(42),
             store: None,
             cover: String::new(),
+            platforms: Vec::new(),
+            mobile: false,
             size: None,
             publishers: Vec::new(),
             developers: Vec::new(),
+            genres: Vec::new(),
+            updated: 0,
+            last_played: 0,
         };
         let mut downloads = Downloads::new();
         downloads.refresh_updates(&[entry], None);
@@ -6534,5 +6826,24 @@ mod tests {
         downloads.mark_updates_dirty();
         downloads.refresh_updates(&[], None);
         assert!(downloads.updates.is_empty());
+    }
+
+    #[test]
+    fn le_fait_de_depot_accepte_les_deux_ecritures() {
+        for step in ["dépôt 2/3 · téléchargement", "depot 2/3 · download"] {
+            let mut job = sample_job(Some(9), JobState::Paused, 10);
+            job.message = step.into();
+            job.depot = 2;
+            job.depots = 3;
+            let facts = download_facts(&job);
+            assert!(
+                !facts.iter().any(|fact| fact.as_str()
+                    == lapinux_core::i18n::t_fmt(
+                        "downloads.part",
+                        &["2".to_string(), "3".to_string()]
+                    )),
+                "{step} : pas de doublon"
+            );
+        }
     }
 }

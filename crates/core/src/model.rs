@@ -33,34 +33,87 @@ pub struct GameSettings {
     /// Nom du Proton à utiliser, sinon celui de la config.
     pub proton: Option<String>,
     pub gamescope: Option<bool>,
+    /// None suit le choix global ; Some(Off) désactive pour ce jeu.
+    pub frame_generation: Option<crate::config::FrameGeneration>,
+    /// None suit la version globale.
+    pub afmf_version: Option<String>,
+    pub afmf_performance_mode: Option<crate::config::AfmfPerformanceMode>,
+    pub afmf_search_mode: Option<crate::config::AfmfSearchMode>,
+    /// Multiplicateur de génération d'images de ce jeu (0, 2, 3 ou 4) ;
+    /// None suit le réglage global.
+    #[serde(default)]
+    pub afmf_multiplier: Option<u32>,
+    pub scaling_filter: Option<crate::config::ScalingFilter>,
+    /// Netteté GameScope de ce jeu ; sinon celle des réglages globaux.
+    #[serde(default)]
+    pub sharpness: Option<u32>,
+    pub vkbasalt: Option<bool>,
+    pub vkbasalt_effect: Option<crate::config::VkBasaltEffect>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps_cap: Option<u32>,
-    pub mangohud: Option<bool>,
-    /// Préréglage MangoHud choisi dans l'overlay (`simple`, `essential`,
-    /// `full`) : il prime sur la case à cocher quand il est présent.
+    /// Lève la limite que le jeu s'impose dans ses propres fichiers de
+    /// réglages (Unreal Engine : `GameUserSettings.ini`). Lapinux les réécrit
+    /// avant chaque lancement et garde l'original pour revenir en arrière.
     #[serde(default)]
-    pub hud_preset: Option<String>,
-    /// Ancrage MangoHud choisi dans l'overlay (`top-left`, `top-center`…).
+    pub unlock_fps: Option<bool>,
+    /// HUD nommé de ce jeu (`hud_custom`), ou preset intégré. Vide suit le
+    /// HUD actif des réglages globaux.
     #[serde(default)]
-    pub hud_position: Option<String>,
-    /// Disposition MangoHud : `block` (bloc vertical) ou `inline` (une ligne).
-    #[serde(default)]
-    pub hud_layout: Option<String>,
-    /// Courbe de frametime MangoHud, indépendante du profil.
-    #[serde(default)]
-    pub hud_graph: Option<bool>,
-    /// Charge de chaque cœur du processeur dans MangoHud.
-    #[serde(default)]
-    pub hud_cores: Option<bool>,
+    pub hud_style: Option<String>,
     pub hdr: Option<bool>,
     pub adaptive_sync: Option<bool>,
+    /// Plaque de performance pour ce jeu ; sinon le réglage global.
+    #[serde(default)]
+    pub hud_on_screen: Option<bool>,
+    /// Badge d'enregistrement pour ce jeu ; sinon le réglage global.
+    #[serde(default)]
+    pub record_badge: Option<bool>,
+    /// Enregistrement automatique au lancement de ce jeu.
+    #[serde(default)]
+    pub record_on_launch: Option<bool>,
+    /// Arrêt de l'enregistrement à la fermeture de ce jeu.
+    #[serde(default)]
+    pub stop_on_exit: Option<bool>,
+    /// Cadence vidéo propre à ce jeu.
+    #[serde(default)]
+    pub video_fps: Option<u32>,
+    /// Profil d'encodage propre à ce jeu (`performance`, `balanced`, `quality`).
+    #[serde(default)]
+    pub video_profile: Option<String>,
+    /// Hauteur vidéo propre à ce jeu (`720p`, `1080p`, `1440p`, `native`).
+    #[serde(default)]
+    pub video_resolution: Option<String>,
+    /// Encodeur vidéo propre à ce jeu (`auto`, `nvenc`, `software`).
+    #[serde(default)]
+    pub video_encoder: Option<String>,
+    /// Codec vidéo propre à ce jeu (`auto`, `h264`, `hevc`, `av1`).
+    #[serde(default)]
+    pub video_codec: Option<String>,
+    /// Son du jeu dans les captures de ce jeu.
+    #[serde(default)]
+    pub record_audio: Option<bool>,
+    /// Microphone dans les captures de ce jeu.
+    #[serde(default)]
+    pub record_microphone: Option<bool>,
+    /// Copie locale automatique des sauvegardes de ce jeu.
+    #[serde(default)]
+    pub saves_auto: Option<bool>,
+    /// Saute la copie locale quand le cloud de la boutique garde déjà ce jeu.
+    #[serde(default)]
+    pub saves_skip_cloud: Option<bool>,
+    /// Relance ce jeu après le chargement d'un emplacement de sauvegarde.
+    #[serde(default)]
+    pub saves_relaunch: Option<bool>,
     /// Variables d'environnement additionnelles.
     pub env: Vec<(String, String)>,
     /// Arguments ajoutés après le chemin de l'exécutable.
     pub args: Vec<String>,
     /// Profil manettes associé.
     pub input_profile: Option<String>,
+    /// Capture des manettes pour ce jeu ; sinon le réglage global.
+    #[serde(default)]
+    pub grab_devices: Option<bool>,
     /// Langue des textes et du doublage (`french`, `schinese`…), quand le jeu
     /// la propose ; `None` suit le réglage général.
     pub language: Option<String>,
@@ -79,11 +132,70 @@ pub struct GameSettings {
     /// Ce que DXVK annonce de la carte au moteur du jeu : certains moteurs
     /// lisent mal la mémoire de l'adaptateur et se bridinent eux-mêmes.
     pub dxvk: DxvkOverride,
+    /// Options de compatibilité explicites, sans modification permanente du préfixe.
+    pub compatibility: CompatibilityOptions,
     /// Mode performance : coupe la scène de lancement, l'enregistrement
     /// automatique et les HUD qui dessinent par-dessus le jeu. GameScope, la
     /// résolution et la limite FPS restent ceux du jeu ; l'enregistrement
     /// manuel reste disponible.
     pub performance: bool,
+    /// Pont Steamworks : `Some(true)` l'active, `Some(false)` le désactive.
+    /// `None` est désactivé en natif ; sous Windows, le défaut dépend du jeu.
+    #[serde(default)]
+    pub steam_shim: Option<bool>,
+    /// Volume du jeu retenu entre deux parties (0 à 1). Le menu rapide
+    /// l'écrit ; le lancement suivant le réapplique au flux du jeu, sans
+    /// toucher au son du bureau.
+    #[serde(default)]
+    pub volume: Option<f32>,
+    /// Injecteurs graphiques et DLL DLSS maintenus par Lapinux malgré le
+    /// verdict d'un anti-triche. Un jeu protégé se lance sans eux tant que ce
+    /// choix explicite manque.
+    #[serde(default)]
+    pub allow_protected_injections: Option<bool>,
+}
+
+/// Réglages expérimentaux par jeu, laissés au comportement du Proton par défaut.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CompatibilityOptions {
+    pub wined3d: bool,
+    pub dxvk_d3d8: bool,
+    pub old_gl_string: bool,
+    pub no_fsync: bool,
+    pub no_esync: bool,
+    pub no_ntsync: bool,
+    pub d3d9_mode_count: bool,
+    pub d3d9_cube_depth: bool,
+    pub d3d9_sampler_type: bool,
+    pub vkd3d_no_dxr: bool,
+}
+
+impl CompatibilityOptions {
+    pub fn dxvk_legacy_line(&self) -> Option<String> {
+        let mut flags = Vec::new();
+        if self.d3d9_mode_count {
+            flags.push("d3d9.modeCountCompatibility = True");
+        }
+        if self.d3d9_cube_depth {
+            flags.push("d3d9.supportCubeDepthFormats = True");
+        }
+        if self.d3d9_sampler_type {
+            flags.push("d3d9.forceSamplerTypeSpecConstants = True");
+        }
+        (!flags.is_empty()).then(|| flags.join("; "))
+    }
+}
+
+/// Jeux que le pont Steamworks écarte par défaut. La liste est vide : le pont
+/// s'installe pour tous les jeux, sauf refus explicite du joueur. Le crash de
+/// SMS Returns venait du retour des `CSteamID` par valeur ; l'ABI à pointeur
+/// caché est corrigée, donc plus aucun jeu n'est écarté d'office.
+pub const STEAM_SHIM_EXCLUDED: &[u32] = &[];
+
+/// Le pont est-il écarté par défaut pour ce jeu ?
+pub fn steam_shim_excluded(appid: u32) -> bool {
+    STEAM_SHIM_EXCLUDED.contains(&appid)
 }
 
 impl GameSettings {
@@ -91,6 +203,102 @@ impl GameSettings {
     /// enregistré avant l'existence du réglage n'a pas de valeur explicite.
     pub fn cloud_sync_enabled(&self) -> bool {
         self.cloud_sync.unwrap_or(true)
+    }
+
+    /// Un jeu protégé refuse les injecteurs installés et les DLL DLSS
+    /// remplacées tant que le joueur ne les a pas autorisés explicitement.
+    /// Seule règle du refus, partagée par le lancement, les états et la fiche.
+    pub fn injections_blocked(&self, protected: bool) -> bool {
+        protected && self.allow_protected_injections != Some(true)
+    }
+
+    /// Ce qu'un anti-triche impose : le pont Steamworks, les injecteurs
+    /// (effets vkBasalt, génération d'images, plaque de performance) et
+    /// l'enregistrement automatique restent coupés tant que le joueur ne les
+    /// réclame pas explicitement. Un champ déjà décidé par le joueur garde sa
+    /// valeur : cette fonction ne remplit que les défauts.
+    pub fn apply_protected_defaults(&mut self, native: bool) {
+        self.vkbasalt.get_or_insert(false);
+        self.hud_on_screen.get_or_insert(false);
+        self.record_on_launch.get_or_insert(false);
+        if self.frame_generation.is_none() {
+            self.frame_generation = Some(crate::config::FrameGeneration::Off);
+        }
+        // Un jeu natif n'a pas de pont Windows à couper.
+        if !native {
+            self.steam_shim.get_or_insert(false);
+        }
+    }
+
+    /// Capture effective de ce jeu : chaque champ laissé vide reprend la
+    /// valeur globale, les autres la remplacent.
+    pub fn effective_capture(
+        &self,
+        global: &crate::config::CaptureConfig,
+    ) -> crate::config::CaptureConfig {
+        let mut capture = global.clone();
+        if let Some(value) = self.record_on_launch {
+            capture.record_on_launch = value;
+        }
+        if let Some(value) = self.stop_on_exit {
+            capture.stop_on_exit = value;
+        }
+        if let Some(value) = self.video_fps {
+            capture.video_fps = value.clamp(5, 240);
+        }
+        if let Some(value) = &self.video_profile {
+            capture.video_profile = value.clone();
+        }
+        if let Some(value) = &self.video_resolution {
+            capture.video_resolution = value.clone();
+        }
+        if let Some(value) = &self.video_encoder {
+            capture.video_encoder = value.clone();
+        }
+        if let Some(value) = &self.video_codec {
+            capture.video_codec = value.clone();
+        }
+        if let Some(value) = self.record_audio {
+            capture.record_audio = value;
+        }
+        if let Some(value) = self.record_microphone {
+            capture.record_microphone = value;
+        }
+        if let Some(value) = self.hud_on_screen {
+            capture.hud_on_screen = value;
+        }
+        if let Some(value) = self.record_badge {
+            capture.record_badge = value;
+        }
+        capture
+    }
+
+    pub fn sharpness(&self, global: u32) -> u32 {
+        self.sharpness.unwrap_or(global)
+    }
+
+    pub fn hud_on_screen(&self, global: bool) -> bool {
+        self.hud_on_screen.unwrap_or(global)
+    }
+
+    pub fn record_badge(&self, global: bool) -> bool {
+        self.record_badge.unwrap_or(global)
+    }
+
+    pub fn saves_auto(&self, global: bool) -> bool {
+        self.saves_auto.unwrap_or(global)
+    }
+
+    pub fn saves_skip_cloud(&self, global: bool) -> bool {
+        self.saves_skip_cloud.unwrap_or(global)
+    }
+
+    pub fn saves_relaunch(&self, global: bool) -> bool {
+        self.saves_relaunch.unwrap_or(global)
+    }
+
+    pub fn grab_devices(&self, global: bool) -> bool {
+        self.grab_devices.unwrap_or(global)
     }
 }
 
@@ -176,6 +384,16 @@ pub struct CloudFile {
     /// Copie présente sur le disque : sa date (0 si elle n'existe pas). Rempli
     /// par le daemon quand il sait où le jeu écrit.
     pub local: Option<i64>,
+    /// Chemin local résolu et vérifié ; faux si son état est inconnu.
+    #[serde(default)]
+    pub local_resolved: bool,
+    /// Empreinte du fichier local, seulement lorsqu'il a pu être lu.
+    #[serde(default)]
+    pub local_sha: Option<Vec<u8>>,
+    /// Pour Epic/GOG, indique si ce fichier existe dans le cloud.
+    /// `None` garde le comportement des relevés Steam antérieurs.
+    #[serde(default)]
+    pub cloud_present: Option<bool>,
 }
 
 /// Sauvegardes cloud d'un jeu : ce que le compte garde, et ce que le jeu
@@ -184,6 +402,12 @@ pub struct CloudFile {
 #[serde(default)]
 pub struct CloudSaves {
     pub files: Vec<CloudFile>,
+    /// Entrées écartées à la lecture : Steam rend l'historique complet, donc
+    /// plusieurs versions d'un même chemin arrivent ensemble. La plus récente
+    /// reste dans `files` ; les autres sont gardées ici pour que la copie de
+    /// récupération les conserve avant tout remplacement.
+    #[serde(default)]
+    pub superseded: Vec<CloudFile>,
     /// Numéro de changement du cloud : Steam le compare avant de synchroniser.
     pub change_number: u64,
     /// Dossiers de sauvegarde déclarés par le jeu.
@@ -194,7 +418,61 @@ pub struct CloudSaves {
     pub max_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteamCloudState {
+    UpToDate,
+    Conflict,
+    MissingLocal,
+    Unknown,
+}
+
 impl CloudSaves {
+    /// Le cloud connaît-il cette empreinte pour ce chemin ? Steam garde
+    /// plusieurs versions d'un même fichier (une par machine) : une copie
+    /// locale qui correspond à l'une d'elles est déjà une version du cloud,
+    /// il n'y a donc rien à protéger ni à choisir.
+    pub fn knows(&self, file: &CloudFile, sha: &[u8]) -> bool {
+        file.sha == sha
+            || self
+                .superseded
+                .iter()
+                .any(|old| old.prefix == file.prefix && old.name == file.name && old.sha == sha)
+    }
+
+    /// Une date identique ne prouve jamais que les contenus sont identiques.
+    pub fn steam_state(&self) -> SteamCloudState {
+        if self.files.is_empty() {
+            return SteamCloudState::Unknown;
+        }
+        let mut missing = false;
+        let mut unknown = false;
+        for file in &self.files {
+            if !file.local_resolved {
+                unknown = true;
+            } else if file.cloud_present == Some(false) {
+                if file.local_sha.is_some() {
+                    return SteamCloudState::Conflict;
+                }
+                unknown = true;
+            } else if let Some(local) = &file.local_sha {
+                if local.len() != 20 {
+                    unknown = true;
+                } else if !self.knows(file, local) {
+                    return SteamCloudState::Conflict;
+                }
+            } else {
+                missing = true;
+            }
+        }
+        if unknown {
+            SteamCloudState::Unknown
+        } else if missing {
+            SteamCloudState::MissingLocal
+        } else {
+            SteamCloudState::UpToDate
+        }
+    }
+
     /// Poids total des sauvegardes gardées dans le cloud.
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|file| file.size).sum()
@@ -488,9 +766,8 @@ impl Game {
         self.library.join("Steam").join(&self.installdir)
     }
 
-    /// Ce jeu exige le client Steam (Steamworks ou DRM SteamStub).
-    /// Pour Steamworks, Lapinux peut démarrer le client officiel en headless
-    /// et attendre qu'il soit prêt avant de lancer le jeu.
+    /// Ce jeu utilise Steamworks ou SteamStub. Certaines protections peuvent
+    /// empêcher le lancement direct ; Lapinux ne démarre pas le client Steam.
     pub fn requires_steam(&self) -> bool {
         matches!(self.drm, Drm::Steamworks | Drm::SteamStub)
     }
@@ -732,6 +1009,347 @@ impl SteamDetails {
     pub fn is_empty(&self) -> bool {
         self.developers.is_empty() && self.genres.is_empty() && self.release_date.is_none()
     }
+}
+
+/// Libellé lisible d'un type de manette Steam Input.
+pub fn steam_input_label(kind: &str) -> &str {
+    match kind {
+        "controller_ps5" => "DualSense",
+        "controller_ps5_edge" => "DualSense Edge",
+        "controller_ps4" => "DualShock 4",
+        "controller_xboxone" => "Manette Xbox",
+        "controller_xbox360" => "Manette Xbox 360",
+        "controller_switch_pro" => "Nintendo Switch Pro",
+        "controller_switch_joycon_pair" => "Joy-Con",
+        "controller_steamcontroller" => "Steam Controller",
+        "controller_steamcontroller_gordon" => "Steam Controller",
+        "controller_triton" => "Steam Controller 2026",
+        "controller_neptune" => "Steam Deck",
+        "controller_rog_ally" => "ROG Ally",
+        "controller_mobile_touch" => "Tactile",
+        "controller_generic" => "Manette générique",
+        other => other,
+    }
+}
+
+/// Identifiants matériels de la Steam Controller 2026 (USB, Bluetooth et récepteurs).
+pub fn is_steam_controller_2026(vendor: u16, product: u16) -> bool {
+    vendor == 0x28de && matches!(product, 0x1302..=0x1305)
+}
+
+/// Type Steam Input d'une manette, d'après son identifiant matériel.
+///
+/// Le pont de la Steam Controller 2026 annonce un pad Xbox 360 : l'appelant
+/// remplace ce type par `controller_triton` quand `steam_bridge` est actif.
+pub fn steam_input_kind(vendor: u16, product: u16) -> &'static str {
+    match (vendor, product) {
+        (0x054c, 0x0ce6) => "controller_ps5",
+        (0x054c, 0x0df2) => "controller_ps5_edge",
+        (0x054c, _) => "controller_ps4",
+        (0x057e, 0x2009) => "controller_switch_pro",
+        (0x057e, 0x2006 | 0x2007) => "controller_switch_joycon_pair",
+        (0x28de, 0x1205 | 0x1206) => "controller_neptune",
+        (vendor, product) if is_steam_controller_2026(vendor, product) => "controller_triton",
+        (0x045e, 0x0b12 | 0x0b13 | 0x0b20 | 0x02fd | 0x02e0) => "controller_xboxone",
+        (0x045e, 0x028e | 0x0291 | 0x02d1) => "controller_xbox360",
+        (0x28de, _) => "controller_steamcontroller",
+        _ => "controller_generic",
+    }
+}
+
+/// Manette reconnue par Steam Input : le type Steam qu'elle prend et le nom
+/// que le pilote lui donne.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SteamInputController {
+    /// Type Steam Input (`controller_ps5`, `controller_xboxone`…).
+    pub kind: String,
+    /// Libellé lisible du type, tel que Steam le nomme.
+    pub label: String,
+    pub name: String,
+    pub vendor: u16,
+    pub product: u16,
+    pub connected: bool,
+}
+
+/// Une ligne de réglage lue dans un profil Steam Input : zone morte d'un
+/// stick, réglage de pavé, etc. La clé et la valeur restent celles du VDF.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SteamInputSetting {
+    pub key: String,
+    pub value: String,
+}
+
+/// Un binding d'une entrée Steam Input, avec l'activateur qui le déclenche.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SteamInputAction {
+    /// Nom Steam de l'entrée (`button_a`, `click`, `dpad_north`…).
+    pub input: String,
+    /// Nom de l'activateur (`Full_Press`, `Soft_Press`, `Release_Press`…).
+    pub activator: String,
+    /// Sortie déclarée par Steam (`xinput_button A, , `, `key_press ENTER`…).
+    pub binding: String,
+}
+
+/// Groupe d'actions d'un profil Steam Input, par mode de contrôle
+/// (`four_buttons`, `joystick`, `trigger`, `absolute_mouse`…).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SteamInputActionGroup {
+    /// Source Steam du groupe (`button_diamond`, `joystick`, `switch`…).
+    pub source: String,
+    /// Mode Steam du groupe.
+    pub mode: String,
+    pub actions: Vec<SteamInputAction>,
+    /// Réglages propres au groupe (zones mortes, pavé tactile…).
+    pub settings: Vec<SteamInputSetting>,
+}
+
+/// Profil Steam Input trouvé dans les dossiers du compte ou d'un jeu.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SteamInputProfile {
+    /// Jeu auquel le profil est rattaché ; 0 quand le chemin n'en porte pas.
+    pub appid: u32,
+    pub title: String,
+    pub description: String,
+    /// Type de manette du profil (`controller_ps5`…).
+    pub controller_type: String,
+    pub creator: String,
+    pub path: PathBuf,
+    /// Identifiant de la configuration publiée sur Steam, quand elle vient de
+    /// l'Atelier. Zéro pour une configuration purement locale.
+    #[serde(default)]
+    pub workshop_id: u64,
+    /// Dernière écriture, en secondes Unix.
+    pub modified: i64,
+    /// « jeu », « compte » ou « partagé » : d'où vient le profil.
+    pub origin: String,
+    /// Sélectionné pour ce jeu dans Lapinux ou dans les `configset` importés de Steam.
+    #[serde(default)]
+    pub active: bool,
+    /// Nom du preset Steam appliqué (`Default`, `Menu`…).
+    #[serde(default)]
+    pub preset: String,
+    /// Le fichier a été lu et les actions ont été extraites.
+    #[serde(default)]
+    pub details_loaded: bool,
+    /// Erreur de lecture du détail ; vide quand le fichier n'a simplement pas
+    /// été chargé pour ce profil.
+    #[serde(default)]
+    pub details_error: String,
+    #[serde(default)]
+    pub action_groups: Vec<SteamInputActionGroup>,
+    /// Réglages globaux du profil (zones mortes, options de pavé…).
+    #[serde(default)]
+    pub settings: Vec<SteamInputSetting>,
+}
+
+/// Profils Steam Input proposés pour les manettes branchées.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SteamInputReport {
+    pub controllers: Vec<SteamInputController>,
+    pub profiles: Vec<SteamInputProfile>,
+    /// Des dossiers Steam Input ont été trouvés.
+    pub available: bool,
+    pub notes: Vec<String>,
+}
+
+impl SteamInputReport {
+    /// Profils qui visent l'une des manettes présentes. Sans manette
+    /// reconnue, tous les profils restent proposés.
+    pub fn for_connected(&self) -> Vec<&SteamInputProfile> {
+        if self.controllers.is_empty() {
+            return self.profiles.iter().collect();
+        }
+        self.profiles
+            .iter()
+            .filter(|profile| {
+                self.controllers
+                    .iter()
+                    .any(|controller| controller.kind == profile.controller_type)
+            })
+            .collect()
+    }
+}
+
+/// Configuration Steam Input publiée sur Steam, mais pas nécessairement
+/// présente sur le disque de l'utilisateur.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SteamInputCommunityProfile {
+    /// Identifiant du fichier publié (Atelier/CDN Steam).
+    pub id: u64,
+    pub appid: u32,
+    pub title: String,
+    pub description: String,
+    pub controller_type: String,
+    /// Identifiant Steam de l'auteur, tel que publié par Steam.
+    pub creator: String,
+    /// URL du `.vdf` sur le CDN de Steam.
+    pub download_url: String,
+    pub file_size: u64,
+    /// Dernière mise à jour, en secondes Unix.
+    pub modified: i64,
+    /// Note Steam, de 0 à 1.
+    pub rating: f32,
+    pub votes_up: u64,
+    pub votes_down: u64,
+    pub subscriptions: u64,
+    /// Une copie a déjà été téléchargée par Lapinux.
+    pub installed: bool,
+}
+
+/// Copie d'une configuration Steam Input que Lapinux garde pour lui-même.
+///
+/// Le fichier `.vdf` est recopié sous `steaminput/saved/<appid>/`, avec ses
+/// métadonnées : la fiche Steam peut être relue ou le jeu désinstallé, la
+/// configuration reste consultable et testable dans Manettes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SteamInputSaved {
+    /// Identifiant de la configuration publiée d'origine.
+    pub id: u64,
+    /// Jeu auquel Lapinux l'a appliquée.
+    pub appid: u32,
+    /// Jeu d'où vient la configuration (différent en cas de repli).
+    pub source_appid: u32,
+    pub title: String,
+    pub description: String,
+    pub controller_type: String,
+    pub creator: String,
+    pub modified: i64,
+    /// Date de la copie dans Lapinux, en secondes Unix.
+    pub saved_at: i64,
+    /// Chemin de la copie `.vdf` dans le dossier de données de Lapinux.
+    pub path: PathBuf,
+    /// Nom du preset Steam appliqué (`Default`, `Menu`…).
+    #[serde(default)]
+    pub preset: String,
+    #[serde(default)]
+    pub details_loaded: bool,
+    #[serde(default)]
+    pub details_error: String,
+    #[serde(default)]
+    pub action_groups: Vec<SteamInputActionGroup>,
+    #[serde(default)]
+    pub settings: Vec<SteamInputSetting>,
+}
+
+/// Résultat d'une recherche dans le catalogue communautaire Steam.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SteamInputCommunityReport {
+    pub profiles: Vec<SteamInputCommunityProfile>,
+    /// Nombre total de configurations trouvées par Steam.
+    pub total: usize,
+    pub page: usize,
+    pub per_page: usize,
+    /// Aucun résultat pour ce jeu : la liste vient d'autres jeux et reste
+    /// applicable à celui-ci, comme le permet Steam Input.
+    pub fallback: bool,
+    pub notes: Vec<String>,
+}
+
+/// Abonnement à l'Atelier tel qu'il est installé sur le disque.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkshopItem {
+    pub published_file_id: u64,
+    pub title: String,
+    /// Vignette officielle publiée par Steam, vide si Steam ne la fournit pas.
+    #[serde(default)]
+    pub preview_url: String,
+    /// Poids publié par Steam pour ce contenu, en octets.
+    pub size: u64,
+    /// Dernière mise à jour, en secondes Unix.
+    pub time_updated: i64,
+    pub manifest: String,
+    /// Contenu téléchargé, quand il est présent sur le disque.
+    pub path: PathBuf,
+    pub installed: bool,
+    /// Désactivé dans le rangement Lapinux (`Mods`) : le contenu reste sur le
+    /// disque, mais aucun lien actif ne le présente au jeu.
+    pub disabled: bool,
+    pub url: String,
+}
+
+/// Atelier d'un jeu : nos abonnements, leur poids et le dossier de rangement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkshopReport {
+    pub appid: u32,
+    pub name: String,
+    /// Le jeu publie un atelier : un manifeste ou du contenu existe.
+    pub supported: bool,
+    pub items: Vec<WorkshopItem>,
+    /// Poids de tous les abonnements.
+    pub total_size: u64,
+    /// Poids des abonnements présents sur le disque.
+    pub installed_size: u64,
+    pub workshop_url: String,
+    /// Dossier `LapinuxLibrary/Mods/<jeu> (<appid>)/SteamWorkshop`.
+    pub mods_dir: PathBuf,
+    /// Dossiers de fichiers réels présents dans ce dossier.
+    pub links: usize,
+    pub notes: Vec<String>,
+}
+
+/// Résultat du rangement de l'Atelier dans `Mods`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkshopArrangeReport {
+    pub dir: PathBuf,
+    /// Dossiers matérialisés après le rangement.
+    pub links: usize,
+    pub removed: usize,
+    /// Octets couverts par les liens.
+    pub bytes: u64,
+}
+
+/// Action demandée sur un ou plusieurs contenus de l'Atelier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkshopAction {
+    Enable,
+    Disable,
+    Uninstall,
+}
+
+/// Résultat d'une activation, d'une désactivation ou d'une suppression.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkshopManageReport {
+    /// Dossiers actifs restants dans `SteamWorkshop`.
+    pub links: usize,
+    /// Entrées retirées par l'opération.
+    pub removed_links: usize,
+    /// Contenus téléchargés supprimés.
+    pub removed_items: usize,
+    /// Octets libérés par les suppressions.
+    pub freed_bytes: u64,
+    /// Contenus qui n'ont pas pu être supprimés.
+    pub errors: Vec<String>,
+}
+
+/// Résultat d'un téléchargement de l'Atelier effectué sans le client Steam,
+/// par DepotDownloader.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkshopDownloadReport {
+    pub appid: u32,
+    /// Contenus effectivement récupérés et placés dans la bibliothèque.
+    pub downloaded: Vec<u64>,
+    /// Poids de ces contenus sur le disque.
+    pub bytes: u64,
+    /// Dossiers actifs après le rangement automatique.
+    pub links: usize,
+    /// Journal complet de DepotDownloader.
+    pub log: PathBuf,
+    pub errors: Vec<String>,
 }
 
 /// Fiche complète d'un jeu, relue à la demande : ce que le **compte** y a joué
@@ -1078,12 +1696,24 @@ pub struct SteamCatalogGame {
     pub minutes: Option<u64>,
 }
 
+/// Contenu additionnel du groupe familial, avec les membres qui le possèdent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SteamFamilyDlc {
+    pub appid: u32,
+    pub name: String,
+    #[serde(default)]
+    pub owners: Vec<u64>,
+}
+
 /// Catalogue du compte Steam connecté (issu de `licenses_print`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SteamCatalog {
     pub account: String,
     pub updated: i64,
     pub entries: Vec<SteamCatalogGame>,
+    /// Contenus additionnels partagés par le groupe, avec leur propriétaire.
+    #[serde(default)]
+    pub family_dlcs: Vec<SteamFamilyDlc>,
     /// Une synchronisation tourne en arrière-plan : l'interface peut sonder.
     #[serde(default)]
     pub syncing: bool,
@@ -1119,6 +1749,7 @@ pub struct ProtonRelease {
 pub enum JobKind {
     InstallGame,
     InstallProton,
+    InstallGraphics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1294,13 +1925,11 @@ pub struct SessionInfo {
     pub started: i64,
     pub proton: String,
     pub fps_cap: u32,
-    /// Rafraîchissement du compositeur imbriqué (l'argument `-r` de
-    /// GameScope), calculé à partir du taux de l'écran et de la limite. Sa
-    /// limite d'images ne peut ouvrir une image que toutes les N périodes :
-    /// c'est la base de calcul de la cadence réellement atteignable.
+    /// Fréquence de l'écran visé, et non l'argument `-r` de GameScope :
+    /// celui-ci tourne au-dessus de l'écran pour laisser la place à
+    /// « illimité » et aux changements de limite à chaud.
     #[serde(default)]
     pub refresh_hz: u32,
-    pub mangohud: bool,
     pub overlay_open: bool,
     pub input_profile: String,
     pub log_path: PathBuf,
@@ -1331,10 +1960,6 @@ pub struct SessionInfo {
     /// automatique et les HUD. L'enregistrement manuel reste possible.
     #[serde(default)]
     pub performance: bool,
-    /// Un HUD MangoHud/MangoApp tourne : il relit sa configuration, donc son
-    /// affichage et son contenu peuvent changer sans relancer le jeu.
-    #[serde(default)]
-    pub hud_live: bool,
     /// Image publique du jeu, pour l'icône de l'activité Discord.
     #[serde(default)]
     pub cover: String,
@@ -1359,24 +1984,175 @@ pub struct SessionInfo {
     /// marque.
     #[serde(default)]
     pub store: crate::stores::Store,
-    /// Préréglage MangoHud de la session : `simple`, `essential` ou `full`.
-    #[serde(default)]
-    pub hud_preset: String,
-    /// Ancrage MangoHud de la session : `top-left`, `top-center`…
-    #[serde(default)]
-    pub hud_position: String,
-    /// Disposition MangoHud : `block` ou `inline`.
-    #[serde(default)]
-    pub hud_layout: String,
-    /// Courbe de frametime affichée dans MangoHud.
-    #[serde(default)]
-    pub hud_graph: bool,
-    /// Utilisation de chaque cœur du processeur dans MangoHud.
-    #[serde(default)]
-    pub hud_cores: bool,
     /// Ce que le jeu embarqué sait faire en DLSS, détecté dans ses fichiers.
     #[serde(default)]
     pub dlss: Option<DlssInfo>,
+    /// Multiplicateur de génération d'images de la session, quand la couche
+    /// afmf-linux est chargée : 0 coupe la génération, ×2, ×3 et ×4
+    /// intercalent des images.
+    #[serde(default)]
+    pub afmf_multiplier: Option<u32>,
+    /// Fichier de contrôle à chaud de cette session, écrit par le daemon et
+    /// lu par la couche : le multiplicateur y change sans relancer le jeu.
+    #[serde(default)]
+    pub afmf_control: Option<PathBuf>,
+}
+
+/// Ce que le dossier d'un jeu révèle de son moteur et de ses technologies :
+/// une lecture de ses fichiers, jamais un lancement du jeu.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameTech {
+    #[serde(default)]
+    pub engine: Option<GameEngine>,
+    /// Suréchantillonneurs embarqués, hors DLSS (voir `dlss`).
+    #[serde(default)]
+    pub upscalers: Vec<Upscaler>,
+    /// Un jeu peut embarquer deux anti-triches (campagne et multijoueur).
+    #[serde(default)]
+    pub anti_cheat: Vec<AntiCheat>,
+    #[serde(default)]
+    pub dlss: DlssInfo,
+}
+
+impl GameTech {
+    /// « DLSS · images générées · FSR · XeSS », ou « — » sans suréchantillonneur.
+    pub fn upscaling(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.dlss.is_empty() {
+            parts.push(self.dlss.short());
+        }
+        parts.extend(
+            self.upscalers
+                .iter()
+                .map(|upscaler| upscaler.label().to_string()),
+        );
+        if parts.is_empty() {
+            "—".into()
+        } else {
+            parts.join(" · ")
+        }
+    }
+
+    /// Vrai quand un anti-triche protège le jeu : son processus refuse les
+    /// bibliothèques et les outils qui s'y injectent.
+    pub fn protected(&self) -> bool {
+        !self.anti_cheat.is_empty()
+    }
+
+    /// « Easy Anti-Cheat · BattlEye », ou « — » sans anti-triche.
+    pub fn anti_cheat(&self) -> String {
+        if self.anti_cheat.is_empty() {
+            return "—".into();
+        }
+        self.anti_cheat
+            .iter()
+            .map(|anti_cheat| anti_cheat.label())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+/// Moteur reconnu d'après les fichiers du jeu : les noms propres ne se
+/// traduisent pas, et un moteur inconnu reste muet plutôt qu'inventé.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum GameEngine {
+    Unreal,
+    Unity,
+    Godot,
+    Source,
+    GameMaker,
+    RenPy,
+    RpgMaker,
+}
+
+impl GameEngine {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Unreal => "Unreal Engine",
+            Self::Unity => "Unity",
+            Self::Godot => "Godot",
+            Self::Source => "Source",
+            Self::GameMaker => "GameMaker",
+            Self::RenPy => "Ren'Py",
+            Self::RpgMaker => "RPG Maker",
+        }
+    }
+}
+
+/// Suréchantillonneurs concurrents de DLSS, repérés par leurs bibliothèques.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Upscaler {
+    Fsr,
+    Xess,
+}
+
+impl Upscaler {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Fsr => "FSR",
+            Self::Xess => "XeSS",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AntiCheat {
+    EasyAntiCheat,
+    BattlEye,
+}
+
+impl AntiCheat {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::EasyAntiCheat => "Easy Anti-Cheat",
+            Self::BattlEye => "BattlEye",
+        }
+    }
+}
+
+/// Une bibliothèque DLSS trouvée sur le disque, avec sa version lue dans la
+/// ressource de la DLL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DlssLibrary {
+    /// `nvngx_dlss.dll`, `nvngx_dlssg.dll` ou `nvngx_dlssd.dll`.
+    pub name: String,
+    pub version: Option<[u16; 4]>,
+    pub path: std::path::PathBuf,
+    /// Jeu d'où vient la bibliothèque, quand elle vient d'ailleurs.
+    #[serde(default)]
+    pub source: String,
+}
+
+impl DlssLibrary {
+    /// « 3.7.10 », ou « version inconnue » quand la ressource manque.
+    pub fn version_label(&self) -> String {
+        let Some(version) = self.version else {
+            return "version inconnue".into();
+        };
+        if version[3] == 0 {
+            format!("{}.{}.{}", version[0], version[1], version[2])
+        } else {
+            format!(
+                "{}.{}.{}.{}",
+                version[0], version[1], version[2], version[3]
+            )
+        }
+    }
+}
+
+/// Bibliothèques DLSS d'un jeu, et versions plus récentes trouvées ailleurs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DlssState {
+    /// Une entrée par nom de DLL, la plus ancienne copie du jeu.
+    pub current: Vec<DlssLibrary>,
+    /// Une entrée par nom de DLL qui peut recevoir une version plus récente.
+    pub available: Vec<DlssLibrary>,
+    /// Vrai quand une sauvegarde existe : le jeu tourne sur d'autres DLL.
+    pub updated: bool,
+    /// Vrai quand un anti-triche interdit de remplacer les DLL tant que le
+    /// joueur n'a pas autorisé les injections de ce jeu.
+    #[serde(default)]
+    pub blocked: bool,
 }
 
 /// Bibliothèques DLSS trouvées dans le dossier du jeu. Lapinux ne les active
@@ -1389,6 +2165,13 @@ pub struct DlssInfo {
     pub frame_generation: bool,
     /// `nvngx_dlssd.dll` : reconstruction de rayons (DLSS 3.5).
     pub ray_reconstruction: bool,
+    /// Versions PE des DLL, lorsqu'une ressource de version est lisible.
+    #[serde(default)]
+    pub dlss_version: Option<[u16; 4]>,
+    #[serde(default)]
+    pub frame_generation_version: Option<[u16; 4]>,
+    #[serde(default)]
+    pub ray_reconstruction_version: Option<[u16; 4]>,
 }
 
 impl DlssInfo {
@@ -1396,41 +2179,55 @@ impl DlssInfo {
         !self.dlss && !self.frame_generation && !self.ray_reconstruction
     }
 
-    /// Forme courte pour une ligne de menu : « DLSS 3 · FG · RR ».
+    fn version(version: Option<[u16; 4]>) -> String {
+        version
+            .map(|v| format!(" {}.{}.{}.{}", v[0], v[1], v[2], v[3]))
+            .unwrap_or_default()
+    }
+
+    /// Indique les fonctions repérées, sans déduire une version des noms des DLL.
     pub fn short(&self) -> String {
         if self.is_empty() {
             return "—".into();
         }
         if self.frame_generation || self.ray_reconstruction {
-            let mut parts = vec!["DLSS 3".to_string()];
+            let mut parts = vec![format!("DLSS{}", Self::version(self.dlss_version))];
             if self.frame_generation {
-                parts.push("FG".into());
+                parts.push(format!(
+                    "FG{}",
+                    Self::version(self.frame_generation_version)
+                ));
             }
             if self.ray_reconstruction {
-                parts.push("RR".into());
+                parts.push(format!(
+                    "RR{}",
+                    Self::version(self.ray_reconstruction_version)
+                ));
             }
             parts.join(" · ")
         } else {
-            "DLSS".into()
+            format!("DLSS{}", Self::version(self.dlss_version))
         }
     }
 
-    /// « DLSS 3 · images générées · rayons reconstruits » : la phrase complète.
+    /// Indique les fonctions repérées, sans affirmer qu'elles sont actives.
     pub fn summary(&self) -> String {
         if self.is_empty() {
             return "non détecté".into();
         }
         let mut parts = Vec::new();
-        if self.frame_generation || self.ray_reconstruction {
-            parts.push("DLSS 3".to_string());
-        } else {
-            parts.push("DLSS".to_string());
-        }
+        parts.push(format!("DLSS{}", Self::version(self.dlss_version)));
         if self.frame_generation {
-            parts.push("images générées".into());
+            parts.push(format!(
+                "images générées{}",
+                Self::version(self.frame_generation_version)
+            ));
         }
         if self.ray_reconstruction {
-            parts.push("rayons".into());
+            parts.push(format!(
+                "rayons{}",
+                Self::version(self.ray_reconstruction_version)
+            ));
         }
         parts.join(" · ")
     }
@@ -1456,6 +2253,26 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
+    /// Rapport partageable : seules les catégories connues et leur état sont
+    /// copiés. Les détails libres peuvent contenir chemins ou données privées.
+    pub fn private_summary(&self) -> serde_json::Value {
+        const CHECKS: &[(&str, &str)] = &[
+            ("Steam", "steam_library"), ("Bibliothèque", "library"),
+            ("umu-run", "umu"), ("GameScope", "gamescope"),
+            ("Pad virtuel", "virtual_controller"),
+            ("Raccourci clavier", "keyboard_shortcut"), ("Manettes", "controllers"),
+            ("Session", "desktop_session"),
+        ];
+        let mut checks = serde_json::Map::new();
+        for &(name, key) in CHECKS {
+            let state = self.checks.iter().find(|check| check.name == name).map(|check| match check.status {
+                CheckStatus::Ok => "ok", CheckStatus::Warn => "warning", CheckStatus::Fail => "error",
+            }).unwrap_or("unknown");
+            checks.insert(key.to_string(), state.into());
+        }
+        serde_json::Value::Object(checks)
+    }
+
     pub fn worst(&self) -> CheckStatus {
         if self.checks.iter().any(|c| c.status == CheckStatus::Fail) {
             CheckStatus::Fail
@@ -1585,6 +2402,112 @@ pub struct DownloadServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_game_capture_overrides_win_and_defaults_restore_the_global() {
+        let mut global = crate::config::CaptureConfig::default();
+        global.record_on_launch = true;
+        global.stop_on_exit = true;
+        global.video_fps = 30;
+        global.video_profile = "balanced".into();
+        global.video_resolution = "1080p".into();
+        global.video_encoder = "auto".into();
+        global.video_codec = "h264".into();
+        global.record_audio = true;
+        global.record_microphone = false;
+        global.hud_on_screen = true;
+        global.record_badge = true;
+
+        let mut game = GameSettings::default();
+        game.record_on_launch = Some(false);
+        game.stop_on_exit = Some(false);
+        game.video_fps = Some(60);
+        game.video_profile = Some("quality".into());
+        game.video_resolution = Some("1440p".into());
+        game.video_encoder = Some("nvenc".into());
+        game.video_codec = Some("av1".into());
+        game.record_audio = Some(false);
+        game.record_microphone = Some(true);
+        game.hud_on_screen = Some(false);
+        game.record_badge = Some(false);
+
+        let effective = game.effective_capture(&global);
+        assert!(!effective.record_on_launch);
+        assert!(!effective.stop_on_exit);
+        assert_eq!(effective.video_fps, 60);
+        assert_eq!(effective.video_profile, "quality");
+        assert_eq!(effective.video_resolution, "1440p");
+        assert_eq!(effective.video_encoder, "nvenc");
+        assert_eq!(effective.video_codec, "av1");
+        assert!(!effective.record_audio);
+        assert!(effective.record_microphone);
+        assert!(!effective.hud_on_screen);
+        assert!(!effective.record_badge);
+
+        game.record_on_launch = None;
+        game.stop_on_exit = None;
+        game.video_fps = None;
+        game.video_profile = None;
+        game.video_resolution = None;
+        game.video_encoder = None;
+        game.video_codec = None;
+        game.record_audio = None;
+        game.record_microphone = None;
+        game.hud_on_screen = None;
+        game.record_badge = None;
+        assert_eq!(
+            game.effective_capture(&global),
+            global,
+            "retirer chaque override rétablit la valeur globale"
+        );
+
+        let inherited = GameSettings::default().effective_capture(&global);
+        assert_eq!(
+            inherited, global,
+            "le retour au défaut reprend toute la config globale"
+        );
+    }
+
+    #[test]
+    fn per_game_display_and_save_overrides_are_persistent() {
+        let mut game = GameSettings::default();
+        game.sharpness = Some(11);
+        game.hud_on_screen = Some(false);
+        game.record_badge = Some(false);
+        game.saves_auto = Some(false);
+        game.saves_skip_cloud = Some(true);
+        game.saves_relaunch = Some(true);
+        game.grab_devices = Some(false);
+        assert_eq!(game.sharpness(3), 11);
+        assert!(!game.hud_on_screen(true));
+        assert!(!game.record_badge(true));
+        assert!(!game.saves_auto(true));
+        assert!(game.saves_skip_cloud(false));
+        assert!(game.saves_relaunch(false));
+        assert!(!game.grab_devices(true));
+
+        let wire = serde_json::to_string(&game).unwrap();
+        let read: GameSettings = serde_json::from_str(&wire).unwrap();
+        assert_eq!(read, game, "les overrides survivent à un redémarrage");
+        let default = GameSettings::default();
+        assert_eq!(default.sharpness(3), 3);
+        assert!(default.saves_auto(true));
+        assert!(!default.saves_skip_cloud(false));
+    }
+
+    #[test]
+    fn steam_controller_2026_ids_are_detected_without_a_bridge() {
+        for product in 0x1302..=0x1305 {
+            assert!(is_steam_controller_2026(0x28de, product));
+            assert_eq!(steam_input_kind(0x28de, product), "controller_triton");
+        }
+        assert_eq!(
+            steam_input_label("controller_triton"),
+            "Steam Controller 2026"
+        );
+        assert!(!is_steam_controller_2026(0x28de, 0x1142));
+        assert!(!is_steam_controller_2026(0x045e, 0x1304));
+    }
 
     #[test]
     fn game_install_dir() {

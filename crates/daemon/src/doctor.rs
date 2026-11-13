@@ -64,12 +64,19 @@ pub fn report(shared: &Shared) -> DoctorReport {
         check(
             "Bibliothèque",
             CheckStatus::Warn,
-            format!("{} sera créé au premier téléchargement", library_root.display()),
+            format!(
+                "{} sera créé au premier téléchargement",
+                library_root.display()
+            ),
         )
     });
 
     checks.push(if paths::which("umu-run").is_some() {
-        check("umu-run", CheckStatus::Ok, "lancement Proton via umu disponible")
+        check(
+            "umu-run",
+            CheckStatus::Ok,
+            "lancement Proton via umu disponible",
+        )
     } else {
         check(
             "umu-run",
@@ -79,19 +86,17 @@ pub fn report(shared: &Shared) -> DoctorReport {
     });
 
     checks.push(if paths::which("gamescope").is_some() {
-        check("GameScope", CheckStatus::Ok, "compositeur imbriqué disponible")
+        check(
+            "GameScope",
+            CheckStatus::Ok,
+            "compositeur imbriqué disponible",
+        )
     } else {
         check(
             "GameScope",
             CheckStatus::Warn,
             "absent : lancement sans GameScope",
         )
-    });
-
-    checks.push(if paths::which("mangohud").is_some() {
-        check("MangoHud", CheckStatus::Ok, "overlay de performance disponible")
-    } else {
-        check("MangoHud", CheckStatus::Warn, "absent : HUD désactivé")
     });
 
     let steam = shared.steam_status();
@@ -163,10 +168,7 @@ pub fn report(shared: &Shared) -> DoctorReport {
 
     let devices = lapinux_input::device::list();
     let pads = devices.iter().filter(|d| d.gamepad).count();
-    let denied_pads: Vec<_> = access
-        .iter()
-        .filter(|d| !d.readable && d.gamepad)
-        .collect();
+    let denied_pads: Vec<_> = access.iter().filter(|d| !d.readable && d.gamepad).collect();
     checks.push(if let Some(device) = denied_pads.first() {
         check(
             "Manettes",
@@ -182,7 +184,10 @@ pub fn report(shared: &Shared) -> DoctorReport {
         check(
             "Manettes",
             CheckStatus::Ok,
-            format!("{pads} manette(s) lisible(s) sur {} périphérique(s) evdev", devices.len()),
+            format!(
+                "{pads} manette(s) lisible(s) sur {} périphérique(s) evdev",
+                devices.len()
+            ),
         )
     } else {
         check("Manettes", CheckStatus::Warn, "aucune manette détectée")

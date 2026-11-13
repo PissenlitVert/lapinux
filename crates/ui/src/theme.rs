@@ -21,7 +21,7 @@ pub const CLASSIC_ID: &str = "classic";
 pub const NX_ID: &str = "nx";
 /// Anciennes valeurs du champ `general.theme` : elles désignent le thème
 /// classique, la palette claire n'ayant jamais eu de rendu distinct.
-pub const CLASSIC_ALIASES: [&str; 4] = ["classic", "sombre", "clair", "default"];
+pub const CLASSIC_ALIASES: [&str; 6] = ["classic", "default", "dark", "light", "sombre", "clair"];
 const RESERVED_IDS: [&str; 2] = [CLASSIC_ID, NX_ID];
 
 /// Disposition de l'interface portée par un thème.
@@ -37,7 +37,7 @@ pub enum ThemeLayout {
 impl ThemeLayout {
     pub fn from_key(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "classic" | "default" | "sombre" | "clair" => Some(Self::Classic),
+            "classic" | "default" | "dark" | "light" | "sombre" | "clair" => Some(Self::Classic),
             "nx" | "switch" | "console" => Some(Self::Nx),
             _ => None,
         }
@@ -45,7 +45,7 @@ impl ThemeLayout {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Classic => "Classique",
+            Self::Classic => lapinux_core::i18n::t("theme.layout_classic"),
             Self::Nx => "NX",
         }
     }
@@ -98,9 +98,8 @@ impl Palette {
     }
 
     pub fn is_light(self) -> bool {
-        let value = self.background.r() as u32
-            + self.background.g() as u32
-            + self.background.b() as u32;
+        let value =
+            self.background.r() as u32 + self.background.g() as u32 + self.background.b() as u32;
         value > 390
     }
 }
@@ -143,9 +142,9 @@ impl Default for ThemeManifest {
         let palette = Palette::classic();
         Self {
             id: CLASSIC_ID.to_string(),
-            name: "Classique".to_string(),
+            name: lapinux_core::i18n::t("theme.layout_classic").to_string(),
             author: "Lapinux".to_string(),
-            description: "L'interface Lapinux historique, en gris neutre.".to_string(),
+            description: lapinux_core::i18n::t("theme.classic_layout_description").to_string(),
             layout: "classic".to_string(),
             accent: hex(palette.accent),
             background: hex(palette.background),
@@ -159,7 +158,7 @@ impl Default for ThemeManifest {
             rounding: 12.0,
             font_scale: 1.0,
             home_label: "Lapinux".to_string(),
-            home_subtitle: "Votre bibliothèque, comme une console.".to_string(),
+            home_subtitle: lapinux_core::i18n::t("theme.classic_description").to_string(),
         }
     }
 }
@@ -175,8 +174,7 @@ impl ThemeManifest {
             id: NX_ID.to_string(),
             name: "NX".to_string(),
             author: "Lapinux".to_string(),
-            description: "Accueil horizontal, carrousel de jeux et dock inspirés de la Nintendo Switch."
-                .to_string(),
+            description: lapinux_core::i18n::t("theme.nx_description").to_string(),
             layout: "nx".to_string(),
             accent: hex(palette.accent),
             background: hex(palette.background),
@@ -189,8 +187,8 @@ impl ThemeManifest {
             text_dim: hex(palette.text_dim),
             rounding: 12.0,
             font_scale: 1.0,
-            home_label: "Jeux".to_string(),
-            home_subtitle: "Choisissez un jeu et appuyez sur Entrée.".to_string(),
+            home_label: lapinux_core::i18n::t("theme.home_label_default").to_string(),
+            home_subtitle: lapinux_core::i18n::t("theme.nx_hint").to_string(),
         }
     }
 
@@ -220,10 +218,10 @@ impl ThemeManifest {
     pub fn validate(&self) -> Result<(), String> {
         validate_id(&self.id)?;
         if self.name.trim().is_empty() {
-            return Err("Le nom du thème est vide.".to_string());
+            return Err(lapinux_core::i18n::t("theme.empty_name").to_string());
         }
         if !(self.layout.trim().is_empty() || ThemeLayout::from_key(&self.layout).is_some()) {
-            return Err("Disposition inconnue : utilisez `classic` ou `nx`.".to_string());
+            return Err(lapinux_core::i18n::t("theme.unknown_layout").to_string());
         }
         for (label, value) in [
             ("accent", &self.accent),
@@ -237,16 +235,17 @@ impl ThemeManifest {
             ("text_dim", &self.text_dim),
         ] {
             if parse_color(value).is_none() {
-                return Err(format!(
-                    "Couleur `{label}` invalide : `{value}` (attendu #RRGGBB)."
+                return Err(lapinux_core::i18n::t_args(
+                    "theme.invalid_color",
+                    &[("label", &label.to_string()), ("value", &value.to_string())],
                 ));
             }
         }
         if !(0.0..=36.0).contains(&self.rounding) {
-            return Err("`rounding` doit être compris entre 0 et 36.".to_string());
+            return Err(lapinux_core::i18n::t("theme.rounding_range").to_string());
         }
         if !(0.75..=1.6).contains(&self.font_scale) {
-            return Err("`font_scale` doit être compris entre 0.75 et 1.6.".to_string());
+            return Err(lapinux_core::i18n::t("theme.font_scale_range").to_string());
         }
         Ok(())
     }
@@ -301,10 +300,10 @@ impl Default for PluginManifest {
     fn default() -> Self {
         Self {
             id: "mon-plugin".to_string(),
-            name: "Mon plugin".to_string(),
+            name: lapinux_core::i18n::t("theme.plugin_default_name").to_string(),
             version: "0.1.0".to_string(),
             author: String::new(),
-            description: "Décrivez ce que ce plugin change.".to_string(),
+            description: lapinux_core::i18n::t("theme.plugin_description").to_string(),
             accent: None,
             background: None,
             panel: None,
@@ -329,7 +328,7 @@ impl PluginManifest {
     pub fn validate(&self) -> Result<(), String> {
         validate_id(&self.id)?;
         if self.name.trim().is_empty() {
-            return Err("Le nom du plugin est vide.".to_string());
+            return Err(lapinux_core::i18n::t("theme.empty_plugin_name").to_string());
         }
         for (label, value) in [
             ("accent", &self.accent),
@@ -344,57 +343,68 @@ impl PluginManifest {
         ] {
             if let Some(value) = value {
                 if !value.trim().is_empty() && parse_color(value).is_none() {
-                    return Err(format!(
-                        "Couleur `{label}` invalide : `{value}` (attendu #RRGGBB)."
+                    return Err(lapinux_core::i18n::t_args(
+                        "theme.invalid_color",
+                        &[("label", &label.to_string()), ("value", &value.to_string())],
                     ));
                 }
             }
         }
         if let Some(layout) = &self.layout {
             if !layout.trim().is_empty() && ThemeLayout::from_key(layout).is_none() {
-                return Err("Disposition inconnue : utilisez `classic` ou `nx`.".to_string());
+                return Err(lapinux_core::i18n::t("theme.unknown_layout").to_string());
             }
         }
         if let Some(rounding) = self.rounding {
             if !(0.0..=36.0).contains(&rounding) {
-                return Err("`rounding` doit être compris entre 0 et 36.".to_string());
+                return Err(lapinux_core::i18n::t("theme.rounding_range").to_string());
             }
         }
         if let Some(scale) = self.font_scale {
             if !(0.75..=1.6).contains(&scale) {
-                return Err("`font_scale` doit être compris entre 0.75 et 1.6.".to_string());
+                return Err(lapinux_core::i18n::t("theme.font_scale_range").to_string());
             }
         }
         for page in &self.hide_pages {
             if !valid_page_key(page) {
-                return Err(format!("Page inconnue dans `hide_pages` : `{page}`."));
+                return Err(lapinux_core::i18n::t_args(
+                    "theme.unknown_hidden_page",
+                    &[("page", &page.to_string())],
+                ));
             }
         }
         for entry in &self.dock {
             if entry.label.trim().is_empty() {
-                return Err("Une entrée du dock n'a pas de libellé.".to_string());
+                return Err(lapinux_core::i18n::t("theme.dock_missing_label").to_string());
             }
             if let Some(page) = &entry.page {
                 if !valid_page_key(page) {
-                    return Err(format!("Page inconnue dans le dock : `{page}`."));
+                    return Err(lapinux_core::i18n::t_args(
+                        "theme.unknown_dock_page",
+                        &[("page", &page.to_string())],
+                    ));
                 }
             }
             if let Some(url) = &entry.url {
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    return Err(format!(
-                        "Le lien du dock doit commencer par http:// ou https:// : `{url}`."
+                    return Err(lapinux_core::i18n::t_args(
+                        "theme.invalid_dock_link",
+                        &[("url", &url.to_string())],
                     ));
                 }
             }
             if entry.page.is_none() && entry.url.is_none() {
-                return Err(format!(
-                    "Le raccourci `{}` doit viser une page ou un lien.",
-                    entry.label
+                return Err(lapinux_core::i18n::t_fmt(
+                    "theme.dock_target",
+                    &[entry.label.clone()],
                 ));
             }
             if let Some(color) = &entry.color {
                 if !color.trim().is_empty() && parse_color(color).is_none() {
-                    return Err(format!("Couleur de dock invalide : `{color}`."));
+                    return Err(lapinux_core::i18n::t_args(
+                        "theme.invalid_dock_color",
+                        &[("color", &color.to_string())],
+                    ));
                 }
             }
         }
@@ -531,11 +541,14 @@ impl ThemeLibrary {
                 errors.push(format!("{} : {error}", path.display()));
                 continue;
             }
-            if self.themes.iter().any(|theme| theme.manifest.id == manifest.id) {
-                errors.push(format!(
-                    "{} : l'identifiant `{}` est déjà utilisé",
-                    path.display(),
-                    manifest.id
+            if self
+                .themes
+                .iter()
+                .any(|theme| theme.manifest.id == manifest.id)
+            {
+                errors.push(lapinux_core::i18n::t_fmt(
+                    "theme.id_taken",
+                    &[path.display().to_string(), manifest.id.to_string()],
                 ));
                 continue;
             }
@@ -555,7 +568,10 @@ impl ThemeLibrary {
 
     pub fn active(&self, id: &str) -> &Theme {
         let id = id.trim();
-        let id = if CLASSIC_ALIASES.iter().any(|alias| id.eq_ignore_ascii_case(alias)) {
+        let id = if CLASSIC_ALIASES
+            .iter()
+            .any(|alias| id.eq_ignore_ascii_case(alias))
+        {
             CLASSIC_ID
         } else {
             id
@@ -604,11 +620,7 @@ impl ThemeLibrary {
             if let Some(value) = colour_override(&plugin.text_dim) {
                 active.colors.text_dim = value;
             }
-            if let Some(layout) = plugin
-                .layout
-                .as_deref()
-                .and_then(ThemeLayout::from_key)
-            {
+            if let Some(layout) = plugin.layout.as_deref().and_then(ThemeLayout::from_key) {
                 active.layout = layout;
             }
             if let Some(rounding) = plugin.rounding {
@@ -617,7 +629,10 @@ impl ThemeLibrary {
             if let Some(scale) = plugin.font_scale {
                 active.font_scale = scale;
             }
-            if let Some(label) = plugin.home_label.as_ref().filter(|label| !label.trim().is_empty())
+            if let Some(label) = plugin
+                .home_label
+                .as_ref()
+                .filter(|label| !label.trim().is_empty())
             {
                 active.home_label = label.clone();
             }
@@ -650,31 +665,37 @@ impl ThemeLibrary {
         active
     }
 
-    pub fn save(&mut self, manifest: &ThemeManifest, previous: Option<&Path>) -> Result<PathBuf, String> {
+    pub fn save(
+        &mut self,
+        manifest: &ThemeManifest,
+        previous: Option<&Path>,
+    ) -> Result<PathBuf, String> {
         manifest.validate()?;
         if RESERVED_IDS
             .iter()
             .any(|id| manifest.id.eq_ignore_ascii_case(id))
         {
-            return Err(format!(
-                "`{}` est réservé au thème fourni : choisissez un autre identifiant.",
-                manifest.id
+            return Err(lapinux_core::i18n::t_fmt(
+                "theme.reserved_id",
+                &[manifest.id.to_string()],
             ));
         }
-        if self
-            .themes
-            .iter()
-            .any(|theme| !theme.builtin
-                && theme.manifest.id == manifest.id
-                && theme.path.as_deref() != previous)
-        {
-            return Err(format!("Un thème `{}` existe déjà.", manifest.id));
+        if self.themes.iter().any(|theme| {
+            !theme.builtin && theme.manifest.id == manifest.id && theme.path.as_deref() != previous
+        }) {
+            return Err(lapinux_core::i18n::t_fmt(
+                "theme.theme_exists",
+                &[manifest.id.to_string()],
+            ));
         }
         std::fs::create_dir_all(&self.dir).map_err(|error| error.to_string())?;
         let path = self.dir.join(format!("{}.toml", manifest.id));
         let body = toml::to_string_pretty(manifest).map_err(|error| error.to_string())?;
-        std::fs::write(&path, format!("# Thème Lapinux\n{body}"))
-            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &path,
+            format!("# {}\n{body}", lapinux_core::i18n::t("theme.file_header")),
+        )
+        .map_err(|error| error.to_string())?;
         if let Some(previous) = previous {
             if previous != path {
                 let _ = std::fs::remove_file(previous);
@@ -686,13 +707,13 @@ impl ThemeLibrary {
 
     pub fn delete(&mut self, id: &str) -> Result<(), String> {
         let Some(theme) = self.find(id) else {
-            return Err("Thème introuvable.".to_string());
+            return Err(lapinux_core::i18n::t("theme.not_found").to_string());
         };
         if theme.builtin {
-            return Err("Un thème fourni ne peut pas être supprimé.".to_string());
+            return Err(lapinux_core::i18n::t("theme.builtin_undeletable").to_string());
         }
         let Some(path) = theme.path.clone() else {
-            return Err("Thème sans fichier.".to_string());
+            return Err(lapinux_core::i18n::t("theme.no_file").to_string());
         };
         std::fs::remove_file(path).map_err(|error| error.to_string())?;
         self.reload();
@@ -757,10 +778,9 @@ impl PluginLibrary {
                 .iter()
                 .any(|plugin| plugin.manifest.id == manifest.id)
             {
-                errors.push(format!(
-                    "{} : l'identifiant `{}` est déjà utilisé",
-                    path.display(),
-                    manifest.id
+                errors.push(lapinux_core::i18n::t_fmt(
+                    "theme.id_taken",
+                    &[path.display().to_string(), manifest.id.to_string()],
                 ));
                 continue;
             }
@@ -795,17 +815,24 @@ impl PluginLibrary {
         if self
             .plugins
             .iter()
-            .any(|plugin| {
-                plugin.manifest.id == manifest.id && plugin.path.as_deref() != previous
-            })
+            .any(|plugin| plugin.manifest.id == manifest.id && plugin.path.as_deref() != previous)
         {
-            return Err(format!("Un plugin `{}` existe déjà.", manifest.id));
+            return Err(lapinux_core::i18n::t_fmt(
+                "theme.plugin_exists",
+                &[manifest.id.to_string()],
+            ));
         }
         std::fs::create_dir_all(&self.dir).map_err(|error| error.to_string())?;
         let path = self.dir.join(format!("{}.toml", manifest.id));
         let body = toml::to_string_pretty(manifest).map_err(|error| error.to_string())?;
-        std::fs::write(&path, format!("# Plugin Lapinux\n{body}"))
-            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &path,
+            format!(
+                "# {}\n{body}",
+                lapinux_core::i18n::t("theme.plugin_file_header")
+            ),
+        )
+        .map_err(|error| error.to_string())?;
         if let Some(previous) = previous {
             if previous != path {
                 let _ = std::fs::remove_file(previous);
@@ -817,10 +844,10 @@ impl PluginLibrary {
 
     pub fn delete(&mut self, id: &str) -> Result<(), String> {
         let Some(plugin) = self.find(id) else {
-            return Err("Plugin introuvable.".to_string());
+            return Err(lapinux_core::i18n::t("theme.plugin_not_found").to_string());
         };
         let Some(path) = plugin.path.clone() else {
-            return Err("Plugin sans fichier.".to_string());
+            return Err(lapinux_core::i18n::t("theme.plugin_without_file").to_string());
         };
         std::fs::remove_file(path).map_err(|error| error.to_string())?;
         self.reload();
@@ -836,14 +863,20 @@ pub fn theme_template(layout: ThemeLayout) -> String {
         ThemeLayout::Nx => ThemeManifest::nx(),
     };
     manifest.id = "mon-theme".to_string();
-    manifest.name = "Mon thème".to_string();
+    manifest.name = lapinux_core::i18n::t("theme.my_theme").to_string();
     manifest.author = String::new();
-    manifest.description = "Un thème créé dans Lapinux.".to_string();
-    manifest.home_label = "Mes jeux".to_string();
-    manifest.home_subtitle = "Choisissez un jeu et appuyez sur Entrée.".to_string();
+    manifest.description = lapinux_core::i18n::t("theme.created_theme").to_string();
+    manifest.home_label = lapinux_core::i18n::t("theme.home_label_created").to_string();
+    manifest.home_subtitle = lapinux_core::i18n::t("theme.nx_hint").to_string();
     let mut body = String::new();
-    body.push_str("# Identifiant : minuscules, chiffres et tirets uniquement.\n");
-    body.push_str("# Couleurs : #RRGGBB. Disposition : \"classic\" ou \"nx\".\n");
+    body.push_str(&format!(
+        "# {}\n",
+        lapinux_core::i18n::t("theme.comment_id")
+    ));
+    body.push_str(&format!(
+        "# {}\n",
+        lapinux_core::i18n::t("theme.comment_colors")
+    ));
     body.push_str(&toml::to_string_pretty(&manifest).unwrap_or_default());
     body
 }
@@ -851,44 +884,117 @@ pub fn theme_template(layout: ThemeLayout) -> String {
 /// Modèle de plugin. Les surcharges sont commentées pour que le fichier reste
 /// valide tel quel.
 pub fn plugin_template() -> String {
-    r##"# Plugin Lapinux : aucune commande n'est exécutée.
-# Un plugin peut changer les couleurs et la disposition du thème actif,
-# ajuster les formes, renommer l'accueil et ajouter des raccourcis au dock NX.
-id = "mon-plugin"
-name = "Mon plugin"
-version = "0.1.0"
-author = ""
-description = "Décrivez ce que ce plugin change."
+    let t = lapinux_core::i18n::t;
+    let mut body = String::new();
+    for line in [
+        t("theme.plugin_comment_1"),
+        t("theme.plugin_comment_2a"),
+        t("theme.plugin_comment_2b"),
+    ] {
+        body.push_str(&format!(
+            "# {line}
+"
+        ));
+    }
+    body.push_str(
+        "id = \"mon-plugin\"
+",
+    );
+    body.push_str(&format!(
+        "name = {:?}
+",
+        t("theme.plugin_default_name")
+    ));
+    body.push_str(
+        "version = \"0.1.0\"
+",
+    );
+    body.push_str(
+        "author = \"\"
+",
+    );
+    body.push_str(&format!(
+        "description = {:?}
+",
+        t("theme.plugin_default_description")
+    ));
+    body.push('\n');
+    body.push_str(&format!(
+        "home_label = {:?}
+",
+        t("theme.plugin_default_home_label")
+    ));
+    body.push_str(&format!(
+        "home_subtitle = {:?}
+",
+        t("theme.plugin_default_home_subtitle")
+    ));
+    body.push('\n');
+    body.push_str(&format!(
+        "# {}
+",
+        t("theme.plugin_comment_overrides")
+    ));
+    for line in [
+        "# accent = \"#4cc9f0\"",
+        "# background = \"#181a1f\"",
+        "# panel = \"#22252b\"",
+        "# card = \"#2c3038\"",
+        "# card_hover = \"#363b45\"",
+        "# card_active = \"#414754\"",
+        "# border = \"#4a505c\"",
+        "# text = \"#f5f7fa\"",
+        "# text_dim = \"#a8afb9\"",
+        "# layout = \"nx\"",
+        "# rounding = 12.0",
+        "# font_scale = 1.0",
+    ] {
+        body.push_str(line);
+        body.push('\n');
+    }
+    body.push('\n');
+    body.push_str(&format!(
+        "# {}
+",
+        t("theme.plugin_comment_hide_pages_a")
+    ));
+    body.push_str(&format!(
+        "# {}
+",
+        t("theme.plugin_comment_hide_pages_b")
+    ));
+    body.push_str(
+        "# hide_pages = [\"downloads\"]
 
-home_label = "Mon espace"
-home_subtitle = "Un accueil personnalisé par mon plugin."
-
-# Décommentez les surcharges utiles :
-# accent = "#4cc9f0"
-# background = "#181a1f"
-# panel = "#22252b"
-# card = "#2c3038"
-# card_hover = "#363b45"
-# card_active = "#414754"
-# border = "#4a505c"
-# text = "#f5f7fa"
-# text_dim = "#a8afb9"
-# layout = "nx"
-# rounding = 12.0
-# font_scale = 1.0
-
-# Pages retirées de la barre et du dock (library, collections, downloads,
-# controllers, profile, boutiques, captures) :
-# hide_pages = ["downloads"]
-
-# Raccourcis ajoutés au dock NX :
-# [[dock]]
-# label = "Ma boutique"
-# icon = "B"
-# color = "#4cc9f0"
-# url = "https://example.com"
-"##
-    .to_string()
+",
+    );
+    body.push_str(&format!(
+        "# {}
+",
+        t("theme.plugin_comment_dock")
+    ));
+    body.push_str(
+        "# [[dock]]
+",
+    );
+    body.push_str(&format!(
+        "# label = {:?}
+",
+        t("theme.plugin_default_dock_label")
+    ));
+    body.push_str(
+        "# icon = \"B\"
+",
+    );
+    body.push_str(
+        "# color = \"#4cc9f0\"
+",
+    );
+    body.push_str(
+        "# url = \"https://example.com\"
+",
+    );
+    body
 }
 
 pub fn theme_toml(manifest: &ThemeManifest) -> String {
@@ -900,15 +1006,17 @@ pub fn plugin_toml(manifest: &PluginManifest) -> String {
 }
 
 pub fn parse_theme(text: &str) -> Result<ThemeManifest, String> {
-    let manifest: ThemeManifest =
-        toml::from_str(text).map_err(|error| format!("TOML invalide : {error}"))?;
+    let manifest: ThemeManifest = toml::from_str(text).map_err(|error| {
+        lapinux_core::i18n::t_args("theme.invalid_toml", &[("error", &error.to_string())])
+    })?;
     manifest.validate()?;
     Ok(manifest)
 }
 
 pub fn parse_plugin(text: &str) -> Result<PluginManifest, String> {
-    let manifest: PluginManifest =
-        toml::from_str(text).map_err(|error| format!("TOML invalide : {error}"))?;
+    let manifest: PluginManifest = toml::from_str(text).map_err(|error| {
+        lapinux_core::i18n::t_args("theme.invalid_toml", &[("error", &error.to_string())])
+    })?;
     manifest.validate()?;
     Ok(manifest)
 }
@@ -942,16 +1050,13 @@ fn hex(color: Color32) -> String {
 
 fn validate_id(id: &str) -> Result<(), String> {
     if id.is_empty() {
-        return Err("L'identifiant est vide.".to_string());
+        return Err(lapinux_core::i18n::t("theme.empty_id").to_string());
     }
     if !id
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
     {
-        return Err(
-            "L'identifiant doit contenir seulement des minuscules, chiffres, `-` ou `_`."
-                .to_string(),
-        );
+        return Err(lapinux_core::i18n::t("theme.invalid_id").to_string());
     }
     Ok(())
 }
@@ -1036,7 +1141,7 @@ mod tests {
         manifest.accent = "rouge".into();
         assert!(manifest.validate().is_err());
         manifest.accent = "#ff0000".into();
-        manifest.layout = "inconnu".into();
+        manifest.layout = lapinux_core::i18n::t("controllers.information.unknown_band").into();
         assert!(manifest.validate().is_err());
     }
 
@@ -1052,5 +1157,79 @@ mod tests {
         assert_eq!(library.active("sombre").manifest.id, CLASSIC_ID);
         assert_eq!(library.active("").manifest.id, CLASSIC_ID);
         assert_eq!(library.active("nx").manifest.id, NX_ID);
+    }
+
+    #[test]
+    fn un_plugin_ecrit_avant_la_traduction_reste_lisible() {
+        // Fichier tel que l'ancienne version l'écrivait : commentaires et
+        // valeurs en français, mêmes clés TOML. Il doit continuer à se lire.
+        let ancien = r##"# Plugin Lapinux : aucune commande n'est exécutée.
+id = "vieux-plugin"
+name = "Vieux plugin"
+version = "0.1.0"
+author = ""
+description = "Décrivez ce que ce plugin change."
+home_label = "Mon espace"
+home_subtitle = "Un accueil personnalisé par mon plugin."
+# accent = "#4cc9f0"
+"##;
+        let parsed = parse_plugin(ancien).expect("un ancien plugin reste lisible");
+        assert_eq!(parsed.id, "vieux-plugin");
+        assert_eq!(parsed.home_label.as_deref(), Some("Mon espace"));
+        assert_eq!(parsed.description, "Décrivez ce que ce plugin change.");
+    }
+
+    #[test]
+    fn les_modeles_generes_suivent_la_langue_du_catalogue() {
+        let modele = plugin_template();
+        assert!(
+            parse_plugin(&modele).is_ok(),
+            "le modèle doit rester du TOML valide"
+        );
+        assert!(modele.contains(lapinux_core::i18n::t("theme.plugin_default_name")));
+        assert!(modele.contains(lapinux_core::i18n::t("theme.plugin_default_description")));
+        assert!(modele.contains(lapinux_core::i18n::t("theme.plugin_default_home_label")));
+        assert!(modele.contains(lapinux_core::i18n::t("theme.plugin_comment_overrides")));
+        assert_eq!(
+            lapinux_core::i18n::t_in("fr", "theme.plugin_default_description"),
+            "Décrivez ce que ce plugin change."
+        );
+        assert_eq!(
+            lapinux_core::i18n::t_in("en", "theme.plugin_default_description"),
+            "Describe what this plugin changes."
+        );
+        let theme = theme_template(ThemeLayout::Classic);
+        assert!(parse_theme(&theme).is_ok());
+        assert!(theme.contains(lapinux_core::i18n::t("theme.comment_id")));
+        assert!(theme.contains(lapinux_core::i18n::t("theme.comment_colors")));
+    }
+
+    #[test]
+    fn les_alias_de_theme_anciens_et_neutres_restent_lus() {
+        for key in ["classic", "default", "dark", "light", "sombre", "clair"] {
+            assert_eq!(
+                ThemeLayout::from_key(key),
+                Some(ThemeLayout::Classic),
+                "{key}"
+            );
+        }
+        for key in ["nx", "switch", "console"] {
+            assert_eq!(ThemeLayout::from_key(key), Some(ThemeLayout::Nx), "{key}");
+        }
+        // Un fichier écrit avant le changement (layout = "sombre") et sa
+        // nouvelle écriture neutre se lisent tous deux.
+        for alias in ["sombre", "dark"] {
+            let mut manifest = ThemeManifest::classic();
+            manifest.layout = alias.into();
+            let text = theme_toml(&manifest);
+            let parsed = parse_theme(&text).expect("thème relu");
+            assert_eq!(parsed.layout(), ThemeLayout::Classic);
+        }
+        let mut manifest = ThemeManifest::nx();
+        manifest.layout = "console".into();
+        assert_eq!(
+            parse_theme(&theme_toml(&manifest)).unwrap().layout(),
+            ThemeLayout::Nx
+        );
     }
 }

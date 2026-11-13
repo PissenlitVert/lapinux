@@ -54,7 +54,10 @@ fn gate() -> &'static Gate {
 pub(crate) async fn permit() -> Verdict {
     let gate = gate();
     {
-        let mut rest = gate.rest_until.lock().unwrap_or_else(|err| err.into_inner());
+        let mut rest = gate
+            .rest_until
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         if let Some(until) = *rest {
             if Instant::now() < until {
                 return Verdict::Resting;
@@ -92,7 +95,10 @@ pub(crate) fn refused(retry_after: Option<Duration>) {
     }
     let rest = retry_after.unwrap_or(COOLDOWN).max(MIN_REST);
     let until = Instant::now() + rest;
-    *gate.rest_until.lock().unwrap_or_else(|err| err.into_inner()) = Some(until);
+    *gate
+        .rest_until
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = Some(until);
     gate.refusals.store(0, Ordering::Relaxed);
     write_rest(rest);
     tracing::warn!(
@@ -104,7 +110,11 @@ pub(crate) fn refused(retry_after: Option<Duration>) {
 /// La boutique se repose-t-elle en ce moment ?
 pub(crate) fn resting() -> bool {
     let gate = gate();
-    match *gate.rest_until.lock().unwrap_or_else(|err| err.into_inner()) {
+    match *gate
+        .rest_until
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+    {
         Some(until) => Instant::now() < until,
         None => false,
     }

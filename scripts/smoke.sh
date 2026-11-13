@@ -27,10 +27,10 @@ for g in installed[:5]:
 PY
 
 step "Protons"
-"$BIN" cli protons | head -8
+"$BIN" cli protons | sed -n '1,8p'
 
 step "périphériques evdev"
-"$BIN" cli devices | head -6
+"$BIN" cli devices | sed -n '1,6p'
 
 step "pad virtuel uinput"
 "$BIN" cli virtual-pad

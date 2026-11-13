@@ -18,6 +18,29 @@ use tempfile::TempDir;
 const LAPINUX_APPID: u32 = 990_001;
 const STEAM_AUTHORED_APPID: u32 = 990_999;
 
+#[test]
+fn diagnostic_export_without_daemon_is_private_and_does_not_overwrite() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let output = home.path().join("report.json");
+    let run = || Command::new(env!("CARGO_BIN_EXE_lapinux"))
+        .args(["cli", "diagnostic-export"])
+        .arg(&output)
+        .env("LAPINUX_HOME", home.path())
+        .output().unwrap();
+    let first = run();
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert_eq!(report["format"], "lapinux-diagnostic-v1");
+    assert_eq!(report["daemon_responding"], false);
+    assert!(report["checks"].is_null());
+    assert!(report["downloads"].is_null());
+    assert_eq!(fs::metadata(&output).unwrap().permissions().mode() & 0o777, 0o600);
+    fs::write(&output, b"keep this file").unwrap();
+    assert!(!run().status.success());
+    assert_eq!(fs::read(&output).unwrap(), b"keep this file");
+}
+
 struct Scenario {
     home: TempDir,
     paths: LapinuxPaths,
@@ -37,7 +60,7 @@ impl Scenario {
             format!(
                 "[general]\nlibrary_root = \"{}\"\n\n\
                  [steam]\nusername = \"tester\"\n\n\
-                 [launch]\nproton = \"Lapinux-Test-Proton\"\ngamescope = false\nmangohud = false\n",
+                 [launch]\nproton = \"Lapinux-Test-Proton\"\ngamescope = false\n",
                 library.display()
             ),
         )
@@ -53,8 +76,7 @@ impl Scenario {
         .unwrap();
         // Compatdata piège dans la bibliothèque : un jeu Lapinux ne doit pas l'utiliser.
         for appid in [LAPINUX_APPID] {
-            fs::create_dir_all(library.join(format!("steamapps/compatdata/{appid}/pfx")))
-                .unwrap();
+            fs::create_dir_all(library.join(format!("steamapps/compatdata/{appid}/pfx"))).unwrap();
         }
         // Proton factice : un vrai script Python qui note l'exécutable reçu,
         // pour vérifier qu'un lancement passe bien par Proton.
@@ -141,12 +163,15 @@ fn write_exec(path: &Path, body: &str) {
 }
 
 fn game<'a>(games: &'a [Game], appid: u32) -> &'a Game {
-    games.iter().find(|game| game.appid == appid).unwrap_or_else(|| {
-        panic!(
-            "jeu {appid} absent de {:?}",
-            games.iter().map(|g| g.appid).collect::<Vec<_>>()
-        )
-    })
+    games
+        .iter()
+        .find(|game| game.appid == appid)
+        .unwrap_or_else(|| {
+            panic!(
+                "jeu {appid} absent de {:?}",
+                games.iter().map(|g| g.appid).collect::<Vec<_>>()
+            )
+        })
 }
 
 fn installed_game_still_launches(scenario: &Scenario, appid: u32) {
@@ -154,12 +179,14 @@ fn installed_game_still_launches(scenario: &Scenario, appid: u32) {
     let installed = game(&games, appid);
     assert!(installed.installed, "le jeu {appid} doit être installé");
     assert_eq!(
-        installed.library,
-        scenario.library,
+        installed.library, scenario.library,
         "le jeu doit être rattaché à library_root"
     );
     assert_eq!(installed.origin, GameOrigin::Lapinux);
-    assert!(installed.prefix.is_none(), "pas de compatdata Steam pour Lapinux");
+    assert!(
+        installed.prefix.is_none(),
+        "pas de compatdata Steam pour Lapinux"
+    );
     assert!(
         installed
             .exe
@@ -279,9 +306,7 @@ fn an_old_managed_library_becomes_readable() {
     assert_eq!(moved.origin, GameOrigin::Lapinux);
     assert!(moved.installed);
     assert!(library.join("Steam/Old Game/old.exe").is_file());
-    assert!(library
-        .join("Steam/appmanifest_990002.acf")
-        .is_file());
+    assert!(library.join("Steam/appmanifest_990002.acf").is_file());
     assert!(library
         .join("CompatData/Old Game (990002)/pfx/state")
         .is_file());

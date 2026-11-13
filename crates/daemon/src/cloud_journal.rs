@@ -62,7 +62,10 @@ pub fn record(paths: &LapinuxPaths, appid: u32, mut entry: CloudSyncEntry) {
         return;
     };
     if let Err(error) = std::fs::create_dir_all(parent) {
-        tracing::warn!("journal cloud : dossier {} inaccessible ({error})", parent.display());
+        tracing::warn!(
+            "journal cloud : dossier {} inaccessible ({error})",
+            parent.display()
+        );
         return;
     }
     let mut entries = read(&file);

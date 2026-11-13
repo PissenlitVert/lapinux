@@ -164,8 +164,7 @@ fn guid_base64(guid: &[u32; 4]) -> String {
 
 /// Base64 URL sans remplissage (RFC 4648 §5).
 fn base64_url(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for block in input.chunks(3) {
         let bytes = [
@@ -819,7 +818,10 @@ mod tests {
         let manifest = parse(&sample(21)).expect("manifeste");
         let legacy = manifest.chunk_path(&manifest.chunks[0]);
         // Groupe, empreinte 64 bits, puis les quatre mots du GUID.
-        assert_eq!(legacy, "03/1122334455667788_00000001000000020000000300000004.chunk");
+        assert_eq!(
+            legacy,
+            "03/1122334455667788_00000001000000020000000300000004.chunk"
+        );
 
         let modern = parse(&sample(23)).expect("manifeste");
         let path = modern.chunk_path(&modern.chunks[1]);

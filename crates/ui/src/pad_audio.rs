@@ -113,7 +113,12 @@ impl PadAudio {
             .args(["set-sink-volume", sink, &format!("{}%", percent.min(100))])
             .env("LC_ALL", "C")
             .output()
-            .map_err(|err| lapinux_core::i18n::t_args("pad.speaker_volume_error", &[("error", &err.to_string())]))?;
+            .map_err(|err| {
+                lapinux_core::i18n::t_args(
+                    "pad.speaker_volume_error",
+                    &[("error", &err.to_string())],
+                )
+            })?;
         if output.status.success() {
             Ok(())
         } else {
@@ -127,10 +132,7 @@ impl PadAudio {
     }
 
     pub fn mic_level(&self) -> f32 {
-        self.mic
-            .as_ref()
-            .map(|mic| mic.level())
-            .unwrap_or(0.0)
+        self.mic.as_ref().map(|mic| mic.level()).unwrap_or(0.0)
     }
 
     /// Ouvre ou coupe l'écoute directe du micro. `parec` capte la source et
@@ -140,10 +142,11 @@ impl PadAudio {
             self.stop_monitor();
             return Ok(());
         }
-        let source = self.route.source.as_deref().ok_or_else(|| {
-            lapinux_core::i18n::t("pad.no_mic")
-                .to_string()
-        })?;
+        let source = self
+            .route
+            .source
+            .as_deref()
+            .ok_or_else(|| lapinux_core::i18n::t("pad.no_mic").to_string())?;
         if self.monitor.is_some() {
             return Ok(());
         }
@@ -168,7 +171,9 @@ impl PadAudio {
             .as_deref()
             .ok_or_else(|| lapinux_core::i18n::t("pad.no_output").to_string())?;
         let path = tone_path();
-        write_tone(&path).map_err(|err| lapinux_core::i18n::t_args("pad.tone_error", &[("error", &err.to_string())]))?;
+        write_tone(&path).map_err(|err| {
+            lapinux_core::i18n::t_args("pad.tone_error", &[("error", &err.to_string())])
+        })?;
         let mut child = Command::new("pw-play")
             .arg("--target")
             .arg(sink)
@@ -187,7 +192,9 @@ impl PadAudio {
                     .stderr(Stdio::null())
                     .spawn()
             })
-            .map_err(|err| format!("lecteur audio indisponible : {err}"))?;
+            .map_err(|err| {
+                lapinux_core::i18n::t_args("pad.audio_unavailable", &[("err", &err.to_string())])
+            })?;
         // Le processus est récolté hors du fil d'affichage.
         std::thread::spawn(move || {
             let _ = child.wait();
@@ -211,8 +218,9 @@ impl PadAudio {
             .as_deref()
             .ok_or_else(|| lapinux_core::i18n::t("pad.no_card").to_string())?;
         let path = haptics_path();
-        write_haptics(&path, left, right, frequency_hz, duration_ms)
-            .map_err(|err| lapinux_core::i18n::t_args("pad.haptics_error", &[("error", &err.to_string())]))?;
+        write_haptics(&path, left, right, frequency_hz, duration_ms).map_err(|err| {
+            lapinux_core::i18n::t_args("pad.haptics_error", &[("error", &err.to_string())])
+        })?;
         let mut child = Command::new("pw-play")
             .args([
                 "--target",
@@ -228,7 +236,9 @@ impl PadAudio {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|err| format!("lecteur audio indisponible : {err}"))?;
+            .map_err(|err| {
+                lapinux_core::i18n::t_args("pad.audio_unavailable", &[("err", &err.to_string())])
+            })?;
         std::thread::spawn(move || {
             let _ = child.wait();
         });
@@ -250,7 +260,11 @@ fn sink_volume_percent(sink: &Value) -> Option<u8> {
             count += 1.0;
         }
     }
-    (count > 0.0).then(|| ((total / count) / 65_536.0 * 100.0).round().clamp(0.0, 100.0) as u8)
+    (count > 0.0).then(|| {
+        ((total / count) / 65_536.0 * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8
+    })
 }
 
 fn detect_route(device: &DeviceInfo) -> AudioRoute {
@@ -294,11 +308,7 @@ fn detect_route(device: &DeviceInfo) -> AudioRoute {
 }
 
 fn pactl_json(args: &[&str]) -> Vec<Value> {
-    let Ok(output) = Command::new("pactl")
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()
-    else {
+    let Ok(output) = Command::new("pactl").args(args).env("LC_ALL", "C").output() else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -441,11 +451,13 @@ impl Monitor {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|err| format!("capture micro : {err}"))?;
+            .map_err(|err| {
+                lapinux_core::i18n::t_args("pad.mic_capture", &[("err", &err.to_string())])
+            })?;
         let Some(stdout) = capture.stdout.take() else {
             let _ = capture.kill();
             let _ = capture.wait();
-            return Err("flux micro indisponible".to_string());
+            return Err(lapinux_core::i18n::t("pad.mic_unavailable").to_string());
         };
         let mut playback = Command::new("pacat");
         playback
@@ -471,7 +483,10 @@ impl Monitor {
             Err(err) => {
                 let _ = capture.kill();
                 let _ = capture.wait();
-                return Err(format!("lecture micro : {err}"));
+                return Err(lapinux_core::i18n::t_args(
+                    "ui.mic_read_failed",
+                    &[("err", &err.to_string())],
+                ));
             }
         };
         Ok(Self { capture, playback })
@@ -526,8 +541,7 @@ impl MicMeter {
                 let mut sum = 0.0_f64;
                 let mut count = 0usize;
                 for sample in buffer[..read].chunks_exact(4) {
-                    let value =
-                        f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                    let value = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
                     sum += (value * value) as f64;
                     count += 1;
                 }
@@ -587,12 +601,7 @@ fn write_tone(path: &std::path::Path) -> std::io::Result<()> {
 
 /// WAV PCM 16 bits, petit-boutiste. Le nombre de canaux décide du reste :
 /// une note est mono, les retours HD utilisent les quatre canaux du câble.
-fn write_wav(
-    path: &std::path::Path,
-    rate: u32,
-    channels: u16,
-    pcm: &[u8],
-) -> std::io::Result<()> {
+fn write_wav(path: &std::path::Path, rate: u32, channels: u16, pcm: &[u8]) -> std::io::Result<()> {
     let block_align = channels * 2;
     let mut wav = Vec::with_capacity(44 + pcm.len());
     wav.extend_from_slice(b"RIFF");
@@ -679,13 +688,13 @@ mod tests {
 
     #[test]
     fn bluetooth_names_match_the_controller_address() {
-        let pad = device(Some("44:46:48:2E:38:09"));
-        assert!(matches_controller(
-            "bluez_output.44:46:48:2E:38:09.1",
+        let pad = device(Some("02:00:00:00:00:01"));
+        assert!(matches_controller("bluez_output.02:00:00:00:00:01.1", &pad));
+        assert!(matches_controller("bluez_card.02_00_00_00_00_01", &pad));
+        assert!(!matches_controller(
+            "bluez_output.02_00_00_00_00_04.1",
             &pad
         ));
-        assert!(matches_controller("bluez_card.44_46_48_2E_38_09", &pad));
-        assert!(!matches_controller("bluez_output.CB_F5_35_81_15_40.1", &pad));
     }
 
     #[test]
@@ -757,7 +766,10 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..4], b"RIFF");
         assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 4);
-        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 48_000);
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            48_000
+        );
         let data = &bytes[44..];
         let frames = data.len() / 8;
         assert!(frames > 10_000, "durée trop courte : {frames} images");
@@ -772,7 +784,10 @@ mod tests {
             rear_peak = rear_peak.max(sample(2).abs()).max(sample(3).abs());
         }
         assert_eq!(front_peak, 0, "le haut-parleur reste muet");
-        assert!(rear_peak > 20_000, "les bobines reçoivent le son : {rear_peak}");
+        assert!(
+            rear_peak > 20_000,
+            "les bobines reçoivent le son : {rear_peak}"
+        );
     }
 
     #[test]
@@ -785,7 +800,10 @@ mod tests {
         assert_eq!(&bytes[..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WAVE");
         assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 1);
-        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 48_000);
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            48_000
+        );
         assert!(bytes.len() > 44);
     }
 }

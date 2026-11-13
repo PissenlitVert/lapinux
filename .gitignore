@@ -1,8 +1,21 @@
 /target
+# Copie de préparation indépendante, à publier seulement après vérification.
+/Lapinux-open-source/
+**/target/
+# Fichiers locaux susceptibles de contenir des identifiants.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
 **/*.rs.bk
 *.log
 .freebuff/
 /covers/
 /dist/
+# DLL construite localement par le projet Windows autonome.
+/crates/steamshim-win/steam_api64.dll
+# Captures locales : les captures déjà suivies restent suivies.
+/screenshots/*
 # Conversations importées : elles contiennent des clés d'API et des jetons.
 .cloud-attachments/

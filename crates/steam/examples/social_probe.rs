@@ -77,7 +77,12 @@ fn main() {
     }
 
     let snapshot = social.snapshot();
-    println!("=== état : {} · présence {} / appliquée {}", snapshot.state, snapshot.presence.label(), snapshot.applied_presence.label());
+    println!(
+        "=== état : {} · présence {} / appliquée {}",
+        snapshot.state,
+        snapshot.presence.label(),
+        snapshot.applied_presence.label()
+    );
     println!(
         "=== profil : {} (steamid {})",
         snapshot.persona_name, snapshot.steam_id
@@ -102,14 +107,22 @@ fn main() {
     }
     match &snapshot.family {
         Some(family) => {
-            println!("=== famille : {} ({} membres)", family.name, family.members.len());
+            println!(
+                "=== famille : {} ({} membres)",
+                family.name,
+                family.members.len()
+            );
             for member in family.members.iter().take(8) {
                 println!(
                     "    {} — {:?} rôle {} photo {} {}",
                     member.steam_id,
                     member.name,
                     member.role,
-                    if member.avatar.is_empty() { "non" } else { "oui" },
+                    if member.avatar.is_empty() {
+                        "non"
+                    } else {
+                        "oui"
+                    },
                     if member.is_self { "(vous)" } else { "" }
                 );
             }

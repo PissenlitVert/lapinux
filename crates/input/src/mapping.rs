@@ -103,10 +103,16 @@ impl VEvent {
 pub struct Mapper {
     profile: Profile,
     held: HashSet<u16>,
+    steam_2026_dpad: HashSet<u16>,
+    /// Sortie choisie à l'appui : une couche relâchée entre-temps ne doit
+    /// pas libérer un autre bouton que celui qui a été pressé.
+    pressed_outputs: BTreeMap<u16, u16>,
     shift_code: Option<u16>,
     hotkey_codes: Vec<u16>,
     hotkey_armed: bool,
     raw_axes: [i32; 6],
+    /// Bornes des gâchettes du pilote natif 2026, si c'est cette manette.
+    steam_2026_triggers: Option<[(i32, i32); 2]>,
 }
 
 impl Mapper {
@@ -119,11 +125,21 @@ impl Mapper {
         Self {
             profile,
             held: HashSet::new(),
+            steam_2026_dpad: HashSet::new(),
+            pressed_outputs: BTreeMap::new(),
             shift_code,
             hotkey_codes,
             hotkey_armed: false,
             raw_axes: [0; 6],
+            steam_2026_triggers: None,
         }
+    }
+
+    /// Les bornes viennent d'evdev : certains pilotes exposent 0–32767.
+    pub fn steam_2026(profile: Profile, left: (i32, i32), right: (i32, i32)) -> Self {
+        let mut mapper = Self::new(profile);
+        mapper.steam_2026_triggers = Some([left, right]);
+        mapper
     }
 
     pub fn profile(&self) -> &Profile {
@@ -142,6 +158,19 @@ impl Mapper {
 
     pub fn is_held(&self, code: u16) -> bool {
         self.held.contains(&code)
+    }
+
+    /// Efface l'état transitoire avant une nouvelle lecture de l'état evdev.
+    pub(crate) fn reset(&mut self) {
+        self.held.clear();
+        self.steam_2026_dpad.clear();
+        self.pressed_outputs.clear();
+        self.hotkey_armed = false;
+        self.raw_axes = [0; 6];
+    }
+
+    pub(crate) fn shift_code(&self) -> Option<u16> {
+        self.shift_code
     }
 
     /// Traite une touche/bouton ; renvoie les événements virtuels et un éventuel
@@ -185,6 +214,32 @@ impl Mapper {
             }
         }
 
+        // Le pilote natif publie la croix en boutons, pas en axes HAT.
+        // Un remap explicite conserve la priorité sur cette traduction.
+        if self.steam_2026_triggers.is_some() {
+            let axis = match code {
+                BTN_DPAD_LEFT | BTN_DPAD_RIGHT => Some((ABS_HAT0X, BTN_DPAD_LEFT, BTN_DPAD_RIGHT)),
+                BTN_DPAD_UP | BTN_DPAD_DOWN => Some((ABS_HAT0Y, BTN_DPAD_UP, BTN_DPAD_DOWN)),
+                _ => None,
+            };
+            if let Some((axis, negative, positive)) = axis {
+                let translated = self.steam_2026_dpad.contains(&code)
+                    || (value != 0
+                        && mapped_name.is_none()
+                        && !self.pressed_outputs.contains_key(&code));
+                if translated {
+                    if value == 0 {
+                        self.steam_2026_dpad.remove(&code);
+                    } else {
+                        self.steam_2026_dpad.insert(code);
+                    }
+                    let value = i32::from(self.steam_2026_dpad.contains(&positive))
+                        - i32::from(self.steam_2026_dpad.contains(&negative));
+                    return (vec![VEvent::abs(axis, value)], hotkey);
+                }
+            }
+        }
+
         let mut virtual_code = match mapped_name {
             Some(name) => codes::key_or_button_code(name).unwrap_or(code),
             None => code,
@@ -197,6 +252,28 @@ impl Mapper {
             };
         }
 
+        // La sortie active est fixée à l'appui, même si la couche change
+        // avant le relâchement. Les répétitions conservent la même sortie.
+        if value == 0 {
+            let Some(pressed) = self.pressed_outputs.remove(&code) else {
+                return (Vec::new(), hotkey);
+            };
+            virtual_code = pressed;
+            if self.pressed_outputs.values().any(|other| *other == pressed) {
+                return (Vec::new(), hotkey);
+            }
+        } else if let Some(pressed) = self.pressed_outputs.get(&code) {
+            virtual_code = *pressed;
+        } else if is_virtual_key(virtual_code) {
+            let already_pressed = self
+                .pressed_outputs
+                .values()
+                .any(|other| *other == virtual_code);
+            self.pressed_outputs.insert(code, virtual_code);
+            if already_pressed {
+                return (Vec::new(), hotkey);
+            }
+        }
         if !is_virtual_key(virtual_code) {
             return (Vec::new(), hotkey);
         }
@@ -205,6 +282,26 @@ impl Mapper {
 
     /// Traite un axe ; renvoie les événements virtuels correspondants.
     pub fn on_abs(&mut self, code: u16, value: i32) -> Vec<VEvent> {
+        if let Some(ranges) = self.steam_2026_triggers {
+            // HAT0/1 sont les pavés tactiles, pas la croix directionnelle.
+            if matches!(code, ABS_HAT0X | ABS_HAT0Y | ABS_HAT1X | ABS_HAT1Y) {
+                return Vec::new();
+            }
+            let trigger = match code {
+                ABS_HAT2Y => Some((ABS_Z, ranges[0])),
+                ABS_HAT2X => Some((ABS_RZ, ranges[1])),
+                _ => None,
+            };
+            if let Some((target, (min, max))) = trigger {
+                let span = i64::from(max) - i64::from(min);
+                if span <= 0 {
+                    return Vec::new();
+                }
+                let scaled =
+                    ((i64::from(value) - i64::from(min)).clamp(0, span) * 255 / span) as i32;
+                return vec![VEvent::abs(target, scaled)];
+            }
+        }
         match code {
             ABS_X | ABS_Y => {
                 self.raw_axes[if code == ABS_X { 0 } else { 1 }] = value;
@@ -216,7 +313,8 @@ impl Mapper {
             }
             ABS_Z | ABS_RZ => vec![VEvent::abs(code, value.clamp(0, 255))],
             ABS_HAT0X | ABS_HAT0Y => vec![VEvent::abs(code, value.clamp(-1, 1))],
-            _ => vec![VEvent::abs(code, value)],
+            // Le pad Xbox virtuel ne déclare pas d'autres axes.
+            _ => Vec::new(),
         }
     }
 
@@ -302,19 +400,111 @@ mod tests {
         });
         let (events, _) = mapper.on_key(BTN_SOUTH, 1);
         assert_eq!(events[0].code, BTN_EAST);
-        let (events, _) = mapper.on_key(BTN_EAST, 0);
+        let (events, _) = mapper.on_key(BTN_EAST, 1);
         assert_eq!(events[0].code, BTN_SOUTH);
+        assert_eq!(
+            mapper.on_key(BTN_EAST, 0).0,
+            vec![VEvent::key(BTN_SOUTH, 0)]
+        );
     }
 
     #[test]
     fn custom_remap_wins() {
         let mut profile = Profile::default();
-        profile
-            .remap
-            .insert("BTN_SOUTH".into(), "BTN_NORTH".into());
+        profile.remap.insert("BTN_SOUTH".into(), "BTN_NORTH".into());
         let mut mapper = Mapper::new(profile);
         let (events, _) = mapper.on_key(BTN_SOUTH, 1);
         assert_eq!(events[0].code, BTN_NORTH);
+    }
+
+    #[test]
+    fn native_steam_2026_translates_triggers_dpad_and_not_trackpads() {
+        let mut mapper = Mapper::steam_2026(Profile::default(), (0, 32767), (0, 32767));
+        assert_eq!(mapper.on_abs(ABS_HAT2Y, 0), vec![VEvent::abs(ABS_Z, 0)]);
+        assert_eq!(
+            mapper.on_abs(ABS_HAT2Y, 16384),
+            vec![VEvent::abs(ABS_Z, 127)]
+        );
+        assert_eq!(
+            mapper.on_abs(ABS_HAT2X, 32767),
+            vec![VEvent::abs(ABS_RZ, 255)]
+        );
+        assert!(mapper.on_abs(ABS_HAT0X, 20000).is_empty());
+        assert!(mapper.on_abs(ABS_HAT1Y, -20000).is_empty());
+        assert!(mapper.on_abs(ABS_GAS, 123).is_empty());
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_LEFT, 1).0,
+            vec![VEvent::abs(ABS_HAT0X, -1)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_RIGHT, 1).0,
+            vec![VEvent::abs(ABS_HAT0X, 0)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_LEFT, 0).0,
+            vec![VEvent::abs(ABS_HAT0X, 1)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_RIGHT, 0).0,
+            vec![VEvent::abs(ABS_HAT0X, 0)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_UP, 1).0,
+            vec![VEvent::abs(ABS_HAT0Y, -1)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_UP, 0).0,
+            vec![VEvent::abs(ABS_HAT0Y, 0)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_SOUTH, 1).0,
+            vec![VEvent::key(BTN_SOUTH, 1)]
+        );
+        assert_eq!(mapper.on_abs(ABS_X, 0)[0].code, ABS_X);
+        assert_eq!(mapper.on_abs(ABS_RX, 0)[0].code, ABS_RX);
+    }
+
+    #[test]
+    fn native_steam_2026_respects_trigger_ranges_and_explicit_remaps() {
+        let mut profile = Profile::default();
+        profile.remap.insert("BTN_GRIPL".into(), "BTN_SOUTH".into());
+        profile
+            .remap
+            .insert("BTN_DPAD_DOWN".into(), "BTN_EAST".into());
+        let mut mapper = Mapper::steam_2026(profile, (100, 1100), (0, 0));
+        assert_eq!(mapper.on_abs(ABS_HAT2Y, 600), vec![VEvent::abs(ABS_Z, 127)]);
+        assert!(mapper.on_abs(ABS_HAT2X, 1).is_empty());
+        assert_eq!(
+            mapper.on_key(BTN_GRIPL, 1).0,
+            vec![VEvent::key(BTN_SOUTH, 1)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_DOWN, 1).0,
+            vec![VEvent::key(BTN_EAST, 1)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_UP, 1).0,
+            vec![VEvent::abs(ABS_HAT0Y, -1)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_UP, 0).0,
+            vec![VEvent::abs(ABS_HAT0Y, 0)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_DOWN, 0).0,
+            vec![VEvent::key(BTN_EAST, 0)]
+        );
+    }
+
+    #[test]
+    fn palette_buttons_are_remappable_by_evdev_name() {
+        let mut profile = Profile::default();
+        profile
+            .remap
+            .insert("BTN_TRIGGER_HAPPY1".into(), "BTN_SOUTH".into());
+        let mut mapper = Mapper::new(profile);
+        let (events, _) = mapper.on_key(BTN_TRIGGER_HAPPY1, 1);
+        assert_eq!(events, vec![VEvent::key(BTN_SOUTH, 1)]);
     }
 
     #[test]
@@ -327,12 +517,101 @@ mod tests {
         let mut mapper = Mapper::new(profile);
         let (events, _) = mapper.on_key(BTN_SOUTH, 1);
         assert_eq!(events[0].code, BTN_SOUTH);
+        assert_eq!(
+            mapper.on_key(BTN_SOUTH, 0).0,
+            vec![VEvent::key(BTN_SOUTH, 0)]
+        );
         let _ = mapper.on_key(BTN_TL2, 1);
         let (events, _) = mapper.on_key(BTN_SOUTH, 1);
         assert_eq!(events[0].code, BTN_START);
+        assert_eq!(
+            mapper.on_key(BTN_SOUTH, 0).0,
+            vec![VEvent::key(BTN_START, 0)]
+        );
         let _ = mapper.on_key(BTN_TL2, 0);
         let (events, _) = mapper.on_key(BTN_SOUTH, 1);
         assert_eq!(events[0].code, BTN_SOUTH);
+    }
+
+    #[test]
+    fn shift_release_does_not_leave_the_mapped_button_pressed() {
+        let mut profile = Profile::default();
+        profile.shift_button = Some("BTN_TL2".into());
+        profile
+            .shift_remap
+            .insert("BTN_SOUTH".into(), "BTN_START".into());
+        let mut mapper = Mapper::new(profile);
+        mapper.on_key(BTN_TL2, 1);
+        assert_eq!(
+            mapper.on_key(BTN_SOUTH, 1).0,
+            vec![VEvent::key(BTN_START, 1)]
+        );
+        mapper.on_key(BTN_TL2, 0);
+        assert_eq!(
+            mapper.on_key(BTN_SOUTH, 0).0,
+            vec![VEvent::key(BTN_START, 0)]
+        );
+    }
+
+    #[test]
+    fn two_physical_buttons_can_hold_the_same_virtual_button() {
+        let mut profile = Profile::default();
+        profile.remap.insert("BTN_GRIPL".into(), "BTN_SOUTH".into());
+        let mut mapper = Mapper::steam_2026(profile, (0, 32767), (0, 32767));
+        assert_eq!(
+            mapper.on_key(BTN_SOUTH, 1).0,
+            vec![VEvent::key(BTN_SOUTH, 1)]
+        );
+        assert!(mapper.on_key(BTN_GRIPL, 1).0.is_empty());
+        assert!(mapper.on_key(BTN_SOUTH, 0).0.is_empty());
+        assert_eq!(
+            mapper.on_key(BTN_GRIPL, 0).0,
+            vec![VEvent::key(BTN_SOUTH, 0)]
+        );
+    }
+
+    #[test]
+    fn release_without_an_observed_press_does_not_release_another_mapping() {
+        let mut profile = Profile::default();
+        profile.remap.insert("BTN_GRIPL".into(), "BTN_SOUTH".into());
+        let mut mapper = Mapper::steam_2026(profile, (0, 32767), (0, 32767));
+        assert_eq!(
+            mapper.on_key(BTN_SOUTH, 1).0,
+            vec![VEvent::key(BTN_SOUTH, 1)]
+        );
+        assert!(mapper.on_key(BTN_GRIPL, 0).0.is_empty());
+        assert_eq!(
+            mapper.on_key(BTN_SOUTH, 0).0,
+            vec![VEvent::key(BTN_SOUTH, 0)]
+        );
+    }
+
+    #[test]
+    fn native_dpad_release_respects_the_layer_used_on_press() {
+        let mut profile = Profile::default();
+        profile.shift_button = Some("BTN_TL".into());
+        profile
+            .shift_remap
+            .insert("BTN_DPAD_LEFT".into(), "BTN_SOUTH".into());
+        let mut mapper = Mapper::steam_2026(profile, (0, 32767), (0, 32767));
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_LEFT, 1).0,
+            vec![VEvent::abs(ABS_HAT0X, -1)]
+        );
+        mapper.on_key(BTN_TL, 1);
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_LEFT, 0).0,
+            vec![VEvent::abs(ABS_HAT0X, 0)]
+        );
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_LEFT, 1).0,
+            vec![VEvent::key(BTN_SOUTH, 1)]
+        );
+        mapper.on_key(BTN_TL, 0);
+        assert_eq!(
+            mapper.on_key(BTN_DPAD_LEFT, 0).0,
+            vec![VEvent::key(BTN_SOUTH, 0)]
+        );
     }
 
     #[test]

@@ -20,6 +20,9 @@ const FINALIZE_URL: &str = "https://login.steampowered.com/jwt/finalizelogin";
 pub const LICENSES_URL: &str = "https://store.steampowered.com/account/licenses/?l=french";
 /// Où retomber après l'échange : le site communautaire, comme le navigateur.
 const REDIRECT: &str = "https://steamcommunity.com/login/home/?goto=";
+/// Bornes de pages lues dans les abonnements Workshop : un compte en annonce
+/// quelques-unes, la borne évite une boucle si Steam répète sa dernière page.
+const WORKSHOP_MAX_PAGES: usize = 40;
 
 /// Cookies du site, tels que le navigateur les porterait.
 #[derive(Debug, Default, Clone)]
@@ -181,7 +184,10 @@ pub fn purchase_dates(
             Ok::<_, String>(purchases)
         }) {
             Ok(purchases) => {
-                let named = purchases.iter().filter(|row| !row.appids.is_empty()).count();
+                let named = purchases
+                    .iter()
+                    .filter(|row| !row.appids.is_empty())
+                    .count();
                 tracing::info!(
                     "historique : {} transaction(s), {named} avec appid(s)",
                     purchases.len()
@@ -447,6 +453,120 @@ pub fn cookies_from_access_token(steam_id: u64, access_token: &str) -> WebCookie
     }
 }
 
+/// Résultat d'une récupération de licence gratuite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LicenseClaim {
+    /// La licence vient d'être ajoutée au compte.
+    Added,
+    /// Steam répond qu'elle y était déjà.
+    AlreadyOwned,
+    /// La page de l'offre ne publie pas de paquet gratuit : il faut la
+    /// terminer dans la boutique.
+    NeedsPage(String),
+}
+
+/// Ajoute au compte la licence gratuite d'une offre Steam à conserver.
+///
+/// La page de l'application publie les paquets ; celui qui est marqué gratuit
+/// est celui de la promotion. Steam limite les ajouts en rafale : l'appelant
+/// espace les offres.
+pub fn claim_free_license(cookies: &WebCookies, appid: u32) -> Result<LicenseClaim, String> {
+    let details =
+        format!("https://store.steampowered.com/api/appdetails?appids={appid}&cc=fr&l=french");
+    let referer = format!("https://store.steampowered.com/app/{appid}/");
+    let value = store_get_json(cookies, &details, &referer)?;
+    let data = value
+        .get(appid.to_string().as_str())
+        .and_then(|item| item.get("data"));
+    let Some(data) = data else {
+        return Ok(LicenseClaim::NeedsPage("fiche Steam illisible".into()));
+    };
+    let package = free_package(data);
+    let Some(package) = package else {
+        // Un jeu déjà permanentment gratuit n'a pas de paquet à réclamer.
+        if data.get("is_free").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(LicenseClaim::AlreadyOwned);
+        }
+        return Ok(LicenseClaim::NeedsPage(
+            "aucun paquet gratuit publié".into(),
+        ));
+    };
+    let url = format!("https://store.steampowered.com/checkout/addfreelicense/{package}");
+    let response = ureq::post(&url)
+        .set("User-Agent", STORE_UA)
+        .set("Accept", "application/json, text/javascript, */*; q=0.01")
+        .set("Accept-Language", "fr-FR,fr;q=0.9,en;q=0.8")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("Referer", &referer)
+        .set("Cookie", &cookies.header())
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .timeout(Duration::from_secs(20))
+        .send_form(&[("ajax", "1"), ("sessionid", cookies.sessionid.as_str())])
+        .map_err(|error| error.to_string())?;
+    let text = response.into_string().map_err(|error| error.to_string())?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(LicenseClaim::Added);
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|_| {
+        "Steam a renvoyé une page au lieu d'une réponse : la session web a peut-être expiré"
+            .to_string()
+    })?;
+    if value.is_null() {
+        return Err("Steam n'a pas confirmé la licence".to_string());
+    }
+    match value
+        .get("purchaseresultdetail")
+        .and_then(serde_json::Value::as_i64)
+    {
+        Some(9) => Ok(LicenseClaim::AlreadyOwned),
+        Some(0) | None => Ok(LicenseClaim::Added),
+        Some(code) => Err(format!("Steam a refusé la licence ({code})")),
+    }
+}
+
+/// Le paquet de promotion gratuit publié par la fiche d'une application.
+fn free_package(data: &serde_json::Value) -> Option<u64> {
+    data.get("package_groups")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("subs").and_then(serde_json::Value::as_array))
+        .flatten()
+        .find(|sub| {
+            sub.get("is_free_license")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || sub
+                    .get("price_in_cents_with_discount")
+                    .and_then(serde_json::Value::as_i64)
+                    == Some(0)
+        })
+        .and_then(|sub| sub.get("packageid"))
+        .and_then(serde_json::Value::as_u64)
+}
+
+const STORE_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+fn store_get_json(
+    cookies: &WebCookies,
+    url: &str,
+    referer: &str,
+) -> Result<serde_json::Value, String> {
+    let response = ureq::get(url)
+        .set("User-Agent", STORE_UA)
+        .set("Accept", "application/json, text/javascript, */*; q=0.01")
+        .set("Accept-Language", "fr-FR,fr;q=0.9,en;q=0.8")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("Referer", referer)
+        .set("Cookie", &cookies.header())
+        .timeout(Duration::from_secs(20))
+        .call()
+        .map_err(|error| error.to_string())?;
+    let text = response.into_string().map_err(|error| error.to_string())?;
+    serde_json::from_str(&text).map_err(|error| error.to_string())
+}
+
 /// Échange le jeton de rafraîchissement contre les cookies du site.
 ///
 /// `nonce` est le jeton lui-même : Steam le reconnaît et rend, pour chaque
@@ -460,9 +580,7 @@ pub fn web_cookies(refresh_token: &str) -> Result<WebCookies, String> {
 /// Même échange, avec le journal des étapes : ce qui a répondu quoi, et quels
 /// cookies chaque domaine a posés. Sert à diagnostiquer un refus que Steam ne
 /// motive pas.
-pub fn web_cookies_traced(
-    refresh_token: &str,
-) -> Result<(WebCookies, Vec<String>), String> {
+pub fn web_cookies_traced(refresh_token: &str) -> Result<(WebCookies, Vec<String>), String> {
     if refresh_token.trim().is_empty() {
         return Err("jeton de rafraîchissement vide".to_string());
     }
@@ -486,20 +604,126 @@ pub fn licenses(cookies: &WebCookies) -> Result<LicensesPage, String> {
     crate::shared::block_on(fetch_account_page(cookies, LICENSES_URL))
 }
 
+/// Adresse de la page des abonnements Workshop du compte pour un jeu.
+fn workshop_subscriptions_url(steam_id: u64, appid: u32, page: usize) -> String {
+    format!(
+        "https://steamcommunity.com/profiles/{steam_id}/myworkshopfiles/?appid={appid}&browsefilter=mysubscriptions&browsesort=mysubscriptions&numperpage=30&p={page}"
+    )
+}
+
+/// Abonnements de l'Atelier d'un jeu, lus sur le site communautaire.
+///
+/// Le fichier `userdata/<compte>/ugc/<appid>_subscriptions.vdf` n'est écrit
+/// qu'au moment où le client Steam voit l'abonnement. Un article suivi depuis
+/// la fenêtre web de Lapinux peut donc manquer au rapport local ; cette page,
+/// elle, suit le compte. Les identifiants sont fusionnés par l'appelant, qui
+/// garde ainsi ce que la lecture locale connaît déjà.
+pub fn workshop_subscriptions(
+    account: &str,
+    refresh_token: &str,
+    steam_id: u64,
+    appid: u32,
+) -> Result<Vec<u64>, String> {
+    let token = access_token(account, refresh_token, steam_id)?;
+    let cookies = cookies_from_access_token(steam_id, &token);
+    crate::shared::block_on(async move {
+        let mut ids: Vec<u64> = Vec::new();
+        for page in 1..=WORKSHOP_MAX_PAGES {
+            let url = workshop_subscriptions_url(steam_id, appid, page);
+            let body = fetch_workshop_page(&cookies, &url).await?;
+            let found = parse_workshop_subscriptions(&body);
+            if found.is_empty() {
+                // Une session que le site ne reconnaît pas rend la page de
+                // connexion : le dire vaut mieux qu'un atelier vide.
+                if page == 1 && workshop_page_signed_out(&body) {
+                    return Err(
+                        "le site communautaire n'a pas reconnu la session Steam".to_string()
+                    );
+                }
+                break;
+            }
+            let before = ids.len();
+            for id in found {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            // Une page sans nouveau contenu est la dernière : Steam la répète
+            // quand `p` dépasse le découpage.
+            if ids.len() == before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        tracing::info!("atelier {appid} : {} abonnement(s) lus en ligne", ids.len());
+        Ok(ids)
+    })
+}
+
+/// Lit une page communautaire avec réessai : Edge refuse parfois la première
+/// demande et la suivante passe.
+async fn fetch_workshop_page(cookies: &WebCookies, url: &str) -> Result<String, String> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+        match fetch_account_page(cookies, url).await {
+            Ok(page) if page.status == 200 => return Ok(page.body),
+            Ok(page) => last = format!("page des abonnements : {}", page.status),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+/// Identifiants des contenus d'une page d'abonnements. Les cartes portent un
+/// `id="sharedfile_<id>"` ; le lien de la carte sert de repli quand Steam
+/// change l'attribut.
+pub fn parse_workshop_subscriptions(body: &str) -> Vec<u64> {
+    let cards = ids_after(body, "id=\"sharedfile_");
+    if !cards.is_empty() {
+        return cards;
+    }
+    ids_after(body, "filedetails/?id=")
+}
+
+fn ids_after(body: &str, marker: &str) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for (at, _) in body.match_indices(marker) {
+        let rest = &body[at + marker.len()..];
+        let digits: String = rest
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
+        if let Ok(id) = digits.parse::<u64>() {
+            if id > 0 && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// La page est-elle la page de connexion, faute de session reconnue ?
+fn workshop_page_signed_out(body: &str) -> bool {
+    body.contains("steamcommunity.com/login/home/") || body.contains("g_steamID = false")
+}
+
 async fn fetch_account_page(cookies: &WebCookies, url: &str) -> Result<LicensesPage, String> {
     let client = client()?;
     let response = client
-            .get(url)
-            .header("cookie", cookies.header())
-            // Sans cette entête, une réponse compressée arriverait telle
-            // quelle : le client HTTP ne décompresse que s'il l'a demandée.
-            .header("accept-encoding", "identity")
-            .header("accept-language", "fr-FR,fr;q=0.9")
-            .header("user-agent", USER_AGENT)
-            .send()
-            .await
-            .map_err(|error| format!("boutique injoignable : {error}"))?;
-        let status = response.status().as_u16();
+        .get(url)
+        .header("cookie", cookies.header())
+        // Sans cette entête, une réponse compressée arriverait telle
+        // quelle : le client HTTP ne décompresse que s'il l'a demandée.
+        .header("accept-encoding", "identity")
+        .header("accept-language", "fr-FR,fr;q=0.9")
+        .header("user-agent", USER_AGENT)
+        .send()
+        .await
+        .map_err(|error| format!("boutique injoignable : {error}"))?;
+    let status = response.status().as_u16();
     // Le même hôte que la boutique : un 403 ou un 429 compte pour la porte
     // anti-rafale, et trois refus d'affilée arrêtent aussi la pagination.
     if status == 403 || status == 429 {
@@ -507,10 +731,10 @@ async fn fetch_account_page(cookies: &WebCookies, url: &str) -> Result<LicensesP
     } else if status == 200 {
         crate::storegate::accepted();
     }
-        let body = response
-            .text()
-            .await
-            .map_err(|error| format!("page illisible : {error}"))?;
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("page illisible : {error}"))?;
     Ok(LicensesPage { status, body })
 }
 
@@ -588,7 +812,11 @@ pub fn parse_licenses(body: &str) -> Vec<LicenseRow> {
 
 /// Attributs d'une cellule : le fragment qui précède son `>` d'ouverture.
 fn cell_attributes(cell: &str) -> String {
-    cell.split('>').next().unwrap_or_default().trim().to_string()
+    cell.split('>')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// Texte d'une cellule : attributs écartés, balises retirées, entités défaites,
@@ -834,8 +1062,12 @@ fn collect_cookie(cookies: &mut WebCookies, header: &str) {
     match name {
         "steamLoginSecure" => cookies.steam_login_secure = value,
         "sessionid" => cookies.sessionid = value,
-        "browserid" | "steamCountry" | "timezoneOffset" | "steamRememberLogin"
-        | "mobileClientVersion" | "mobileClient" => {
+        "browserid"
+        | "steamCountry"
+        | "timezoneOffset"
+        | "steamRememberLogin"
+        | "mobileClientVersion"
+        | "mobileClient" => {
             cookies.extra.push((name.to_string(), value));
         }
         _ => {}
@@ -910,13 +1142,22 @@ mod tests {
     #[test]
     fn cookies_are_read_from_set_cookie_headers() {
         let mut cookies = WebCookies::default();
-        collect_cookie(&mut cookies, "steamLoginSecure=1||x; Path=/; Secure; HttpOnly");
+        collect_cookie(
+            &mut cookies,
+            "steamLoginSecure=1||x; Path=/; Secure; HttpOnly",
+        );
         collect_cookie(&mut cookies, "sessionid=deadbeef; Path=/");
-        collect_cookie(&mut cookies, "browserid=123; expires=Sat, 01 Nov 2026 00:00:00 GMT");
+        collect_cookie(
+            &mut cookies,
+            "browserid=123; expires=Sat, 01 Nov 2026 00:00:00 GMT",
+        );
         collect_cookie(&mut cookies, "garbage");
         assert_eq!(cookies.steam_login_secure, "1||x");
         assert_eq!(cookies.sessionid, "deadbeef");
-        assert_eq!(cookies.extra, vec![("browserid".to_string(), "123".to_string())]);
+        assert_eq!(
+            cookies.extra,
+            vec![("browserid".to_string(), "123".to_string())]
+        );
         assert!(cookies.is_signed_in());
     }
 
@@ -926,6 +1167,21 @@ mod tests {
         assert_eq!(id.len(), 24);
         assert!(id.chars().all(|character| character.is_ascii_hexdigit()));
         assert_ne!(id, session_id());
+    }
+
+    #[test]
+    fn a_promotion_package_is_the_free_one() {
+        let data = serde_json::json!({
+            "is_free": false,
+            "package_groups": [{
+                "subs": [
+                    {"packageid": 123, "is_free_license": false, "price_in_cents_with_discount": 1999},
+                    {"packageid": 456, "is_free_license": true, "price_in_cents_with_discount": 0}
+                ]
+            }]
+        });
+        assert_eq!(free_package(&data), Some(456));
+        assert_eq!(free_package(&serde_json::json!({})), None);
     }
 
     #[test]
@@ -957,7 +1213,10 @@ mod tests {
     fn a_retail_suffix_still_matches_the_game() {
         // Les paquets de clés revendeur portent une région *et* une mention de
         // vente : le jeu, lui, n'a ni l'une ni l'autre.
-        assert!(same_title("Among the Sleep (Global) - Retail", "Among the Sleep"));
+        assert!(same_title(
+            "Among the Sleep (Global) - Retail",
+            "Among the Sleep"
+        ));
         assert!(same_title("Insurgency (WW) - Retail", "Insurgency"));
         assert!(same_title("Darkwater (Global)", "Darkwater"));
         // Un tiret qui appartient au titre n'est pas une étiquette.
@@ -1014,14 +1273,20 @@ mod tests {
             "https://store.steampowered.com/account/licenses/?x=1789465284:388027149365842018&offset=100"
         );
         // La dernière page n'a pas de lien : la lecture s'arrête là.
-        assert_eq!(next_page(r#"<div class="license_paginator">1845-1991 sur 1991</div>"#), None);
+        assert_eq!(
+            next_page(r#"<div class="license_paginator">1845-1991 sur 1991</div>"#),
+            None
+        );
     }
 
     #[test]
     fn a_form_body_encodes_what_the_site_sends() {
         let body = form_encode(&[
             ("nonce".into(), "1||a+b".into()),
-            ("redir".into(), "https://steamcommunity.com/login/home/?goto=".into()),
+            (
+                "redir".into(),
+                "https://steamcommunity.com/login/home/?goto=".into(),
+            ),
         ]);
         assert_eq!(
             body,
@@ -1037,5 +1302,22 @@ mod tests {
         assert!(form.contains(&("nonce".to_string(), "n".to_string())));
         assert!(form.contains(&("steamID".to_string(), "7656119".to_string())));
         assert!(transfer_form(None).is_empty());
+    }
+
+    #[test]
+    fn workshop_cards_give_their_published_ids() {
+        let body = r#"<div id="sharedfile_3767639280" class="workshopItemPreviewHolder">
+            <a href="https://steamcommunity.com/sharedfiles/filedetails/?id=3767639280">x</a>
+            </div>
+            <div id="sharedfile_3812321265" class="workshopItemPreviewHolder"></div>
+            <div id="sharedfile_3767639280"></div>"#;
+        assert_eq!(
+            parse_workshop_subscriptions(body),
+            vec![3767639280, 3812321265]
+        );
+        // Repli : plus de cartes nommées, seuls les liens restent.
+        let links = r#"<a href="https://steamcommunity.com/sharedfiles/filedetails/?id=42">x</a>"#;
+        assert_eq!(parse_workshop_subscriptions(links), vec![42]);
+        assert!(parse_workshop_subscriptions("<p>aucun abonnement</p>").is_empty());
     }
 }

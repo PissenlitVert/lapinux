@@ -24,7 +24,7 @@ impl Brand {
             Brand::Xbox => "Xbox",
             Brand::Nintendo => "Nintendo",
             Brand::Steam => "Steam",
-            Brand::Generic => "Inconnu",
+            Brand::Generic => lapinux_core::i18n::t("controllers.information.unknown"),
         }
     }
 }
@@ -71,7 +71,7 @@ fn known(brand: Brand, family: &'static str, model: &'static str) -> PadIdentity
 pub fn identify(vendor: u16, product: u16, name: &str) -> PadIdentity {
     // Nom donné par `describe` à un pad générique : la marque et la console
     // sont inconnues, même si le profil de boutons reste celui d'une Xbox.
-    if name == "Manette 2,4 GHz" {
+    if name == lapinux_core::i18n::t("pad.radio_2_4ghz") {
         return PadIdentity {
             brand: Some(Brand::Generic),
             family: None,
@@ -100,9 +100,7 @@ fn from_ids(vendor: u16, product: u16) -> Option<PadIdentity> {
         // Sony
         (0x054c, 0x0ce6) => known(PlayStation, "PS5", "DualSense"),
         (0x054c, 0x0df2) => known(PlayStation, "PS5", "DualSense Edge"),
-        (0x054c, 0x05c4 | 0x09cc | 0x0ba0) => {
-            known(PlayStation, "PS4", "DualShock 4")
-        }
+        (0x054c, 0x05c4 | 0x09cc | 0x0ba0) => known(PlayStation, "PS4", "DualShock 4"),
         (0x054c, 0x0268) => known(PlayStation, "PS3", "DualShock 3"),
         (0x054c, 0x03d5) => known(PlayStation, "PS3", "PlayStation Move"),
         (0x054c, 0x0cda) => known(PlayStation, "PS1", "PlayStation Classic"),
@@ -122,8 +120,12 @@ fn from_ids(vendor: u16, product: u16) -> Option<PadIdentity> {
         (0x045e, 0x0b00) => known(Xbox, "Xbox", "Xbox Elite Series 2"),
         (0x045e, 0x0b12 | 0x0b13) => known(Xbox, "Xbox Series", "Xbox Wireless Controller"),
         // Nintendo
-        (0x057e, 0x2006) => known(Nintendo, "Switch", "Joy-Con gauche"),
-        (0x057e, 0x2007) => known(Nintendo, "Switch", "Joy-Con droite"),
+        (0x057e, 0x2006) => known(Nintendo, "Switch", lapinux_core::i18n::t("pad.joycon_left")),
+        (0x057e, 0x2007) => known(
+            Nintendo,
+            "Switch",
+            lapinux_core::i18n::t("pad.joycon_right"),
+        ),
         (0x057e, 0x2009) => known(Nintendo, "Switch", "Switch Pro Controller"),
         (0x057e, 0x0330) => known(Nintendo, "Wii U", "Wii U Pro Controller"),
         (0x057e, 0x0306) => known(Nintendo, "Wii", "Wii Remote"),
@@ -136,7 +138,7 @@ fn from_ids(vendor: u16, product: u16) -> Option<PadIdentity> {
         // Controller » sur son nœud evdev, et « Wireless Steam Controller »
         // derrière le Puck — un nom que porte aussi la manette 2015 sans fil.
         // L'identifiant USB est donc la seule source fiable de génération.
-        (0x28de, 0x1302 | 0x1303 | 0x1304 | 0x1305) => {
+        (vendor, product) if lapinux_core::model::is_steam_controller_2026(vendor, product) => {
             known(Steam, "Steam", "Steam Controller 2026")
         }
         (0x28de, 0x1205) => known(Steam, "Steam Deck", "Steam Deck"),
@@ -204,9 +206,9 @@ fn from_name(raw: &str) -> Option<PadIdentity> {
     }
     if has("joy-con") || has("joycon") {
         let model = if has("(l)") || has("left") || has("gauche") {
-            "Joy-Con gauche"
+            lapinux_core::i18n::t("pad.joycon_left")
         } else if has("(r)") || has("right") || has("droite") {
-            "Joy-Con droite"
+            lapinux_core::i18n::t("pad.joycon_right")
         } else {
             "Joy-Con"
         };
@@ -286,7 +288,10 @@ mod tests {
         let dualsense = identify(0x054c, 0x0ce6, "DualSense Wireless Controller");
         assert_eq!(dualsense.brand, Some(Brand::PlayStation));
         assert_eq!(dualsense.family, Some("PS5"));
-        assert_eq!(dualsense.display_name("DualSense Wireless Controller"), "DualSense");
+        assert_eq!(
+            dualsense.display_name("DualSense Wireless Controller"),
+            "DualSense"
+        );
 
         assert_eq!(identify(0x054c, 0x0df2, "").model, Some("DualSense Edge"));
         let ds4 = identify(0x054c, 0x09cc, "Wireless Controller");
@@ -303,8 +308,14 @@ mod tests {
         assert_eq!(pro.family, Some("Switch"));
         assert_eq!(pro.display_name("Pro Controller"), "Switch Pro Controller");
 
-        assert_eq!(identify(0x057e, 0x2006, "").model, Some("Joy-Con gauche"));
-        assert_eq!(identify(0x057e, 0x2007, "").model, Some("Joy-Con droite"));
+        assert_eq!(
+            identify(0x057e, 0x2006, "").model,
+            Some(lapinux_core::i18n::t("pad.joycon_left"))
+        );
+        assert_eq!(
+            identify(0x057e, 0x2007, "").model,
+            Some(lapinux_core::i18n::t("pad.joycon_right"))
+        );
         assert_eq!(identify(0x057e, 0x0330, "").family, Some("Wii U"));
     }
 
@@ -317,11 +328,14 @@ mod tests {
         assert_eq!(identify(0x045e, 0x028e, "").family, Some("Xbox 360"));
         // Un clone 045e:028e ne revendique ni console ni modèle officiel :
         // son nom vient de la liaison, pas d'un « Xbox 360 Controller ».
-        let clone = identify(0x045e, 0x028e, "Manette 2,4 GHz");
+        let clone = identify(0x045e, 0x028e, lapinux_core::i18n::t("pad.radio_2_4ghz"));
         assert_eq!(clone.brand, Some(Brand::Generic));
         assert_eq!(clone.family, None);
         assert_eq!(clone.model, None);
-        assert_eq!(clone.display_name("Manette 2,4 GHz"), "Manette 2,4 GHz");
+        assert_eq!(
+            clone.display_name(lapinux_core::i18n::t("pad.radio_2_4ghz")),
+            lapinux_core::i18n::t("pad.radio_2_4ghz")
+        );
         assert_eq!(identify(0x28de, 0x1142, "").model, Some("Steam Controller"));
         assert_eq!(identify(0x28de, 0x1205, "").family, Some("Steam Deck"));
 
@@ -335,8 +349,14 @@ mod tests {
             identify(0x28de, 0x1304, "Wireless Steam Controller").model,
             Some("Steam Controller 2026")
         );
-        assert_eq!(identify(0x28de, 0x1303, "").model, Some("Steam Controller 2026"));
-        assert_eq!(identify(0x28de, 0x1305, "").model, Some("Steam Controller 2026"));
+        assert_eq!(
+            identify(0x28de, 0x1303, "").model,
+            Some("Steam Controller 2026")
+        );
+        assert_eq!(
+            identify(0x28de, 0x1305, "").model,
+            Some("Steam Controller 2026")
+        );
         // Le nom « Wireless Steam Controller » ne suffit pas à lui seul : la
         // manette 2015 sans fil le porte aussi.
         assert_eq!(

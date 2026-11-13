@@ -5,9 +5,9 @@
 //! session. Aucune lecture `/dev/input` n'est nécessaire.
 
 use std::sync::{Mutex, OnceLock};
+use zbus::blocking::connection::Builder;
 use zbus::blocking::Connection;
 use zbus::blocking::Proxy;
-use zbus::blocking::connection::Builder;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
 const BUS_NAME: &str = "io.github.lapinux.QuickMenu";
@@ -81,7 +81,12 @@ pub struct GameWindow {
 /// `None` tant que [`serve`] n'a pas pris le nom D-Bus.
 pub fn state() -> Option<State> {
     SERVICE.get()?;
-    Some(STATE.lock().map(|state| state.clone()).unwrap_or(State::Ready))
+    Some(
+        STATE
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or(State::Ready),
+    )
 }
 
 /// Vrai quand KWin répond : c'est le seul chemin de raccourci de Lapinux.
@@ -233,10 +238,7 @@ pub fn keep_splash_above(output: &str) -> Result<(), String> {
     // existe, les fenêtres plein écran descendent donc dans la couche
     // inférieure — et seulement elles : les autres fenêtres du bureau ne
     // changent pas d'état, et tout est restauré dès que l'écran disparaît.
-    let output = output
-        .trim()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
+    let output = output.trim().replace('\\', "\\\\").replace('"', "\\\"");
     let script = r#"var splashTitle = "__TITLE__";
 var targetOutput = "__OUTPUT__";
 var lowered = [];
@@ -308,10 +310,7 @@ pub fn prepare_splash_reveal(output: &str) -> Result<(), String> {
     let title = lapinux_core::SPLASH_TITLE
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
-    let output = output
-        .trim()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
+    let output = output.trim().replace('\\', "\\\\").replace('"', "\\\"");
     let script = r#"var splashTitle = "__TITLE__";
 var targetOutput = "__OUTPUT__";
 function isSplash(win) { return win && win.caption === splashTitle; }
@@ -498,7 +497,9 @@ pub fn reveal_lapinux() -> Result<(), String> {
     let dir = lapinux_core::paths::LapinuxPaths::discover().cache_dir;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cache : {e}"))?;
     let path = dir.join("kwin-reveal.js");
-    let title = lapinux_core::APP_NAME.replace('\\', "\\\\").replace('"', "\\\"");
+    let title = lapinux_core::APP_NAME
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     let script = format!(
         "var title = \"{title}\";\n\
          function reveal() {{\n\
@@ -537,7 +538,9 @@ pub fn wake_lapinux() -> Result<(), String> {
     let dir = lapinux_core::paths::LapinuxPaths::discover().cache_dir;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cache : {e}"))?;
     let path = dir.join("kwin-wake.js");
-    let title = lapinux_core::APP_NAME.replace('\\', "\\\\").replace('"', "\\\"");
+    let title = lapinux_core::APP_NAME
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     let script = format!(
         "var title = \"{title}\";\n\
          function wake() {{\n\
@@ -574,7 +577,9 @@ pub fn bury_lapinux() -> Result<(), String> {
     let dir = lapinux_core::paths::LapinuxPaths::discover().cache_dir;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cache : {e}"))?;
     let path = dir.join("kwin-bury.js");
-    let title = lapinux_core::APP_NAME.replace('\\', "\\\\").replace('"', "\\\"");
+    let title = lapinux_core::APP_NAME
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     let script = format!(
         "var title = \"{title}\";\n\
          function bury() {{\n\
@@ -608,7 +613,9 @@ pub fn hide_lapinux() -> Result<(), String> {
     let dir = lapinux_core::paths::LapinuxPaths::discover().cache_dir;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cache : {e}"))?;
     let path = dir.join("kwin-hide.js");
-    let title = lapinux_core::APP_NAME.replace('\\', "\\\\").replace('"', "\\\"");
+    let title = lapinux_core::APP_NAME
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     let script = format!(
         "var title = \"{title}\";\n\
          function hide(win) {{\n\
@@ -645,7 +652,9 @@ pub fn close_lapinux() -> Result<(), String> {
     let dir = lapinux_core::paths::LapinuxPaths::discover().cache_dir;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cache : {e}"))?;
     let path = dir.join("kwin-close.js");
-    let title = lapinux_core::APP_NAME.replace('\\', "\\\\").replace('"', "\\\"");
+    let title = lapinux_core::APP_NAME
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     let script = format!(
         "var title = \"{title}\";\n\
          function closeLapinux() {{\n\

@@ -386,11 +386,7 @@ pub fn begin_auth_request(request: &BeginAuthRequest<'_>) -> Vec<u8> {
     field_varint(4, request.timestamp, &mut out);
     field_varint(5, 1, &mut out);
     field_varint(6, u64::from(AUTH_PLATFORM_STEAM_CLIENT), &mut out);
-    field_varint(
-        7,
-        if request.persistent { 1 } else { 0 },
-        &mut out,
-    );
+    field_varint(7, if request.persistent { 1 } else { 0 }, &mut out);
     field_bytes(8, b"Client", &mut out);
     field_bytes(9, &device, &mut out);
     if let Some(guard) = request.guard_data.filter(|value| !value.is_empty()) {
@@ -688,7 +684,10 @@ pub fn split_multi(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         let Some(head) = data.get(offset..offset + 4) else {
             return Err(Error::Protocol("Multi tronqué".into()));
         };
-        let len = u32::from_le_bytes(head.try_into().map_err(|_| Error::Protocol("Multi tronqué".into()))?) as usize;
+        let len = u32::from_le_bytes(
+            head.try_into()
+                .map_err(|_| Error::Protocol("Multi tronqué".into()))?,
+        ) as usize;
         let start = offset + 4;
         let end = start + len;
         let message = data
@@ -784,9 +783,9 @@ mod tests {
     #[test]
     fn refresh_token_steam_id_comes_from_the_payload() {
         // JWT header.payload.signature ; payload :
-        // {"iss":"steam","sub":"76561198272259682","aud":["client","web"]}
-        let token = "e30.eyJpc3MiOiJzdGVhbSIsInN1YiI6Ijc2NTYxMTk4MjcyMjU5NjgyIiwiYXVkIjpbImNsaWVudCIsIndlYiJdfQ.c2ln";
-        assert_eq!(refresh_token_steam_id(token), Some(76_561_198_272_259_682));
+        // {"iss":"steam","sub":"76561198000000000","aud":["client","web"]}
+        let token = "e30.eyJpc3MiOiJzdGVhbSIsInN1YiI6Ijc2NTYxMTk4MDAwMDAwMDAwIiwiYXVkIjpbImNsaWVudCIsIndlYiJdfQ.c2ln";
+        assert_eq!(refresh_token_steam_id(token), Some(76_561_198_000_000_000));
         assert_eq!(refresh_token_steam_id("pas-un-jeton"), None);
         assert_eq!(refresh_token_steam_id("e30.e30.c2ln"), None);
     }

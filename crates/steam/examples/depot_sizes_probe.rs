@@ -3,7 +3,7 @@
 use lapinux_steam::session;
 use steamroom::apps::AccessToken;
 use steamroom::depot::AppId;
-use steamroom::types::key_value::{KvValue, KeyValue};
+use steamroom::types::key_value::{KeyValue, KvValue};
 use steamroom_client::login::LoginBuilder;
 
 fn field<'a>(node: &'a KeyValue, key: &str) -> Option<&'a KeyValue> {

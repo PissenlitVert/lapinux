@@ -11,10 +11,11 @@
 //! boutique expose — aucune des trois n'a de succès, itch n'a pas de cloud.
 
 use crate::{Result, Shared};
+use lapinux_core::i18n::{t, t_args};
 use lapinux_core::ipc::Envelope;
 use lapinux_core::model::{
-    CloudFile, CloudReport, Drm, Game, GameOrigin, Job, JobKind, JobState,
-    SteamAchievement, SteamAchievements,
+    CloudFile, CloudReport, Drm, Game, GameOrigin, Job, JobKind, JobState, SteamAchievement,
+    SteamAchievements,
 };
 use lapinux_core::stores::{self as core_stores, Store, StoreAccount, StoreLibrary, StoresView};
 use std::collections::{HashMap, HashSet};
@@ -34,7 +35,7 @@ impl Shared {
             .store
             .game(appid)
             .map_err(|error| lapinux_core::Error::Other(error.to_string()))?
-            .ok_or_else(|| lapinux_core::Error::Other("jeu introuvable".into()))?;
+            .ok_or_else(|| lapinux_core::Error::Other(t("downloads.err_game_not_found").into()))?;
         if game.store == Store::Steam {
             return Err(lapinux_core::Error::Other(
                 "ce jeu s'ouvre depuis Steam".into(),
@@ -45,16 +46,6 @@ impl Shared {
             .filter(|platform| !platform.trim().is_empty())
             .unwrap_or_else(|| "windows".into());
         Ok((game, platform))
-    }
-
-    fn store_tokens(&self, game: &Game) -> Result<core_stores::StoreTokens> {
-        let tokens = core_stores::load_tokens(&self.paths.data_dir, game.store).ok_or_else(|| {
-            lapinux_core::Error::Other(format!(
-                "compte {} non connecté : Réglages → Comptes",
-                game.store.label()
-            ))
-        })?;
-        self.valid_store_tokens(game.store, &tokens)
     }
 
     /// Renouvelle un jeton avant une lecture et l'enregistre aussitôt : Epic
@@ -95,6 +86,13 @@ impl Shared {
             .map(str::trim)
             .filter(|dir| !dir.is_empty())
             .map(lapinux_core::paths::expand_tilde)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    game.install_dir().join(path)
+                }
+            })
             .unwrap_or_else(|| game.install_dir().join("sauvegardes"))
     }
 
@@ -238,7 +236,7 @@ impl Shared {
         }
         self.cached_store_entry(appid)
             .map(|entry| (entry.store, entry.store_id, entry.namespace))
-            .ok_or_else(|| lapinux_core::Error::Other("jeu de boutique inconnu".into()))
+            .ok_or_else(|| lapinux_core::Error::Other(t("downloads.store_game_unknown").into()))
     }
 
     /// Description et visuels d'un jeu de boutique : lus chez la boutique,
@@ -300,8 +298,7 @@ impl Shared {
                 }
                 // La liste d'une boutique recopie souvent l'éditeur chez le
                 // développeur : un vrai studio venu de la vitrine le remplace.
-                let unnamed =
-                    !entry.publishers.is_empty() && entry.publishers == entry.developers;
+                let unnamed = !entry.publishers.is_empty() && entry.publishers == entry.developers;
                 if !publisher.is_empty() && entry.publishers.is_empty() {
                     entry.publishers = vec![publisher.to_string()];
                     changed = true;
@@ -345,8 +342,7 @@ impl Shared {
             if mark.build.trim().is_empty() {
                 continue;
             }
-            let Some(tokens) = core_stores::load_tokens(&self.paths.data_dir, game.store)
-            else {
+            let Some(tokens) = core_stores::load_tokens(&self.paths.data_dir, game.store) else {
                 continue;
             };
             let Ok(tokens) = self.valid_store_tokens(game.store, &tokens) else {
@@ -374,13 +370,12 @@ impl Shared {
             if mark.fingerprint_version < core_stores::StoreMark::FINGERPRINT_VERSION
                 && !plan.build.trim().is_empty()
             {
-                let same_size = plan.installed == 0
-                    || game.size_on_disk.abs_diff(plan.installed) <= 8192;
+                let same_size =
+                    plan.installed == 0 || game.size_on_disk.abs_diff(plan.installed) <= 8192;
                 if same_size {
                     let mut migrated = mark.clone();
                     migrated.build = current;
-                    migrated.fingerprint_version =
-                        core_stores::StoreMark::FINGERPRINT_VERSION;
+                    migrated.fingerprint_version = core_stores::StoreMark::FINGERPRINT_VERSION;
                     let _ = migrated.write(&game.install_dir());
                     continue;
                 }
@@ -431,16 +426,17 @@ impl Shared {
             .flat_map(|library| library.entries.iter())
             .find(|entry| entry.appid == appid)
             .cloned()
-            .ok_or_else(|| lapinux_core::Error::Other("jeu de boutique inconnu".into()))?;
+            .ok_or_else(|| lapinux_core::Error::Other(t("downloads.store_game_unknown").into()))?;
         if game.store != Store::Epic {
             return Ok(serde_json::json!({ "contents": [] }));
         }
-        let tokens = core_stores::load_tokens(&self.paths.data_dir, game.store).ok_or_else(|| {
-            lapinux_core::Error::Other(format!(
-                "compte {} non connecté : Réglages → Comptes",
-                game.store.label()
-            ))
-        })?;
+        let tokens =
+            core_stores::load_tokens(&self.paths.data_dir, game.store).ok_or_else(|| {
+                lapinux_core::Error::Other(format!(
+                    "compte {} non connecté : Réglages → Comptes",
+                    game.store.label()
+                ))
+            })?;
         let tokens = self.valid_store_tokens(game.store, &tokens)?;
         // La même version que le bouton d'installation proposerait.
         let platform = preferred(&game.platforms).unwrap_or_else(|| "windows".into());
@@ -534,7 +530,7 @@ impl Shared {
             updating: false,
             dlc: Vec::new(),
             platform: Some(platform.clone()),
-            message: "préparation".into(),
+            message: t("downloads.preparing").into(),
             backend: store.label().to_string(),
             started: lapinux_core::util::now_unix(),
             finished: None,
@@ -561,8 +557,9 @@ impl Shared {
         ) {
             Ok(plan) if !plan.steps.is_empty() => plan,
             Ok(_) => {
-                let message = format!(
-                    "aucun téléchargement publié pour ce jeu en version {platform}"
+                let message = t_args(
+                    "downloads.job_no_store_download",
+                    &[("platform", &platform)],
                 );
                 failed(self, message.clone());
                 return Err(lapinux_core::Error::Other(message));
@@ -592,7 +589,7 @@ impl Shared {
             // jour : un dossier laissé par un essai interrompu (ou par le
             // client de la boutique) ne fait pas de la pose une reprise.
             job.updating = core_stores::StoreMark::read(&dest).is_some();
-            job.message = "téléchargement".into();
+            job.message = t("downloads.job_downloading").into();
         });
         self.persist_jobs(true);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -608,7 +605,7 @@ impl Shared {
 
         let shared = Arc::clone(self);
         let thread_job = job_id.clone();
-        let cache_dir = self.paths.cache_dir.join("stores");
+        let cache_dir = self.paths.stores_cache_dir();
         let identity = core_stores::StoreMark {
             store,
             store_id: plan.store_id.clone(),
@@ -700,11 +697,7 @@ impl Shared {
                 // Une mise à jour tous les 4 Mio suffit à l'affichage, et
                 // épargne la base et l'interface sur un gros jeu. Bridé, on
                 // rapporte plus souvent pour que la barre avance régulièrement.
-                let report_step = if cap > 0 {
-                    512 * 1024
-                } else {
-                    4 * 1024 * 1024
-                };
+                let report_step = if cap > 0 { 512 * 1024 } else { 4 * 1024 * 1024 };
                 if done.saturating_sub(last) < report_step && done != size {
                     return true;
                 }
@@ -717,7 +710,7 @@ impl Shared {
                         job.total = size;
                         job.progress = (done as f32 / size as f32).clamp(0.0, 1.0);
                     }
-                    job.message = "téléchargement et extraction".into();
+                    job.message = t("downloads.job_downloading_extracting").into();
                 });
                 true
             };
@@ -749,23 +742,28 @@ impl Shared {
                     game.installed = true;
                     game.prefix = None;
                     game.exe = find_executable(&dest, &plan.installdir);
-                    game.native = platform != "windows";
+                    // Un jeu peut être publié en version Windows sur une
+                    // plateforme annoncée Linux (itch.io ne renseigne pas
+                    // toujours la plateforme). L'exécutable tranche : un
+                    // `.exe` passe par Proton, même si le plan disait Linux.
+                    game.native = match &game.exe {
+                        Some(exe) => !is_windows_executable(exe),
+                        None => platform != "windows",
+                    };
                     game.drm = Drm::None;
                     if let Err(error) = shared.store.save_game(&game) {
                         tracing::warn!("jeu {} non enregistré : {error}", game.appid);
                     }
                     let mut cloud = String::new();
-                    let cloud_enabled = shared
-                        .config_snapshot()
-                        .downloads
-                        .cloud_saves_after_install;
+                    let cloud_enabled =
+                        shared.config_snapshot().downloads.cloud_saves_after_install;
                     if store.capabilities().cloud
                         && game.settings.save_dir.is_some()
                         && game.settings.cloud_sync_enabled()
                         && cloud_enabled
                     {
                         shared.update_job(&thread_job, |job| {
-                            job.message = "sauvegardes cloud".into();
+                            job.message = t("downloads.job_cloud_saves").into();
                         });
                         match shared.store_cloud_pull_auto(appid) {
                             Ok((files, bytes)) if files > 0 => {
@@ -792,9 +790,9 @@ impl Shared {
                         job.message = format!(
                             "{}{cloud}",
                             if game.exe.is_some() {
-                                "installé"
+                                t("downloads.job_installed")
                             } else {
-                                "installé · exécutable à choisir dans les réglages du jeu"
+                                t("downloads.job_installed_choose_exe")
                             }
                         );
                     });
@@ -840,10 +838,7 @@ impl Shared {
     /// Marque laissée par une déconnexion : une lecture partie juste avant ne
     /// doit pas recréer le fichier de jetons en arrivant.
     fn signed_out_marker(&self, store: Store) -> PathBuf {
-        core_stores::stores_dir(&self.paths.data_dir).join(format!(
-            "{}.signed-out",
-            store.key()
-        ))
+        core_stores::stores_dir(&self.paths.data_dir).join(format!("{}.signed-out", store.key()))
     }
 
     /// Lit les comptes et les bibliothèques des trois boutiques externes.
@@ -895,8 +890,10 @@ impl Shared {
                 });
             }
         }
-        view.accounts.retain(|account| account.store != Store::Steam);
-        view.libraries.retain(|library| library.store != Store::Steam);
+        view.accounts
+            .retain(|account| account.store != Store::Steam);
+        view.libraries
+            .retain(|library| library.store != Store::Steam);
 
         if refresh {
             let selected: Vec<Store> = if only.is_empty() {
@@ -916,11 +913,11 @@ impl Shared {
                 .map(|game| (game.store, game.store_id))
                 .collect();
             for store in selected {
-                let Some(tokens) =
-                    core_stores::load_tokens(&self.paths.data_dir, store)
-                else {
-                    if let Some(library) =
-                        view.libraries.iter_mut().find(|library| library.store == store)
+                let Some(tokens) = core_stores::load_tokens(&self.paths.data_dir, store) else {
+                    if let Some(library) = view
+                        .libraries
+                        .iter_mut()
+                        .find(|library| library.store == store)
                     {
                         library.store = store;
                         library.fetched = 0;
@@ -932,8 +929,10 @@ impl Shared {
                 let tokens = match self.valid_store_tokens(store, &tokens) {
                     Ok(tokens) => tokens,
                     Err(error) => {
-                        if let Some(library) =
-                            view.libraries.iter_mut().find(|library| library.store == store)
+                        if let Some(library) = view
+                            .libraries
+                            .iter_mut()
+                            .find(|library| library.store == store)
                         {
                             library.error = Some(error.to_string());
                         }
@@ -943,8 +942,10 @@ impl Shared {
                 let mut entries = match lapinux_stores::library(store, &tokens) {
                     Ok(entries) => entries,
                     Err(error) => {
-                        if let Some(library) =
-                            view.libraries.iter_mut().find(|library| library.store == store)
+                        if let Some(library) = view
+                            .libraries
+                            .iter_mut()
+                            .find(|library| library.store == store)
                         {
                             library.error = Some(error.to_string());
                         }
@@ -967,8 +968,10 @@ impl Shared {
                 library.fetched = lapinux_core::util::now_unix();
                 library.entries = entries;
                 library.error = None;
-                if let Some(account) =
-                    view.accounts.iter_mut().find(|account| account.store == store)
+                if let Some(account) = view
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.store == store)
                 {
                     account.connected = true;
                     account.expires_at = tokens.expires_at;
@@ -986,12 +989,7 @@ impl Shared {
     /// Termine une connexion par code d'autorisation (Epic, GOG) ou par clé
     /// d'API (itch), puis rend la vue des comptes : l'écran qui a envoyé le
     /// code l'attend dans cette forme.
-    pub fn store_login(
-        &self,
-        store: Store,
-        token: String,
-        username: String,
-    ) -> Result<Envelope> {
+    pub fn store_login(&self, store: Store, token: String, username: String) -> Result<Envelope> {
         if store == Store::Steam {
             return Err(lapinux_core::Error::Other(
                 "Steam a sa propre connexion".into(),
@@ -1084,8 +1082,10 @@ impl Shared {
         }))
     }
 
-    /// Jeux offerts en ce moment par Epic : les offres déjà rattachées au
-    /// compte sont marquées pour que la page ne propose pas de les reprendre.
+    /// Jeux offerts en ce moment chez les quatre boutiques : les offres Epic
+    /// déjà rattachées au compte sont marquées pour que la page ne propose pas
+    /// de les reprendre. Steam, GOG et itch.io viennent du flux des offres à
+    /// conserver, qui écarte les free-to-play et les free weekends.
     pub fn store_free_games(&self) -> Result<Envelope> {
         let locale = self.config_snapshot().general.lang;
         let mut games = lapinux_stores::free_games(&locale)
@@ -1098,15 +1098,96 @@ impl Shared {
         Ok(Envelope::ok(&games))
     }
 
-    /// Rattache au compte Epic les offres choisies et rend le verdict par
-    /// offre : une offre refusée ne doit pas faire échouer les autres.
+    /// Amis des comptes de boutique : Epic Games et GOG publient leur liste.
+    /// itch.io n'expose pas d'API d'amis : il ne figure pas dans le panneau.
+    /// Une boutique non branchée reste une réponse : sa ligne dit qu'il faut la
+    /// connecter, plutôt que de faire échouer toute la liste.
+    pub fn store_friends(&self) -> Result<Envelope> {
+        let mut boards = Vec::new();
+        for store in [Store::Epic, Store::Gog] {
+            let Some(tokens) = core_stores::load_tokens(&self.paths.data_dir, store) else {
+                boards.push(lapinux_core::social::StoreFriends {
+                    store,
+                    connected: false,
+                    note: format!("Compte {} non connecté : Réglages → Comptes", store.label()),
+                    ..Default::default()
+                });
+                continue;
+            };
+            let tokens = match self.valid_store_tokens(store, &tokens) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    boards.push(lapinux_core::social::StoreFriends {
+                        store,
+                        connected: true,
+                        note: format!("{} : {error}", store.label()),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            };
+            let board = match lapinux_stores::friends::list(&tokens) {
+                Ok(board) => board,
+                Err(error) => lapinux_core::social::StoreFriends {
+                    store,
+                    connected: true,
+                    note: error.to_string(),
+                    ..Default::default()
+                },
+            };
+            boards.push(board);
+        }
+        Ok(Envelope::ok(&boards))
+    }
+
+    /// Notifications personnelles des boutiques hors Steam : Epic et GOG
+    /// publient leurs demandes d'ami, itch.io n'expose rien. Une boutique
+    /// non branchée ou en erreur reste une réponse, pour que les autres
+    /// sections s'affichent quand même.
+    pub fn store_notifications(&self) -> Result<Envelope> {
+        let mut boards = Vec::new();
+        for store in Store::EXTERNAL {
+            let Some(tokens) = core_stores::load_tokens(&self.paths.data_dir, store) else {
+                boards.push(lapinux_core::stores::StoreNotifications {
+                    store,
+                    connected: false,
+                    note: format!("Compte {} non connecté : Réglages → Comptes", store.label()),
+                    ..Default::default()
+                });
+                continue;
+            };
+            let tokens = match self.valid_store_tokens(store, &tokens) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    boards.push(lapinux_core::stores::StoreNotifications {
+                        store,
+                        connected: true,
+                        note: format!("{} : {error}", store.label()),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            };
+            let board = match lapinux_stores::notifications::list(&tokens) {
+                Ok(board) => board,
+                Err(error) => lapinux_core::stores::StoreNotifications {
+                    store,
+                    connected: true,
+                    note: error.to_string(),
+                    ..Default::default()
+                },
+            };
+            boards.push(board);
+        }
+        Ok(Envelope::ok(&boards))
+    }
+
+    /// Rattache au compte les offres choisies, boutique par boutique, et rend
+    /// le verdict par offre : un refus chez l'une ne doit pas faire échouer les
+    /// autres. Epic et Steam terminent directement ; GOG et itch.io n'ont pas
+    /// d'API de récupération et s'ouvrent sur leur page, dans la file de
+    /// l'interface.
     pub fn store_claim_free_games(&self, ids: Vec<String>) -> Result<Envelope> {
-        let tokens = core_stores::load_tokens(&self.paths.data_dir, Store::Epic).ok_or_else(|| {
-            lapinux_core::Error::Other(
-                "compte Epic Games non connecté : Réglages → Comptes".into(),
-            )
-        })?;
-        let tokens = self.valid_store_tokens(Store::Epic, &tokens)?;
         let locale = self.config_snapshot().general.lang;
         let games = lapinux_stores::free_games(&locale)
             .map_err(|error| lapinux_core::Error::Other(error.to_string()))?;
@@ -1119,17 +1200,171 @@ impl Shared {
                 "aucune offre gratuite à récupérer".into(),
             ));
         }
-        let outcomes = lapinux_stores::claim_free(&tokens, &selected, &locale)
-            .map_err(|error| lapinux_core::Error::Other(error.to_string()))?;
+        let mut outcomes = Vec::new();
+        let (epic, selected): (Vec<_>, Vec<_>) = selected
+            .into_iter()
+            .partition(|game| game.store == Store::Epic);
+        if !epic.is_empty() {
+            match core_stores::load_tokens(&self.paths.data_dir, Store::Epic) {
+                Some(tokens) => match self.valid_store_tokens(Store::Epic, &tokens) {
+                    Ok(tokens) => match lapinux_stores::claim_free(&tokens, &epic, &locale) {
+                        Ok(result) => outcomes.extend(result),
+                        Err(error) => outcomes.extend(epic.iter().map(|game| {
+                            lapinux_core::stores::ClaimOutcome {
+                                id: game.id.clone(),
+                                title: game.title.clone(),
+                                error: error.to_string(),
+                                ..Default::default()
+                            }
+                        })),
+                    },
+                    Err(error) => outcomes.extend(epic.iter().map(|game| {
+                        lapinux_core::stores::ClaimOutcome {
+                            id: game.id.clone(),
+                            title: game.title.clone(),
+                            error: error.to_string(),
+                            ..Default::default()
+                        }
+                    })),
+                },
+                None => {
+                    outcomes.extend(epic.iter().map(|game| lapinux_core::stores::ClaimOutcome {
+                        id: game.id.clone(),
+                        title: game.title.clone(),
+                        error: "compte Epic Games non connecté : Réglages → Comptes".into(),
+                        ..Default::default()
+                    }))
+                }
+            }
+        }
+        let (steam, selected): (Vec<_>, Vec<_>) = selected
+            .into_iter()
+            .partition(|game| game.store == Store::Steam);
+        if !steam.is_empty() {
+            outcomes.extend(self.claim_steam_free_games(&steam));
+        }
+        // GOG et itch.io n'exposent pas de récupération programmable : leur
+        // page est ouverte par l'interface, une offre à la fois.
+        for game in selected {
+            outcomes.push(lapinux_core::stores::ClaimOutcome {
+                id: game.id,
+                title: game.title,
+                needs_checkout: true,
+                ..Default::default()
+            });
+        }
         Ok(Envelope::ok(&outcomes))
+    }
+
+    /// Licences gratuites Steam : une session web suffit, et Steam répond
+    /// « déjà possédée » pour une offre prise précédemment.
+    fn claim_steam_free_games(
+        &self,
+        games: &[core_stores::FreeGame],
+    ) -> Vec<core_stores::ClaimOutcome> {
+        let config = self.config_snapshot();
+        let saved = lapinux_steam::session::load_from(&self.session_path()).filter(|saved| {
+            saved
+                .account_name
+                .eq_ignore_ascii_case(&config.steam.username)
+        });
+        let Some(saved) = saved.filter(|saved| !saved.refresh_token.trim().is_empty()) else {
+            return games
+                .iter()
+                .map(|game| core_stores::ClaimOutcome {
+                    id: game.id.clone(),
+                    title: game.title.clone(),
+                    error: "compte Steam non connecté : Réglages → Compte Steam".into(),
+                    ..Default::default()
+                })
+                .collect();
+        };
+        let token = match lapinux_steam::web::access_token(
+            &saved.account_name,
+            &saved.refresh_token,
+            saved.steam_id,
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                return games
+                    .iter()
+                    .map(|game| core_stores::ClaimOutcome {
+                        id: game.id.clone(),
+                        title: game.title.clone(),
+                        error: error.clone(),
+                        ..Default::default()
+                    })
+                    .collect();
+            }
+        };
+        let cookies = lapinux_steam::web::cookies_from_access_token(saved.steam_id, &token);
+        let mut outcomes = Vec::new();
+        for (index, game) in games.iter().enumerate() {
+            if index > 0 {
+                // Steam ferme la porte aux rafales : une seconde entre deux
+                // licences suffit et garde la session intacte.
+                std::thread::sleep(std::time::Duration::from_millis(1200));
+            }
+            let Some(appid) = game
+                .id
+                .strip_prefix("steam:")
+                .and_then(|id| id.parse::<u32>().ok())
+                .or_else(|| {
+                    game.url
+                        .split("/app/")
+                        .nth(1)
+                        .and_then(|rest| rest.split('/').next())
+                        .and_then(|id| id.parse::<u32>().ok())
+                })
+            else {
+                outcomes.push(core_stores::ClaimOutcome {
+                    id: game.id.clone(),
+                    title: game.title.clone(),
+                    error: "identifiant Steam illisible".into(),
+                    ..Default::default()
+                });
+                continue;
+            };
+            match lapinux_steam::web::claim_free_license(&cookies, appid) {
+                Ok(lapinux_steam::web::LicenseClaim::Added) => {
+                    outcomes.push(core_stores::ClaimOutcome {
+                        id: game.id.clone(),
+                        title: game.title.clone(),
+                        ok: true,
+                        ..Default::default()
+                    });
+                }
+                Ok(lapinux_steam::web::LicenseClaim::AlreadyOwned) => {
+                    outcomes.push(core_stores::ClaimOutcome {
+                        id: game.id.clone(),
+                        title: game.title.clone(),
+                        ok: true,
+                        ..Default::default()
+                    });
+                }
+                Ok(lapinux_steam::web::LicenseClaim::NeedsPage(reason)) => {
+                    outcomes.push(core_stores::ClaimOutcome {
+                        id: game.id.clone(),
+                        title: game.title.clone(),
+                        error: reason,
+                        needs_checkout: true,
+                        ..Default::default()
+                    });
+                }
+                Err(error) => outcomes.push(core_stores::ClaimOutcome {
+                    id: game.id.clone(),
+                    title: game.title.clone(),
+                    error,
+                    ..Default::default()
+                }),
+            }
+        }
+        outcomes
     }
 
     /// Succès d'un jeu de boutique, lus sans cache : la surveillance d'une
     /// partie doit voir un déblocage immédiatement.
-    pub(crate) fn read_store_achievements_now(
-        &self,
-        appid: u32,
-    ) -> Result<SteamAchievements> {
+    pub(crate) fn read_store_achievements_now(&self, appid: u32) -> Result<SteamAchievements> {
         let (store, store_id, namespace) = self.store_identity(appid)?;
         let tokens = core_stores::load_tokens(&self.paths.data_dir, store).ok_or_else(|| {
             lapinux_core::Error::Other(format!(
@@ -1168,9 +1403,8 @@ impl Shared {
         let shared = Arc::clone(self);
         self.cached_remote_read("succès-boutique", appid, move || {
             let achievements = shared.read_store_achievements_now(appid)?;
-            serde_json::to_value(&achievements).map_err(|error| {
-                lapinux_core::Error::Other(format!("succès illisibles : {error}"))
-            })
+            serde_json::to_value(&achievements)
+                .map_err(|error| lapinux_core::Error::Other(format!("succès illisibles : {error}")))
         })
     }
 
@@ -1186,16 +1420,28 @@ impl Shared {
             ))
         })?;
         let tokens = self.valid_store_tokens(store, &tokens)?;
+        if !matches!(store, Store::Epic | Store::Gog) {
+            return Err(lapinux_core::Error::Other(
+                "cette boutique ne propose pas de cloud pris en charge".into(),
+            ));
+        }
+        if game
+            .settings
+            .save_dir
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            return Err(lapinux_core::Error::Other(
+                "renseignez le dossier réel des sauvegardes dans l'onglet Sauvegardes".into(),
+            ));
+        }
         let dir = Self::store_save_dir(&game);
         let dir_name = Self::save_dir_name(&game, &dir);
-        let files = lapinux_stores::cloud_list(
-            store,
-            &tokens,
-            &game.store_id,
-            &platform,
-            &dir_name,
-        )
-        .map_err(|error| lapinux_core::Error::Other(error.to_string()))?;
+        let files =
+            lapinux_stores::cloud_list(store, &tokens, &game.store_id, &platform, &dir_name)
+                .map_err(|error| lapinux_core::Error::Other(error.to_string()))?;
         Ok(CloudContext {
             appid,
             store,
@@ -1213,30 +1459,19 @@ impl Shared {
     pub fn store_cloud(&self, appid: u32) -> Result<Envelope> {
         let mut report = CloudReport::default();
         match self.store_cloud_context(appid) {
-            Ok(context) => {
-                report.saves.files = context
-                    .files
-                    .iter()
-                    .map(|file| {
-                        let local = safe_relative(&file.name)
-                            .and_then(|relative| local_modified(&context.dir.join(relative)));
-                        CloudFile {
-                            name: file.name.clone(),
-                            size: file.size,
-                            modified: file.modified,
-                            local,
-                            ..Default::default()
-                        }
-                    })
-                    .collect();
-                report.local_dir = Some(context.dir.display().to_string());
-                report.local_present = report
-                    .saves
-                    .files
-                    .iter()
-                    .filter(|file| file.local.is_some())
-                    .count();
-            }
+            Ok(context) => match read_store_cloud(&context) {
+                Ok(snapshot) => {
+                    report.local_present = snapshot
+                        .report
+                        .files
+                        .iter()
+                        .filter(|file| file.cloud_present == Some(true) && file.local_sha.is_some())
+                        .count();
+                    report.saves = snapshot.report;
+                    report.local_dir = Some(context.dir.display().to_string());
+                }
+                Err(error) => report.error = Some(error),
+            },
             Err(error) => report.error = Some(error.to_string()),
         }
         report.syncs = crate::cloud_journal::history(&self.paths, appid);
@@ -1245,10 +1480,15 @@ impl Shared {
 
     /// Télécharge toutes les sauvegardes du compte dans le dossier du jeu.
     pub fn store_cloud_restore(&self, appid: u32) -> Result<Envelope> {
+        let _guard = self.save_operation.try_lock().map_err(|_| {
+            lapinux_core::Error::Other(
+                "une opération de sauvegarde ou de lancement est déjà en cours".into(),
+            )
+        })?;
         self.ensure_store_game_closed(appid, "récupérer")?;
         let context = self.store_cloud_context(appid)?;
         let (written, bytes) = self
-            .pull_store_cloud(&context, false)
+            .pull_store_cloud(&context)
             .map_err(|error| lapinux_core::Error::Other(format!("sauvegardes cloud : {error}")))?;
         Ok(Envelope::ok(&serde_json::json!({
             "files": written,
@@ -1256,25 +1496,20 @@ impl Shared {
         })))
     }
 
-    /// Envoie vers le cloud les sauvegardes que la partie a écrites.
+    /// L'envoi manuel conserve les deux versions avant de choisir la copie locale.
     pub fn store_cloud_upload(&self, appid: u32) -> Result<Envelope> {
         self.ensure_store_game_closed(appid, "envoyer")?;
         let context = self.store_cloud_context(appid)?;
-        let (files, bytes) = self
-            .push_store_cloud(&context)
-            .map_err(|error| lapinux_core::Error::Other(format!("sauvegardes cloud : {error}")))?;
-        Ok(Envelope::ok(&serde_json::json!({
-            "files": files,
-            "bytes": bytes,
-        })))
+        let snapshot = read_store_cloud(&context).map_err(lapinux_core::Error::Other)?;
+        self.resolve_store_cloud(
+            appid,
+            lapinux_core::ipc::SteamCloudChoice::Local,
+            snapshot.report,
+        )
     }
 
-    /// Reprise automatique avant une partie : seuls les fichiers du cloud plus
-    /// récents que leur copie locale sont ramenés.
-    pub fn store_cloud_pull_auto(
-        &self,
-        appid: u32,
-    ) -> std::result::Result<(usize, u64), String> {
+    /// Reprise automatique : seuls les fichiers cloud absents localement sont copiés.
+    pub fn store_cloud_pull_auto(&self, appid: u32) -> std::result::Result<(usize, u64), String> {
         let game = self
             .store
             .game(appid)
@@ -1286,7 +1521,7 @@ impl Shared {
         let context = self
             .store_cloud_context(appid)
             .map_err(|error| error.to_string())?;
-        let result = self.pull_store_cloud(&context, true);
+        let result = self.pull_store_cloud(&context);
         if matches!(&result, Ok((files, _)) if *files > 0) {
             if let Ok(mut cache) = self.game_reads.lock() {
                 cache.forget("cloud", appid);
@@ -1296,8 +1531,41 @@ impl Shared {
         result
     }
 
-    /// Envoi automatique après une partie : seuls les fichiers modifiés
-    /// depuis le relevé du cloud repartent.
+    /// Ne conserve un relevé que si les deux côtés sont identiques après la reprise.
+    pub(crate) fn capture_store_cloud_baseline(
+        &self,
+        appid: u32,
+    ) -> std::result::Result<(), String> {
+        let context = self.store_cloud_context(appid).map_err(|e| e.to_string())?;
+        let snapshot = read_store_cloud(&context)?;
+        if snapshot
+            .local
+            .iter()
+            .zip(&snapshot.remote)
+            .any(|((_, local), remote)| local != remote)
+        {
+            return Err(
+                "sauvegardes différentes : choisissez une version dans l'onglet Sauvegardes".into(),
+            );
+        }
+        let baseline = StoreCloudBaseline {
+            appid,
+            store: context.store,
+            store_id: context.store_id,
+            platform: context.platform,
+            dir: context.dir,
+            dir_name: context.dir_name,
+            user_id: context.tokens.user_id,
+            report: snapshot.report,
+        };
+        *self
+            .store_cloud_before
+            .lock()
+            .map_err(|_| "verrou du relevé cloud indisponible")? = Some(baseline);
+        Ok(())
+    }
+
+    /// Après une partie, envoie les changements seulement si le cloud correspond au relevé.
     pub fn store_cloud_push_auto(
         &self,
         appid: u32,
@@ -1310,18 +1578,83 @@ impl Shared {
         if !game.settings.cloud_sync_enabled() {
             return Ok((0, 0, false));
         }
+        let baseline = self
+            .store_cloud_before
+            .lock()
+            .map_err(|_| "verrou du relevé cloud indisponible")?
+            .take()
+            .filter(|baseline| baseline.appid == appid)
+            .ok_or("aucun relevé fiable avant la partie : envoi automatique annulé")?;
         let context = self
             .store_cloud_context(appid)
             .map_err(|error| error.to_string())?;
-        let present = !context.files.is_empty();
-        let (files, bytes) = self.push_store_cloud(&context)?;
+        if !baseline.matches_context(&context) {
+            return Err(
+                "compte, plateforme ou dossier modifié pendant la partie : envoi annulé".into(),
+            );
+        }
+        let snapshot = read_store_cloud(&context)?;
+        if !store_cloud_auto_plan(&baseline.report, &snapshot)?.is_empty() {
+            check_recovery_outside_saves(&self.paths.data_dir, appid, &context.dir)?;
+            let backup = crate::steam::save_cloud_recovery(
+                &self.paths.data_dir,
+                &game,
+                &snapshot.report,
+                &snapshot.local,
+                &snapshot.remote,
+                &snapshot.report.superseded,
+            )?;
+            tracing::info!(
+                "cloud {} : copies de récupération avant envoi : {}",
+                context.store.label(),
+                backup.display()
+            );
+        }
+        let (files, bytes) = execute_store_cloud_uploads(
+            &baseline,
+            &snapshot,
+            || {
+                let latest = self.store_cloud_context(appid).map_err(|e| e.to_string())?;
+                if !baseline.matches_context(&latest) {
+                    return Err("compte ou dossier modifié pendant l'envoi".into());
+                }
+                let fresh = read_store_cloud(&latest)?;
+                Ok((latest, fresh))
+            },
+            |latest, file, path, data| {
+                lapinux_stores::cloud_upload(
+                    latest.store,
+                    &latest.tokens,
+                    &latest.store_id,
+                    &latest.platform,
+                    &latest.dir_name,
+                    file,
+                    data.to_vec(),
+                    local_modified(path).unwrap_or_else(lapinux_core::util::now_unix),
+                )
+                .map_err(|e| e.to_string())
+            },
+        )?;
         if files > 0 {
+            crate::cloud_journal::record(
+                &self.paths,
+                appid,
+                lapinux_core::model::CloudSyncEntry {
+                    at: lapinux_core::util::now_unix(),
+                    direction: lapinux_core::model::CloudSyncDirection::Upload,
+                    machine: crate::cloud_journal::machine_name(),
+                    files,
+                    bytes,
+                },
+            );
             if let Ok(mut cache) = self.game_reads.lock() {
                 cache.forget("cloud", appid);
             }
             self.forget_remote_sheet("cloud", appid);
         }
-        Ok((files, bytes, present))
+        // La présence de fichiers distants ne démontre pas que toute la
+        // progression locale est sauvegardée ; conserver la copie locale.
+        Ok((files, bytes, false))
     }
 
     /// Refuse une opération cloud pendant que le jeu tourne : ses sauvegardes
@@ -1348,39 +1681,33 @@ impl Shared {
     fn pull_store_cloud(
         &self,
         context: &CloudContext,
-        only_newer: bool,
     ) -> std::result::Result<(usize, u64), String> {
+        let snapshot = read_store_cloud(context)?;
+        match snapshot.report.steam_state() {
+            lapinux_core::model::SteamCloudState::Conflict => {
+                return Err(
+                    "sauvegardes différentes : choisissez une version dans l'onglet Sauvegardes"
+                        .into(),
+                )
+            }
+            lapinux_core::model::SteamCloudState::Unknown if !snapshot.report.files.is_empty() => {
+                return Err("état des sauvegardes inconnu : aucune récupération effectuée".into())
+            }
+            _ => {}
+        }
         let mut written = 0usize;
         let mut bytes = 0u64;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
-        for file in &context.files {
-            if only_newer && std::time::Instant::now() > deadline {
-                break;
-            }
-            let Some(relative) = safe_relative(&file.name) else {
-                tracing::warn!("cloud : {} ignoré, chemin invalide", file.name);
-                continue;
-            };
-            let dest = context.dir.join(relative);
-            if only_newer && file.modified > 0 {
-                if let Some(local) = local_modified(&dest) {
-                    if local >= file.modified {
-                        continue;
-                    }
+        for (index, ((path, local), remote)) in
+            snapshot.local.iter().zip(&snapshot.remote).enumerate()
+        {
+            if local.is_none() {
+                if let Some(data) = remote {
+                    store_path(&context.dir, &snapshot.report.files[index].name)?;
+                    crate::steam::write_cloud_file(path, data, None)?;
+                    written += 1;
+                    bytes += data.len() as u64;
                 }
             }
-            let size = lapinux_stores::cloud_download(
-                context.store,
-                &context.tokens,
-                &context.store_id,
-                &context.platform,
-                &context.dir_name,
-                file,
-                &dest,
-            )
-            .map_err(|error| error.to_string())?;
-            written += 1;
-            bytes += size;
         }
         if written > 0 {
             crate::cloud_journal::record(
@@ -1398,63 +1725,194 @@ impl Shared {
         Ok((written, bytes))
     }
 
-    fn push_store_cloud(
+    /// Copie les deux versions puis applique seulement le choix confirmé.
+    pub fn resolve_store_cloud(
         &self,
-        context: &CloudContext,
-    ) -> std::result::Result<(usize, u64), String> {
-        let mut local_files = Vec::new();
-        collect_saves(&context.dir, &context.dir, &mut local_files);
-        let mut sent = 0usize;
+        appid: u32,
+        choice: lapinux_core::ipc::SteamCloudChoice,
+        expected: lapinux_core::model::CloudSaves,
+    ) -> Result<Envelope> {
+        use lapinux_core::ipc::SteamCloudChoice;
+        let _guard = self.save_operation.try_lock().map_err(|_| {
+            lapinux_core::Error::Other(
+                "une opération de sauvegarde ou de lancement est déjà en cours".into(),
+            )
+        })?;
+        self.ensure_store_game_closed(appid, "résoudre")?;
+        let game = self.store_game(appid)?.0;
+        let context = self.store_cloud_context(appid)?;
+        let snapshot = read_store_cloud(&context).map_err(lapinux_core::Error::Other)?;
+        if !same_store_snapshot(&snapshot, &expected) {
+            return Err(lapinux_core::Error::Other(
+                "les sauvegardes ont changé : actualisez la fiche avant de choisir".into(),
+            ));
+        }
+        check_recovery_outside_saves(&self.paths.data_dir, appid, &context.dir)
+            .map_err(lapinux_core::Error::Other)?;
+        let backup = crate::steam::save_cloud_recovery(
+            &self.paths.data_dir,
+            &game,
+            &snapshot.report,
+            &snapshot.local,
+            &snapshot.remote,
+            &snapshot.report.superseded,
+        )
+        .map_err(lapinux_core::Error::Other)?;
+        let fresh = self.store_cloud_context(appid).map_err(|e| {
+            lapinux_core::Error::Other(format!(
+                "vérification impossible : {e} ; copies : {}",
+                backup.display()
+            ))
+        })?;
+        let fresh_snapshot = read_store_cloud(&fresh).map_err(|e| {
+            lapinux_core::Error::Other(format!(
+                "vérification impossible : {e} ; copies : {}",
+                backup.display()
+            ))
+        })?;
+        if !same_store_snapshot(&fresh_snapshot, &expected) {
+            return Err(lapinux_core::Error::Other(format!(
+                "les sauvegardes ont changé ; aucune résolution appliquée. Copies : {}",
+                backup.display()
+            )));
+        }
+        let mut count = 0usize;
         let mut bytes = 0u64;
-        for (name, path) in local_files {
-            let Some(modified) = local_modified(&path) else {
-                continue;
-            };
-            if let Some(remote) = context.files.iter().find(|file| file.name == name) {
-                if remote.modified > 0 && modified <= remote.modified {
-                    continue;
+        match choice {
+            SteamCloudChoice::KeepBoth => {}
+            SteamCloudChoice::Cloud => {
+                for (index, ((path, local), remote)) in
+                    snapshot.local.iter().zip(&snapshot.remote).enumerate()
+                {
+                    // Un fichier uniquement local n'est jamais supprimé.
+                    if let Some(bytes) = remote {
+                        if local.as_ref() != Some(bytes) {
+                            store_path(&context.dir, &expected.files[index].name)
+                                .map_err(lapinux_core::Error::Other)?;
+                            crate::steam::write_cloud_file(path, bytes, local.as_deref()).map_err(
+                                |e| {
+                                    lapinux_core::Error::Other(format!(
+                                        "{e} ; copies : {}",
+                                        backup.display()
+                                    ))
+                                },
+                            )?;
+                            count += 1;
+                        }
+                    }
                 }
             }
-            let data = std::fs::read(&path).map_err(|error| error.to_string())?;
-            let remote = lapinux_stores::RemoteFile {
-                name: name.clone(),
-                size: data.len() as u64,
-                modified,
-                full_name: if context.dir_name.is_empty() {
-                    name
-                } else {
-                    format!("{}/{name}", context.dir_name)
-                },
-                ..Default::default()
-            };
-            let size = lapinux_stores::cloud_upload(
-                context.store,
-                &context.tokens,
-                &context.store_id,
-                &context.platform,
-                &context.dir_name,
-                &remote,
-                data,
-                modified,
-            )
-            .map_err(|error| error.to_string())?;
-            sent += 1;
-            bytes += size;
+            SteamCloudChoice::Local => {
+                // Sans effacement distant documenté, conserver les fichiers uniquement cloud.
+                for (index, ((path, local), remote)) in
+                    snapshot.local.iter().zip(&snapshot.remote).enumerate()
+                {
+                    let Some(data) = local else { continue };
+                    if remote.as_ref() == Some(data) {
+                        continue;
+                    }
+                    let latest = self.store_cloud_context(appid).map_err(|e| {
+                        lapinux_core::Error::Other(format!(
+                            "vérification impossible : {e} ; copies : {}",
+                            backup.display()
+                        ))
+                    })?;
+                    let latest_file = latest
+                        .files
+                        .iter()
+                        .find(|entry| entry.name == expected.files[index].name);
+                    match (latest_file, &snapshot.remote_files[index]) {
+                        (None, None) => {}
+                        (Some(file), Some(original)) if file.full_name == original.full_name => {
+                            let current = lapinux_stores::cloud_read(
+                                latest.store,
+                                &latest.tokens,
+                                &latest.store_id,
+                                &latest.platform,
+                                &latest.dir_name,
+                                file,
+                            )
+                            .map_err(|e| {
+                                lapinux_core::Error::Other(format!(
+                                    "vérification du cloud : {e} ; copies : {}",
+                                    backup.display()
+                                ))
+                            })?;
+                            if Some(&current) != remote.as_ref() {
+                                return Err(lapinux_core::Error::Other(format!(
+                                    "le cloud a changé pendant l'envoi ; copies : {}",
+                                    backup.display()
+                                )));
+                            }
+                        }
+                        _ => {
+                            return Err(lapinux_core::Error::Other(format!(
+                                "le cloud a changé pendant l'envoi ; copies : {}",
+                                backup.display()
+                            )))
+                        }
+                    }
+                    store_path(&context.dir, &expected.files[index].name)
+                        .map_err(lapinux_core::Error::Other)?;
+                    if crate::steam::read_cloud_local(path).map_err(lapinux_core::Error::Other)?
+                        != *local
+                    {
+                        return Err(lapinux_core::Error::Other(format!(
+                            "la sauvegarde locale a changé ; copies : {}",
+                            backup.display()
+                        )));
+                    }
+                    let file = latest_file
+                        .cloned()
+                        .unwrap_or_else(|| lapinux_stores::RemoteFile {
+                            name: expected.files[index].name.clone(),
+                            ..Default::default()
+                        });
+                    lapinux_stores::cloud_upload(
+                        latest.store,
+                        &latest.tokens,
+                        &latest.store_id,
+                        &latest.platform,
+                        &latest.dir_name,
+                        &file,
+                        data.clone(),
+                        local_modified(path).unwrap_or_else(lapinux_core::util::now_unix),
+                    )
+                    .map_err(|e| {
+                        lapinux_core::Error::Other(format!(
+                            "envoi interrompu : {e} ; copies : {}",
+                            backup.display()
+                        ))
+                    })?;
+                    count += 1;
+                    bytes += data.len() as u64;
+                }
+            }
         }
-        if sent > 0 {
+        if count > 0 {
             crate::cloud_journal::record(
                 &self.paths,
-                context.appid,
+                appid,
                 lapinux_core::model::CloudSyncEntry {
                     at: lapinux_core::util::now_unix(),
-                    direction: lapinux_core::model::CloudSyncDirection::Upload,
-                    machine: crate::cloud_journal::machine_name(),
-                    files: sent,
+                    direction: if choice == SteamCloudChoice::Local {
+                        lapinux_core::model::CloudSyncDirection::Upload
+                    } else {
+                        lapinux_core::model::CloudSyncDirection::Download
+                    },
+                    machine: if choice == SteamCloudChoice::Local {
+                        crate::cloud_journal::machine_name()
+                    } else {
+                        format!("{} Cloud", context.store.label())
+                    },
+                    files: count,
                     bytes,
                 },
             );
         }
-        Ok((sent, bytes))
+        Ok(Envelope::ok(
+            &serde_json::json!({ "backup": backup.display().to_string(), "files": count, "bytes": bytes }),
+        ))
     }
 
     /// Prépare en arrière-plan les fiches des jeux de boutique récemment
@@ -1475,6 +1933,344 @@ impl Shared {
             }
         });
     }
+}
+
+/// Les copies ne doivent jamais apparaître dans le dossier synchronisé.
+fn check_recovery_outside_saves(
+    data_dir: &Path,
+    appid: u32,
+    dir: &Path,
+) -> std::result::Result<(), String> {
+    let recovery_root = data_dir.join("cloud-recovery").join(appid.to_string());
+    if let Ok(save_dir) = std::fs::canonicalize(dir) {
+        if let Some((existing, canonical)) = recovery_root.ancestors().find_map(|path| {
+            std::fs::canonicalize(path)
+                .ok()
+                .map(|canonical| (path, canonical))
+        }) {
+            let suffix = recovery_root
+                .strip_prefix(existing)
+                .map_err(|e| format!("chemin de récupération invalide : {e}"))?;
+            if canonical.join(suffix).starts_with(save_dir) {
+                return Err(
+                    "le dossier des copies cloud se trouve dans les sauvegardes du jeu".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Identité et empreintes du relevé fiable pris avant la partie.
+pub(crate) struct StoreCloudBaseline {
+    appid: u32,
+    store: Store,
+    store_id: String,
+    platform: String,
+    dir: PathBuf,
+    dir_name: String,
+    user_id: String,
+    report: lapinux_core::model::CloudSaves,
+}
+
+impl StoreCloudBaseline {
+    fn matches_context(&self, context: &CloudContext) -> bool {
+        self.appid == context.appid
+            && self.store == context.store
+            && self.store_id == context.store_id
+            && self.platform == context.platform
+            && self.dir == context.dir
+            && self.dir_name == context.dir_name
+            && self.user_id == context.tokens.user_id
+    }
+}
+
+fn remote_hashes(
+    report: &lapinux_core::model::CloudSaves,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    report
+        .files
+        .iter()
+        .filter(|file| file.cloud_present == Some(true))
+        .map(|file| (file.name.clone(), file.sha.clone()))
+        .collect()
+}
+
+fn same_local_files(a: &StoreSnapshot, b: &StoreSnapshot) -> bool {
+    let local = |snapshot: &StoreSnapshot| -> std::collections::BTreeMap<String, Vec<u8>> {
+        snapshot
+            .report
+            .files
+            .iter()
+            .filter_map(|file| {
+                file.local_sha
+                    .as_ref()
+                    .map(|sha| (file.name.clone(), sha.clone()))
+            })
+            .collect()
+    };
+    local(a) == local(b)
+}
+
+/// Pas de suppression distante : un fichier disparu demande une résolution manuelle.
+fn store_cloud_auto_plan(
+    before: &lapinux_core::model::CloudSaves,
+    after: &StoreSnapshot,
+) -> std::result::Result<Vec<usize>, String> {
+    if remote_hashes(before) != remote_hashes(&after.report) {
+        return Err("le cloud a changé pendant la partie : choisissez une version dans l'onglet Sauvegardes".into());
+    }
+    let current_local: HashSet<&str> = after
+        .report
+        .files
+        .iter()
+        .filter(|file| file.local_sha.is_some())
+        .map(|file| file.name.as_str())
+        .collect();
+    if before
+        .files
+        .iter()
+        .any(|file| file.local_sha.is_some() && !current_local.contains(file.name.as_str()))
+    {
+        return Err(
+            "une sauvegarde locale a disparu : aucune suppression cloud automatique".into(),
+        );
+    }
+    Ok(after
+        .report
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            file.local_sha
+                .as_ref()
+                .filter(|sha| file.cloud_present != Some(true) || *sha != &file.sha)
+                .map(|_| index)
+        })
+        .collect())
+}
+
+fn execute_store_cloud_uploads(
+    baseline: &StoreCloudBaseline,
+    snapshot: &StoreSnapshot,
+    mut observe: impl FnMut() -> std::result::Result<(CloudContext, StoreSnapshot), String>,
+    mut upload: impl FnMut(
+        &CloudContext,
+        &lapinux_stores::RemoteFile,
+        &Path,
+        &[u8],
+    ) -> std::result::Result<u64, String>,
+) -> std::result::Result<(usize, u64), String> {
+    let pending = store_cloud_auto_plan(&baseline.report, snapshot)?;
+    let mut expected = remote_hashes(&baseline.report);
+    let mut files = 0;
+    let mut bytes = 0;
+    for index in pending {
+        let (latest, fresh) =
+            observe().map_err(|e| format!("{e} ; {files} fichier(s) déjà envoyé(s)"))?;
+        if !baseline.matches_context(&latest)
+            || remote_hashes(&fresh.report) != expected
+            || !same_local_files(&fresh, snapshot)
+        {
+            return Err(format!("les sauvegardes ou le compte ont changé pendant l'envoi ; {files} fichier(s) déjà envoyé(s)"));
+        }
+        let name = &snapshot.report.files[index].name;
+        let path = store_path(&latest.dir, name)?;
+        let data = snapshot.local[index]
+            .1
+            .as_ref()
+            .ok_or("sauvegarde locale absente")?;
+        if crate::steam::read_cloud_local(&path)?.as_ref() != Some(data) {
+            return Err(format!("sauvegarde locale modifiée : {name}"));
+        }
+        let file = latest
+            .files
+            .iter()
+            .find(|file| &file.name == name)
+            .cloned()
+            .unwrap_or_else(|| lapinux_stores::RemoteFile {
+                name: name.clone(),
+                ..Default::default()
+            });
+        let sent = upload(&latest, &file, &path, data)
+            .map_err(|e| format!("envoi interrompu : {e} ; {files} fichier(s) déjà envoyé(s)"))?;
+        files += 1;
+        bytes += sent;
+        expected.insert(name.clone(), lapinux_steam::cloud::file_sha(data));
+        let (verified_context, verified) = observe().map_err(|e| {
+            format!("vérification après envoi : {e} ; {files} fichier(s) déjà envoyé(s)")
+        })?;
+        if !baseline.matches_context(&verified_context)
+            || remote_hashes(&verified.report) != expected
+            || !same_local_files(&verified, snapshot)
+        {
+            return Err(format!("vérification après l'envoi de {name} impossible ou cloud modifié ; {files} fichier(s) déjà envoyé(s)"));
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// Relevé interne complet : les octets restent dans le daemon, pas dans l'IPC.
+struct StoreSnapshot {
+    report: lapinux_core::model::CloudSaves,
+    local: Vec<(PathBuf, Option<Vec<u8>>)>,
+    remote: Vec<Option<Vec<u8>>>,
+    remote_files: Vec<Option<lapinux_stores::RemoteFile>>,
+}
+
+fn store_path(root: &Path, name: &str) -> std::result::Result<PathBuf, String> {
+    let relative = safe_relative(name).ok_or_else(|| format!("chemin cloud invalide : {name}"))?;
+    let mut current = root.to_path_buf();
+    // Refuser les liens intermédiaires pour ne pas sortir du dossier choisi.
+    for part in relative.components() {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!("lien symbolique refusé : {}", current.display()))
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(format!("dossier invalide : {}", current.display()))
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("{} : {error}", current.display()))
+            }
+            _ => {}
+        }
+        current.push(part.as_os_str());
+    }
+    Ok(current)
+}
+
+fn collect_store_files(root: &Path) -> std::result::Result<Vec<(String, PathBuf)>, String> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        found: &mut Vec<(String, PathBuf)>,
+    ) -> std::result::Result<(), String> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir == root => return Ok(()),
+            Err(e) => return Err(format!("{} : {e}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_symlink() {
+                return Err(format!("lien symbolique refusé : {}", path.display()));
+            }
+            if kind.is_dir() {
+                walk(root, &path, found)?;
+            } else if kind.is_file() {
+                let name = path
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .to_str()
+                    .ok_or("nom de fichier non UTF-8")?
+                    .to_string();
+                found.push((name, path));
+            } else {
+                return Err(format!("fichier spécial refusé : {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+    if std::fs::symlink_metadata(root).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err("le dossier des sauvegardes est un lien symbolique".into());
+    }
+    let mut found = Vec::new();
+    walk(root, root, &mut found)?;
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
+}
+
+fn read_store_cloud(context: &CloudContext) -> std::result::Result<StoreSnapshot, String> {
+    read_store_cloud_with(context, |file| {
+        lapinux_stores::cloud_read(
+            context.store,
+            &context.tokens,
+            &context.store_id,
+            &context.platform,
+            &context.dir_name,
+            file,
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn read_store_cloud_with(
+    context: &CloudContext,
+    mut read: impl FnMut(&lapinux_stores::RemoteFile) -> std::result::Result<Vec<u8>, String>,
+) -> std::result::Result<StoreSnapshot, String> {
+    let mut files = std::collections::BTreeMap::new();
+    for remote in &context.files {
+        let path = store_path(&context.dir, &remote.name)?;
+        if files
+            .insert(remote.name.clone(), (path, Some(remote.clone())))
+            .is_some()
+        {
+            return Err(format!("nom cloud en double : {}", remote.name));
+        }
+    }
+    for (name, path) in collect_store_files(&context.dir)? {
+        files.entry(name).or_insert((path, None));
+    }
+    if files.len() > 4096 {
+        return Err("trop de fichiers de sauvegarde à comparer".into());
+    }
+    for name in files.keys() {
+        let mut parent = Path::new(name).parent();
+        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            if files.contains_key(&path.to_string_lossy().to_string()) {
+                return Err(format!("chemins cloud incompatibles : {name}"));
+            }
+            parent = path.parent();
+        }
+    }
+    let mut total = 0usize;
+    let mut report = lapinux_core::model::CloudSaves::default();
+    let mut local = Vec::new();
+    let mut remote = Vec::new();
+    let mut remote_files = Vec::new();
+    for (name, (path, file)) in files {
+        let bytes = crate::steam::read_cloud_local(&path)?;
+        let cloud = match &file {
+            Some(file) => Some(read(file)?),
+            None => None,
+        };
+        total = total
+            .saturating_add(bytes.as_ref().map_or(0, Vec::len))
+            .saturating_add(cloud.as_ref().map_or(0, Vec::len));
+        if total > 512 * 1024 * 1024 {
+            return Err("ensemble des sauvegardes trop volumineux à comparer".into());
+        }
+        report.files.push(CloudFile {
+            name,
+            size: file.as_ref().map(|f| f.size).unwrap_or(0),
+            modified: file.as_ref().map(|f| f.modified).unwrap_or(0),
+            sha: cloud
+                .as_ref()
+                .map(|v| lapinux_steam::cloud::file_sha(v))
+                .unwrap_or_default(),
+            local: bytes.as_ref().and_then(|_| local_modified(&path)),
+            local_sha: bytes.as_ref().map(|v| lapinux_steam::cloud::file_sha(v)),
+            local_resolved: true,
+            cloud_present: Some(file.is_some()),
+            ..Default::default()
+        });
+        local.push((path, bytes));
+        remote.push(cloud);
+        remote_files.push(file);
+    }
+    Ok(StoreSnapshot {
+        report,
+        local,
+        remote,
+        remote_files,
+    })
+}
+
+fn same_store_snapshot(a: &StoreSnapshot, expected: &lapinux_core::model::CloudSaves) -> bool {
+    a.report.files == expected.files
 }
 
 /// Dernière modification d'un fichier, en secondes Unix.
@@ -1507,53 +2303,23 @@ fn unix_seconds(time: std::time::SystemTime) -> i64 {
 /// Chemin venu de la boutique, ramené sous le dossier de sauvegarde : un nom
 /// absolu ou remontant (`../`) est refusé.
 fn safe_relative(name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty()
+        || name.contains('\\')
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return None;
+    }
     let mut out = std::path::PathBuf::new();
     for component in std::path::Path::new(name).components() {
         match component {
             std::path::Component::Normal(part) => out.push(part),
-            std::path::Component::CurDir => {}
+            std::path::Component::CurDir => return None,
             _ => return None,
         }
     }
     (!out.as_os_str().is_empty()).then_some(out)
-}
-
-/// Fichiers d'un dossier de sauvegarde, avec leur chemin relatif en `/`.
-fn collect_saves(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<(String, std::path::PathBuf)>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            collect_saves(root, &path, out);
-            continue;
-        }
-        if !kind.is_file() {
-            continue;
-        }
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        let name = relative
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(part) => Some(part.to_string_lossy().to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("/");
-        if !name.is_empty() {
-            out.push((name, path));
-        }
-    }
 }
 
 /// Version préférée quand l'utilisateur n'en choisit pas : Linux d'abord, puis
@@ -1658,7 +2424,8 @@ fn plan_fingerprint(plan: &lapinux_stores::InstallPlan) -> String {
         let text = match step {
             lapinux_stores::Step::Download { url, .. }
             | lapinux_stores::Step::EpicBuild { url, .. } => url.as_str(),
-            lapinux_stores::Step::Unzip { file }
+            lapinux_stores::Step::Extract { file }
+            | lapinux_stores::Step::InstallFile { file }
             | lapinux_stores::Step::RunInstaller { file }
             | lapinux_stores::Step::InnoExtract { file } => file.as_str(),
         };
@@ -1728,7 +2495,7 @@ fn dir_size(path: &Path) -> u64 {
 
 /// Premier exécutable du dossier, sous quelques niveaux : un jeu GOG met son
 /// binaire dans `game/`, un jeu itch à la racine ou sous `bin/`.
-fn find_executable(dir: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn find_executable(dir: &Path, name: &str) -> Option<PathBuf> {
     let target: String = name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -1737,6 +2504,11 @@ fn find_executable(dir: &Path, name: &str) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     collect_executables(dir, 0, &mut candidates);
     candidates.into_iter().min_by_key(|path| {
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         let stem: String = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1745,15 +2517,28 @@ fn find_executable(dir: &Path, name: &str) -> Option<PathBuf> {
             .filter(|c| c.is_ascii_alphanumeric())
             .map(|c| c.to_ascii_lowercase())
             .collect();
-        let score = if !target.is_empty() && stem.contains(&target) {
+        // Un jeu Unreal publie souvent un petit `Jeu.exe` de démarrage à la
+        // racine, qui ne traverse pas correctement Proton, et le vrai binaire
+        // `Jeu-Win64-Shipping.exe` sous `Binaries/Win64`. Ce dernier passe
+        // avant, même s'il est plus profond.
+        let score = if is_shipping_executable(&filename) {
             0
-        } else if stem.contains("launcher") || stem.contains("unins") {
-            2
-        } else {
+        } else if !target.is_empty() && stem.contains(&target) {
             1
+        } else if stem.contains("launcher") || stem.contains("unins") {
+            3
+        } else {
+            2
         };
         (score, path.components().count())
     })
+}
+
+fn is_shipping_executable(filename: &str) -> bool {
+    let filename = filename.to_ascii_lowercase();
+    filename.ends_with("-win64-shipping.exe")
+        || filename.ends_with("-win32-shipping.exe")
+        || filename.ends_with("-shipping.exe")
 }
 
 fn collect_executables(dir: &Path, depth: u32, found: &mut Vec<PathBuf>) {
@@ -1782,12 +2567,20 @@ fn collect_executables(dir: &Path, depth: u32, found: &mut Vec<PathBuf>) {
                 .metadata()
                 .map(|meta| meta.permissions().mode() & 0o111 != 0)
                 .unwrap_or(false);
-            let suffix = path
+            let extension = path
                 .extension()
                 .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("exe"))
-                .unwrap_or(true);
-            if executable && suffix {
+                .map(str::to_ascii_lowercase);
+            let windows = extension.as_deref() == Some("exe");
+            // Un `.exe` extrait d'une archive Windows n'a pas de bit
+            // exécutable Unix : il est pourtant bien le lanceur du jeu sous
+            // Proton. Les binaires natifs, eux, doivent rester exécutables.
+            let native = match extension.as_deref() {
+                None => true,
+                Some("sh" | "appimage" | "x86_64" | "x86-64" | "run" | "bin") => true,
+                _ => false,
+            };
+            if windows || (native && executable) {
                 found.push(path);
             }
         }
@@ -1796,6 +2589,44 @@ fn collect_executables(dir: &Path, depth: u32, found: &mut Vec<PathBuf>) {
             let _ = path;
         }
     }
+}
+
+/// Vrai pour un exécutable Windows : il ne se lance pas directement sur
+/// Linux, il passe par Proton.
+pub(crate) fn is_windows_executable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+}
+
+/// Répare une entrée installée avant le correctif qui trouvait les `.exe`
+/// d'une archive Windows, ou dont l'exécutable a été déplacé. Rend `true`
+/// quand le jeu a été mis à jour ; l'appelant enregistre alors son entrée.
+pub(crate) fn refresh_game_executable(game: &mut Game) -> bool {
+    let current = game.exe.as_ref().filter(|exe| exe.is_file());
+    let Some(exe) = find_executable(&game.install_dir(), &game.name) else {
+        return false;
+    };
+    let current_shipping = current
+        .and_then(|exe| exe.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(is_shipping_executable);
+    let found_shipping = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_shipping_executable);
+    // Une entrée existante garde son exécutable, sauf si elle pointait vers le
+    // petit démarreur d'un jeu Unreal et qu'un vrai `-Shipping.exe` est
+    // disponible. Un exécutable disparu est bien sûr remplacé.
+    if current.is_some_and(|current| current == &exe) || (current_shipping && !found_shipping) {
+        return false;
+    }
+    if current.is_some() && !found_shipping {
+        return false;
+    }
+    game.native = !is_windows_executable(&exe);
+    game.exe = Some(exe);
+    true
 }
 
 #[cfg(test)]
@@ -1883,6 +2714,309 @@ mod tests {
     }
 
     #[test]
+    fn store_cloud_compares_content_and_rejects_stale_or_incomplete_reads() {
+        use lapinux_core::model::SteamCloudState;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("saves");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("same"), b"same").unwrap();
+        std::fs::write(dir.join("different"), b"local").unwrap();
+        std::fs::write(dir.join("local-only"), b"progress").unwrap();
+        for store in [Store::Epic, Store::Gog] {
+            let file = |name: &str| lapinux_stores::RemoteFile {
+                name: name.into(),
+                size: 4,
+                modified: 12,
+                hash: "untrusted".into(),
+                ..Default::default()
+            };
+            let mut context = CloudContext {
+                appid: 123,
+                store,
+                store_id: "test".into(),
+                platform: "windows".into(),
+                dir: dir.clone(),
+                dir_name: "saves".into(),
+                tokens: core_stores::StoreTokens::default(),
+                files: vec![file("same"), file("different"), file("remote-only")],
+            };
+            let read = |file: &lapinux_stores::RemoteFile| {
+                Ok(match file.name.as_str() {
+                    "same" => b"same".to_vec(),
+                    "different" => b"other".to_vec(),
+                    _ => b"remote".to_vec(),
+                })
+            };
+            let snapshot = read_store_cloud_with(&context, read).unwrap();
+            assert_eq!(snapshot.report.steam_state(), SteamCloudState::Conflict);
+            assert_eq!(snapshot.report.files.len(), 4);
+            let local_only = snapshot
+                .report
+                .files
+                .iter()
+                .find(|f| f.name == "local-only")
+                .unwrap();
+            assert_eq!(local_only.cloud_present, Some(false));
+            let missing = snapshot
+                .report
+                .files
+                .iter()
+                .find(|f| f.name == "remote-only")
+                .unwrap();
+            assert!(missing.local_sha.is_none());
+            assert!(same_store_snapshot(&snapshot, &snapshot.report));
+            let mut stale = snapshot.report.clone();
+            stale.files[0].sha = vec![42; 20];
+            assert!(!same_store_snapshot(&snapshot, &stale));
+            assert!(read_store_cloud_with(&context, |_| Err("réseau interrompu".into())).is_err());
+            context.files.push(file("same"));
+            assert!(read_store_cloud_with(&context, read).is_err());
+            context.files = vec![file("../outside")];
+            assert!(read_store_cloud_with(&context, read).is_err());
+            context.files = vec![file("parent"), file("parent/child")];
+            assert!(read_store_cloud_with(&context, read).is_err());
+        }
+    }
+
+    #[test]
+    fn store_cloud_missing_identical_and_recovery_are_verified() {
+        use lapinux_core::model::SteamCloudState;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("saves");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = lapinux_stores::RemoteFile {
+            name: "save".into(),
+            ..Default::default()
+        };
+        for store in [Store::Epic, Store::Gog] {
+            let context = CloudContext {
+                appid: 123,
+                store,
+                store_id: "test".into(),
+                platform: "windows".into(),
+                dir: dir.clone(),
+                dir_name: "saves".into(),
+                tokens: core_stores::StoreTokens::default(),
+                files: vec![file.clone()],
+            };
+            let path = dir.join("save");
+            let _ = std::fs::remove_file(&path);
+            let missing = read_store_cloud_with(&context, |_| Ok(b"cloud".to_vec())).unwrap();
+            assert_eq!(missing.report.steam_state(), SteamCloudState::MissingLocal);
+            crate::steam::write_cloud_file(&path, b"cloud", None).unwrap();
+            let equal = read_store_cloud_with(&context, |_| Ok(b"cloud".to_vec())).unwrap();
+            assert_eq!(equal.report.steam_state(), SteamCloudState::UpToDate);
+            std::fs::write(&path, b"local").unwrap();
+            let conflict = read_store_cloud_with(&context, |_| Ok(b"cloud".to_vec())).unwrap();
+            let game = Game {
+                appid: 123,
+                ..Default::default()
+            };
+            let backup = crate::steam::save_cloud_recovery(
+                temp.path(),
+                &game,
+                &conflict.report,
+                &conflict.local,
+                &conflict.remote,
+                &conflict.report.superseded,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(backup.join("0-local")).unwrap(), b"local");
+            assert_eq!(std::fs::read(backup.join("0-cloud")).unwrap(), b"cloud");
+            crate::steam::write_cloud_file(
+                &path,
+                conflict.remote[0].as_deref().unwrap(),
+                conflict.local[0].1.as_deref(),
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"cloud");
+            let bad_root = temp.path().join("not-a-directory");
+            std::fs::write(&bad_root, b"x").unwrap();
+            assert!(crate::steam::save_cloud_recovery(
+                &bad_root,
+                &game,
+                &conflict.report,
+                &conflict.local,
+                &conflict.remote,
+                &conflict.report.superseded
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"cloud");
+        }
+    }
+
+    #[test]
+    fn store_cloud_auto_uploads_only_when_remote_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("saves");
+        std::fs::create_dir_all(&dir).unwrap();
+        for store in [Store::Epic, Store::Gog] {
+            std::fs::write(dir.join("save"), b"avant").unwrap();
+            let _ = std::fs::remove_file(dir.join("new"));
+            let mut context = CloudContext {
+                appid: 123,
+                store,
+                store_id: "jeu".into(),
+                platform: "windows".into(),
+                dir: dir.clone(),
+                dir_name: "saves".into(),
+                tokens: core_stores::StoreTokens::default(),
+                files: vec![lapinux_stores::RemoteFile {
+                    name: "save".into(),
+                    ..Default::default()
+                }],
+            };
+            let before = read_store_cloud_with(&context, |_| Ok(b"avant".to_vec())).unwrap();
+            assert!(store_cloud_auto_plan(&before.report, &before)
+                .unwrap()
+                .is_empty());
+            std::fs::write(dir.join("save"), b"apres").unwrap();
+            std::fs::write(dir.join("new"), b"nouveau").unwrap();
+            let after = read_store_cloud_with(&context, |_| Ok(b"avant".to_vec())).unwrap();
+            let plan = store_cloud_auto_plan(&before.report, &after).unwrap();
+            let names: Vec<_> = plan
+                .iter()
+                .map(|&i| after.report.files[i].name.as_str())
+                .collect();
+            assert_eq!(names, vec!["new", "save"]);
+            let changed_remote =
+                read_store_cloud_with(&context, |_| Ok(b"autre machine".to_vec())).unwrap();
+            assert!(store_cloud_auto_plan(&before.report, &changed_remote).is_err());
+            context.files.push(lapinux_stores::RemoteFile {
+                name: "distant".into(),
+                ..Default::default()
+            });
+            let added_remote = read_store_cloud_with(&context, |_| Ok(b"avant".to_vec())).unwrap();
+            assert!(store_cloud_auto_plan(&before.report, &added_remote).is_err());
+            context.files.pop();
+            std::fs::remove_file(dir.join("save")).unwrap();
+            let deleted = read_store_cloud_with(&context, |_| Ok(b"avant".to_vec())).unwrap();
+            assert!(store_cloud_auto_plan(&before.report, &deleted).is_err());
+            assert!(!same_local_files(&after, &deleted));
+        }
+    }
+
+    #[test]
+    fn store_cloud_auto_transfers_and_rechecks_each_file() {
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("saves");
+        std::fs::create_dir_all(&dir).unwrap();
+        for store in [Store::Epic, Store::Gog] {
+            std::fs::write(dir.join("save"), b"avant").unwrap();
+            let _ = std::fs::remove_file(dir.join("new"));
+            let remote = RefCell::new(BTreeMap::from([("save".to_string(), b"avant".to_vec())]));
+            let context = || CloudContext {
+                appid: 123,
+                store,
+                store_id: "jeu".into(),
+                platform: "windows".into(),
+                dir: dir.clone(),
+                dir_name: "saves".into(),
+                tokens: core_stores::StoreTokens::default(),
+                files: remote
+                    .borrow()
+                    .keys()
+                    .map(|name| lapinux_stores::RemoteFile {
+                        name: name.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            };
+            let observe = || {
+                let ctx = context();
+                let snapshot = read_store_cloud_with(&ctx, |file| {
+                    remote
+                        .borrow()
+                        .get(&file.name)
+                        .cloned()
+                        .ok_or("absent".into())
+                })?;
+                Ok((ctx, snapshot))
+            };
+            let (_, before) = observe().unwrap();
+            let baseline = StoreCloudBaseline {
+                appid: 123,
+                store,
+                store_id: "jeu".into(),
+                platform: "windows".into(),
+                dir: dir.clone(),
+                dir_name: "saves".into(),
+                user_id: String::new(),
+                report: before.report,
+            };
+            std::fs::write(dir.join("save"), b"apres").unwrap();
+            std::fs::write(dir.join("new"), b"nouveau").unwrap();
+            let (_, snapshot) = observe().unwrap();
+            let writes = RefCell::new(Vec::new());
+            let result =
+                execute_store_cloud_uploads(&baseline, &snapshot, observe, |_, file, _, bytes| {
+                    writes.borrow_mut().push(file.name.clone());
+                    remote
+                        .borrow_mut()
+                        .insert(file.name.clone(), bytes.to_vec());
+                    Ok(bytes.len() as u64)
+                })
+                .unwrap();
+            assert_eq!(result, (2, 12));
+            assert_eq!(&*writes.borrow(), &["new", "save"]);
+            assert_eq!(remote.borrow()["save"], b"apres");
+
+            remote.borrow_mut().insert("save".into(), b"avant".to_vec());
+            remote.borrow_mut().remove("new");
+            let writes = RefCell::new(Vec::new());
+            let result =
+                execute_store_cloud_uploads(&baseline, &snapshot, observe, |_, file, _, bytes| {
+                    writes.borrow_mut().push(file.name.clone());
+                    remote
+                        .borrow_mut()
+                        .insert(file.name.clone(), bytes.to_vec());
+                    remote
+                        .borrow_mut()
+                        .insert("save".into(), b"autre machine".to_vec());
+                    Ok(bytes.len() as u64)
+                });
+            assert!(result.is_err());
+            assert_eq!(&*writes.borrow(), &["new"]);
+            assert_eq!(remote.borrow()["save"], b"autre machine");
+        }
+    }
+
+    #[test]
+    fn store_cloud_rejects_links_and_detects_local_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("saves");
+        std::fs::create_dir_all(dir.join("slot")).unwrap();
+        let path = dir.join("slot/save");
+        std::fs::write(&path, b"before").unwrap();
+        let context = CloudContext {
+            appid: 123,
+            store: Store::Gog,
+            store_id: "test".into(),
+            platform: "windows".into(),
+            dir: dir.clone(),
+            dir_name: "saves".into(),
+            tokens: core_stores::StoreTokens::default(),
+            files: vec![lapinux_stores::RemoteFile {
+                name: "slot/save".into(),
+                ..Default::default()
+            }],
+        };
+        let first = read_store_cloud_with(&context, |_| Ok(b"cloud".to_vec())).unwrap();
+        std::fs::write(&path, b"changed").unwrap();
+        let next = read_store_cloud_with(&context, |_| Ok(b"cloud".to_vec())).unwrap();
+        assert!(!same_store_snapshot(&next, &first.report));
+        assert!(
+            crate::steam::write_cloud_file(&path, b"cloud", first.local[0].1.as_deref()).is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed");
+        std::os::unix::fs::symlink(temp.path(), dir.join("link")).unwrap();
+        assert!(read_store_cloud_with(&context, |_| Ok(b"cloud".to_vec())).is_err());
+        assert!(store_path(&dir, "link/escape").is_err());
+    }
+
+    #[test]
     fn cloud_paths_stay_under_the_save_folder() {
         // Un nom venu du cloud ne peut pas remonter hors du dossier.
         assert!(safe_relative("../secret").is_none());
@@ -1891,10 +3025,7 @@ mod tests {
             safe_relative("slot1/save.sav"),
             Some(std::path::PathBuf::from("slot1/save.sav"))
         );
-        assert_eq!(
-            safe_relative("./save.sav"),
-            Some(std::path::PathBuf::from("save.sav"))
-        );
+        assert_eq!(safe_relative("./save.sav"), None);
     }
 
     #[test]
@@ -1903,13 +3034,15 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("slot1")).unwrap();
         std::fs::write(dir.path().join("profil.sav"), b"a").unwrap();
         std::fs::write(dir.path().join("slot1").join("save.sav"), b"b").unwrap();
-        let mut found = Vec::new();
-        collect_saves(dir.path(), dir.path(), &mut found);
+        let found = collect_store_files(dir.path()).unwrap();
         let mut names: Vec<String> = found.into_iter().map(|(name, _)| name).collect();
         names.sort();
         // Le séparateur est toujours `/`, même sur un système qui en préfère un
         // autre : c'est la forme que le cloud attend.
-        assert_eq!(names, vec!["profil.sav".to_string(), "slot1/save.sav".to_string()]);
+        assert_eq!(
+            names,
+            vec!["profil.sav".to_string(), "slot1/save.sav".to_string()]
+        );
     }
 
     #[test]
@@ -1945,7 +3078,11 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["Shadow Tactics: Blades of the Shogun", "GTA V", "GTA V Enhanced"]
+            vec![
+                "Shadow Tactics: Blades of the Shogun",
+                "GTA V",
+                "GTA V Enhanced"
+            ]
         );
         // La copie installée gagne : c'est son identifiant que la fiche lance.
         assert_eq!(entries[0].store_id, "game");
@@ -1959,6 +3096,42 @@ mod tests {
         assert_eq!(safe_dirname("Disco Elysium"), "Disco Elysium");
         assert_eq!(safe_dirname("  "), "Jeu");
         assert!(!safe_dirname("../..").contains('/'));
+    }
+
+    #[test]
+    fn a_windows_exe_without_unix_mode_is_found_and_switches_to_the_shipping_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let install = root.path().join("library/LIMINAL STATE");
+        std::fs::create_dir_all(install.join("LiminalStateGame/Binaries/Win64")).unwrap();
+        // Les archives Windows n'ont pas de bit exécutable Unix : l'extraction
+        // d'un rar itch.io laisse ces fichiers en 0644.
+        std::fs::write(install.join("LiminalStateGame.exe"), b"launcher").unwrap();
+        std::fs::write(
+            install.join("LiminalStateGame/Binaries/Win64/LiminalStateGame-Win64-Shipping.exe"),
+            b"shipping",
+        )
+        .unwrap();
+        let bootstrap = install.join("LiminalStateGame.exe");
+        let mut game = Game {
+            appid: 42,
+            name: "LIMINAL STATE".into(),
+            installdir: "LIMINAL STATE".into(),
+            library: root.path().join("library"),
+            origin: lapinux_core::model::GameOrigin::Store,
+            store: Store::Itch,
+            installed: true,
+            native: true,
+            exe: Some(bootstrap),
+            ..Default::default()
+        };
+        assert!(refresh_game_executable(&mut game));
+        assert_eq!(
+            game.exe,
+            Some(
+                install.join("LiminalStateGame/Binaries/Win64/LiminalStateGame-Win64-Shipping.exe")
+            )
+        );
+        assert!(!game.native, "un .exe doit passer par Proton");
     }
 
     #[test]
