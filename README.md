@@ -116,7 +116,7 @@ essai du lancement de jeu, du bureau graphique ou du matériel réel. Certains
 tests accèdent au réseau ou au système : vérifier leur portée avant de lancer la
 suite sur une machine contenant des données personnelles.
 
-Avant publication, le titulaire doit préciser la licence du projet : les
-manifestes indiquent MIT, mais aucun fichier de licence général n'est présent.
-Vérifier séparément les droits des images, marques et autres ressources tierces ;
-les polices possèdent leurs propres notices dans `assets/fonts`.
+Le projet est distribué sous licence MIT (voir [LICENSE](LICENSE)), comme les
+manifestes l'indiquaient déjà. Vérifier séparément les droits des images,
+marques et autres ressources tierces ; les polices possèdent leurs propres
+notices dans `assets/fonts`.
