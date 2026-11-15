@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lapinux — Modèles de désinstallation</title>
+<style>
+:root {
+  --bg: #141516;
+  --panel: #1c1d1f;
+  --panel-2: #202124;
+  --card: #27282b;
+  --card-hover: #303134;
+  --border: #404144;
+  --border-soft: rgba(255,255,255,.08);
+  --text: #ebecee;
+  --dim: #a0a2a6;
+  --accent: #ced0d3;
+  --cyan: #00c8e0;
+  --danger: #e88484;
+  --danger-strong: #f05b5b;
+  --danger-soft: rgba(232,132,132,.12);
+  --ok: #7ecd95;
+  --radius: 16px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  background:
+    radial-gradient(900px 500px at 12% 0%, rgba(240,91,91,.08), transparent 62%),
+    radial-gradient(900px 550px at 92% 10%, rgba(0,200,224,.06), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font-family: "Inter", "Segoe UI", "Noto Sans", system-ui, sans-serif;
+  font-size: 14px;
+}
+.page { max-width: 1440px; margin: 0 auto; padding: 46px 34px 70px; }
+.intro { display: flex; align-items: end; justify-content: space-between; gap: 30px; margin-bottom: 34px; }
+.eyebrow { color: var(--cyan); font-size: 11px; letter-spacing: .16em; text-transform: uppercase; font-weight: 600; }
+h1 { font-size: clamp(28px, 3vw, 42px); line-height: 1.08; margin: 9px 0 10px; letter-spacing: -.03em; font-weight: 600; }
+.intro p { color: var(--dim); max-width: 650px; margin: 0; line-height: 1.6; }
+.legend { display: flex; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+.legend span { border: 1px solid var(--border); background: rgba(255,255,255,.025); color: var(--dim); padding: 7px 11px; border-radius: 999px; font-size: 11px; white-space: nowrap; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; }
+.model { min-width: 0; }
+.model-label { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin: 0 2px 10px; }
+.model-label strong { font-size: 14px; font-weight: 600; }
+.model-label em { color: var(--dim); font-style: normal; font-size: 11px; }
+.stage {
+  position: relative;
+  min-height: 430px;
+  border: 1px solid rgba(255,255,255,.055);
+  border-radius: 22px;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  isolation: isolate;
+  background:
+    linear-gradient(180deg, rgba(15,15,17,.4), rgba(15,15,17,.9)),
+    radial-gradient(420px 260px at 16% 12%, rgba(226,140,40,.30), transparent 65%),
+    radial-gradient(400px 270px at 82% 18%, rgba(82,150,116,.25), transparent 66%),
+    #17181a;
+}
+.stage::before {
+  content: "";
+  position: absolute;
+  inset: -30px;
+  z-index: -1;
+  opacity: .21;
+  filter: blur(18px);
+  background:
+    linear-gradient(115deg, transparent 0 7%, #8b5a19 7% 27%, transparent 27% 32%, #173f35 32% 55%, transparent 55% 60%, #6e271f 60% 82%, transparent 82%),
+    #111214;
+  transform: scale(1.08);
+}
+.stage::after {
+  content: "BAD CHEESE   ·   SHORT HIKE   ·   PÂQUERETTE";
+  position: absolute;
+  left: 28px;
+  bottom: 18px;
+  z-index: -1;
+  color: rgba(255,255,255,.10);
+  font-size: 12px;
+  letter-spacing: .18em;
+  font-weight: 600;
+}
+.modal {
+  width: 100%;
+  max-width: 570px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 20px 50px rgba(0,0,0,.58), 0 2px 0 rgba(255,255,255,.035) inset;
+  position: relative;
+  overflow: hidden;
+}
+button { font: inherit; }
+.x {
+  position: absolute;
+  top: 13px;
+  right: 13px;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--dim);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.x:hover { color: var(--text); background: var(--card-hover); }
+.btn {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  height: 38px;
+  padding: 0 16px;
+  font-weight: 600;
+  font-size: 12.5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.btn:hover { background: var(--card-hover); }
+.btn.primary {
+  background: var(--text);
+  color: #191a1c;
+  border-color: transparent;
+}
+.btn.primary:hover { filter: brightness(.92); }
+.btn.danger {
+  background: var(--danger-soft);
+  border-color: rgba(232,132,132,.42);
+  color: #ffc1c1;
+}
+.btn.danger:hover { background: rgba(232,132,132,.20); border-color: var(--danger); }
+.btn.danger-solid {
+  background: var(--danger-strong);
+  border-color: transparent;
+  color: #230a0a;
+}
+.btn.danger-solid:hover { filter: brightness(1.08); }
+.btn.wide { width: 100%; }
+.actions { display: flex; justify-content: flex-end; gap: 9px; }
+.muted { color: var(--dim); }
+.tiny { font-size: 10.5px; line-height: 1.55; color: var(--dim); }
+svg { flex: 0 0 auto; }
+
+/* 1 — Carte de jeu */
+.v1 .head {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  min-height: 84px;
+  padding: 14px 52px 13px 18px;
+  background: linear-gradient(180deg, #202124, #1d1e20);
+  border-bottom: 1px solid var(--border);
+}
+.thumb {
+  width: 46px;
+  height: 58px;
+  border-radius: 7px;
+  background:
+    radial-gradient(circle at 50% 28%, rgba(255,255,255,.26), transparent 12%),
+    linear-gradient(145deg, #d79a4a, #7a391f 56%, #211311);
+  border: 1px solid rgba(255,255,255,.15);
+  box-shadow: 0 3px 10px rgba(0,0,0,.35);
+  display: grid;
+  place-items: center;
+  color: #2a120a;
+  font-weight: 800;
+  font-size: 8px;
+  letter-spacing: .03em;
+  text-align: center;
+  line-height: 1.05;
+}
+.v1 h2 { font-size: 17px; margin: 0 0 3px; font-weight: 600; letter-spacing: -.01em; }
+.v1 .sub { margin: 0; color: var(--dim); font-size: 11px; }
+.v1 .body { padding: 18px 20px 17px; }
+.callout { display: flex; gap: 11px; align-items: flex-start; }
+.icon-box {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+.callout strong { font-size: 13px; font-weight: 600; display: block; margin: 1px 0 4px; }
+.callout p { margin: 0; color: var(--dim); font-size: 11.5px; line-height: 1.5; }
+.cards { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 16px; }
+.info {
+  border: 1px solid var(--border-soft);
+  background: rgba(255,255,255,.022);
+  border-radius: 10px;
+  padding: 11px;
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  min-height: 66px;
+}
+.info .mini { color: var(--ok); margin-top: 1px; }
+.info.warn .mini { color: #e8c076; }
+.info b { display: block; font-size: 11.5px; font-weight: 600; margin: 0 0 3px; }
+.info span { display: block; color: var(--dim); font-size: 10.5px; line-height: 1.45; }
+.v1 .fine { margin: 13px 0 0; }
+.v1 footer { padding: 13px 20px 15px; border-top: 1px solid var(--border); background: rgba(0,0,0,.10); display: flex; justify-content: space-between; align-items: center; gap: 15px; }
+.v1 footer .tiny { max-width: 245px; }
+
+/* 2 — Panneau d'impact */
+.v2 { max-width: 610px; display: grid; grid-template-columns: 170px 1fr; min-height: 342px; }
+.v2 .poster {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 24%, rgba(255,219,155,.32), transparent 20%),
+    radial-gradient(180px 220px at 52% 32%, #d79842 0 20%, transparent 21%),
+    linear-gradient(160deg, #9c5a27 0%, #4a2417 56%, #170e0d 100%);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 18px 16px;
+  border-right: 1px solid var(--border);
+}
+.poster-art {
+  position: absolute;
+  top: 35px;
+  left: 17px;
+  font-weight: 800;
+  font-size: 27px;
+  line-height: .93;
+  letter-spacing: -.035em;
+  color: rgba(45,20,10,.88);
+  text-shadow: 0 1px 0 rgba(255,255,255,.18);
+}
+.v2 .poster .pill { align-self: flex-start; font-size: 9.5px; color: #f8e8d2; border: 1px solid rgba(255,255,255,.22); background: rgba(0,0,0,.22); padding: 5px 8px; border-radius: 999px; font-weight: 600; }
+.v2 .side { min-width: 0; display: flex; flex-direction: column; }
+.v2 .side-head { padding: 19px 50px 0 20px; }
+.v2 .kicker { color: var(--danger); text-transform: uppercase; letter-spacing: .13em; font-size: 9.5px; font-weight: 800; }
+.v2 h2 { margin: 7px 0 5px; font-size: 22px; letter-spacing: -.02em; font-weight: 600; }
+.v2 .sub { margin: 0; color: var(--dim); font-size: 11px; }
+.v2 .side-body { padding: 15px 20px 0; flex: 1; }
+.v2 .lede { font-size: 12px; line-height: 1.5; margin: 0 0 12px; }
+.v2 .safety {
+  display: flex; gap: 10px; align-items: flex-start;
+  border-left: 2px solid var(--ok);
+  background: linear-gradient(90deg, rgba(126,205,149,.085), transparent);
+  padding: 9px 10px;
+  border-radius: 0 7px 7px 0;
+  margin-bottom: 10px;
+}
+.v2 .safety b { display: block; font-size: 11px; margin: 1px 0 2px; }
+.v2 .safety span { color: var(--dim); font-size: 10px; line-height: 1.4; }
+.v2 .hint { margin: 0; padding-left: 10px; border-left: 2px solid #e8c076; color: var(--dim); font-size: 10px; line-height: 1.45; }
+.v2 footer { padding: 14px 20px 17px; display: flex; justify-content: flex-end; gap: 9px; }
+
+/* 3 — Compact */
+.v3 { max-width: 480px; text-align: center; }
+.v3 .body { padding: 29px 34px 23px; }
+.danger-round {
+  width: 62px; height: 62px; border-radius: 20px;
+  margin: 0 auto 15px;
+  display: grid; place-items: center;
+  color: #ffbdbd;
+  background: linear-gradient(145deg, rgba(240,91,91,.20), rgba(240,91,91,.08));
+  border: 1px solid rgba(240,91,91,.26);
+  box-shadow: 0 8px 24px rgba(240,91,91,.08) inset;
+}
+.v3 h2 { margin: 0 0 7px; font-size: 21px; letter-spacing: -.02em; font-weight: 600; }
+.v3 .sub { margin: 0 auto 17px; max-width: 370px; color: var(--dim); font-size: 11.5px; line-height: 1.55; }
+.save-chip {
+  display: flex; align-items: center; gap: 9px; text-align: left;
+  padding: 10px 11px; border-radius: 10px;
+  background: rgba(126,205,149,.065);
+  border: 1px solid rgba(126,205,149,.18);
+  font-size: 10.5px; line-height: 1.4; color: #c5e5cf;
+}
+.save-chip svg { color: var(--ok); }
+.disclosure {
+  width: 100%; margin-top: 12px; padding: 11px 1px;
+  border: 0; border-top: 1px solid var(--border-soft);
+  background: transparent; color: var(--dim);
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 10.5px; cursor: pointer;
+}
+.disclosure b { color: var(--text); font-weight: 500; }
+.v3 .fine { margin: 0 0 16px; text-align: left; font-size: 9.5px; line-height: 1.5; }
+.v3 footer { padding: 0 34px 27px; display: grid; gap: 8px; }
+
+/* 4 — Sauvegarde d'abord */
+.v4 { max-width: 590px; border-color: rgba(126,205,149,.20); }
+.v4 .head {
+  padding: 18px 50px 16px 21px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, #202124, #1d1e20);
+}
+.v4 .steps { display: flex; gap: 7px; align-items: center; margin-bottom: 13px; }
+.step { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 9.5px; font-weight: 600; }
+.step i { font-style: normal; width: 17px; height: 17px; border-radius: 50%; border: 1px solid var(--border); display: grid; place-items: center; font-size: 9px; }
+.step.active { color: var(--ok); }
+.step.active i { background: rgba(126,205,149,.13); border-color: rgba(126,205,149,.5); }
+.step-line { height: 1px; width: 24px; background: var(--border); }
+.v4 h2 { margin: 0 0 4px; font-size: 19px; font-weight: 600; letter-spacing: -.015em; }
+.v4 .sub { margin: 0; color: var(--dim); font-size: 11px; }
+.v4 .body { padding: 17px 21px 16px; }
+.v4 .backup-row { display: grid; grid-template-columns: 1.15fr .85fr; gap: 10px; }
+.backup {
+  border: 1px solid rgba(126,205,149,.22);
+  background: linear-gradient(145deg, rgba(126,205,149,.09), rgba(126,205,149,.025));
+  border-radius: 11px; padding: 13px;
+  display: flex; gap: 10px; align-items: flex-start;
+}
+.backup .big { color: var(--ok); }
+.backup b { display: block; font-size: 12px; margin: 2px 0 3px; }
+.backup span { color: #a9c9b4; font-size: 10px; line-height: 1.45; display: block; }
+.kept { border: 1px solid var(--border-soft); border-radius: 11px; padding: 12px 13px; background: rgba(255,255,255,.018); }
+.kept b { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: var(--dim); margin-bottom: 8px; }
+.kept ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 7px; }
+.kept li { display: flex; gap: 7px; align-items: center; font-size: 10.5px; color: var(--text); }
+.kept li svg { color: var(--ok); }
+.v4 .warn-line { margin: 13px 0 0; display: flex; gap: 8px; color: var(--dim); font-size: 9.5px; line-height: 1.5; }
+.v4 .warn-line svg { color: #e8c076; margin-top: 1px; }
+.v4 footer { padding: 13px 21px 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; gap: 12px; align-items: center; background: rgba(0,0,0,.10); }
+.v4 footer .tiny { max-width: 260px; }
+
+@media (max-width: 1000px) {
+  .grid { grid-template-columns: 1fr; }
+  .stage { min-height: 420px; }
+}
+@media (max-width: 620px) {
+  .page { padding: 26px 15px 48px; }
+  .intro { align-items: flex-start; flex-direction: column; }
+  .legend { justify-content: flex-start; }
+  .stage { padding: 14px; min-height: 0; }
+  .v2 { grid-template-columns: 1fr; }
+  .v2 .poster { min-height: 135px; }
+  .v2 .poster-art { top: 22px; }
+  .v4 .backup-row { grid-template-columns: 1fr; }
+  .v1 footer, .v4 footer { align-items: stretch; flex-direction: column; }
+  .v1 .actions, .v4 .actions { width: 100%; }
+  .v1 .actions .btn, .v4 .actions .btn { flex: 1; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="intro">
+    <div>
+      <div class="eyebrow">Lapinux · fiche de jeu</div>
+      <h1>Quel style pour la désinstallation ?</h1>
+      <p>Quatre directions pour le même contenu : prévenir clairement, rassurer sur la sauvegarde, puis laisser le choix. Rien n’est encore modifié dans l’application — dis-moi le numéro qui te plaît.</p>
+    </div>
+    <div class="legend">
+      <span>Même contenu</span>
+      <span>Même actions</span>
+      <span>Thème sombre actuel</span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section class="model">
+      <div class="model-label"><strong>Modèle 1 — Carte de jeu</strong><em>identité + compartiments</em></div>
+      <div class="stage">
+        <article class="modal v1">
+          <button class="x" aria-label="Fermer">×</button>
+          <div class="head">
+            <div class="thumb">BAD<br>CHEESE</div>
+            <div>
+              <h2>Désinstaller le jeu ?</h2>
+              <p class="sub">Bad Cheese · installation Windows</p>
+            </div>
+          </div>
+          <div class="body">
+            <div class="callout">
+              <div class="icon-box">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 8v5"/><path d="M12 17h.01"/><path d="M10.3 3.7 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z"/></svg>
+              </div>
+              <div>
+                <strong>Le jeu et son préfixe Proton seront supprimés.</strong>
+                <p>Le préfixe peut contenir des sauvegardes. Lapinux vérifie d’abord ce qu’il peut conserver.</p>
+              </div>
+            </div>
+            <div class="cards">
+              <div class="info">
+                <svg class="mini" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1Z"/><path d="m9 12 2 2 4-4"/></svg>
+                <div><b>Copie de sauvegarde</b><span>Créée et vérifiée avant la suppression si un dossier est détecté.</span></div>
+              </div>
+              <div class="info warn">
+                <svg class="mini" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 10h18"/></svg>
+                <div><b>Dossiers de sauvegarde</b><span>La détection peut en manquer : vérifie leur emplacement dans Sauvegardes.</span></div>
+              </div>
+            </div>
+            <p class="tiny fine">Si aucun dossier non vide n’est trouvé pour un jeu déjà lancé, la désinstallation est annulée.</p>
+          </div>
+          <footer>
+            <div class="tiny">Cette action est définitive pour les fichiers du jeu.</div>
+            <div class="actions">
+              <button class="btn">Annuler</button>
+              <button class="btn danger">Désinstaller</button>
+            </div>
+          </footer>
+        </article>
+      </div>
+    </section>
+
+    <section class="model">
+      <div class="model-label"><strong>Modèle 2 — Panneau d’impact</strong><em>plus éditorial</em></div>
+      <div class="stage">
+        <article class="modal v2">
+          <button class="x" aria-label="Fermer">×</button>
+          <aside class="poster"><div class="poster-art">BAD<br>CHEESE</div><span class="pill">Installé · 8,3 Go</span></aside>
+          <div class="side">
+            <div class="side-head">
+              <div class="kicker">Désinstallation</div>
+              <h2>Bad Cheese</h2>
+              <p class="sub">Windows · préfixe Proton</p>
+            </div>
+            <div class="side-body">
+              <p class="lede">Les fichiers du jeu et son préfixe Proton seront supprimés.</p>
+              <div class="safety">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--ok)"><path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1Z"/><path d="m9 12 2 2 4-4"/></svg>
+                <div><b>Une copie vérifiée sera créée</b><span>Si un dossier de sauvegarde est détecté avant la suppression.</span></div>
+              </div>
+              <p class="hint">La détection peut manquer d’autres dossiers : vérifie leur emplacement dans l’onglet Sauvegardes.</p>
+            </div>
+            <footer>
+              <button class="btn">Annuler</button>
+              <button class="btn danger">Désinstaller</button>
+            </footer>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="model">
+      <div class="model-label"><strong>Modèle 3 — Compact</strong><em>moins de texte, plus direct</em></div>
+      <div class="stage">
+        <article class="modal v3">
+          <button class="x" aria-label="Fermer">×</button>
+          <div class="body">
+            <div class="danger-round">
+              <svg width="27" height="27" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/></svg>
+            </div>
+            <h2>Désinstaller Bad Cheese ?</h2>
+            <p class="sub">Le jeu et son préfixe Proton seront supprimés. Une copie vérifiée de la sauvegarde sera créée si un dossier est détecté.</p>
+            <div class="save-chip">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1Z"/><path d="m9 12 2 2 4-4"/></svg>
+              <span><b>Sauvegarde protégée</b> — copie vérifiée avant suppression.</span>
+            </div>
+            <button class="disclosure"><b>Ce qui sera supprimé</b><span>⌄</span></button>
+            <p class="tiny fine">Le jeu et son préfixe Proton. La détection peut manquer d’autres dossiers : vérifie-les dans Sauvegardes. Sans dossier trouvé pour un jeu déjà lancé, la désinstallation est annulée.</p>
+          </div>
+          <footer>
+            <button class="btn danger-solid wide">Désinstaller</button>
+            <button class="btn wide">Annuler</button>
+          </footer>
+        </article>
+      </div>
+    </section>
+
+    <section class="model">
+      <div class="model-label"><strong>Modèle 4 — Sauvegarde d’abord</strong><em>rassurer avant d’agir</em></div>
+      <div class="stage">
+        <article class="modal v4">
+          <button class="x" aria-label="Fermer">×</button>
+          <div class="head">
+            <div class="steps">
+              <span class="step active"><i>1</i>Sauvegarde</span>
+              <span class="step-line"></span>
+              <span class="step"><i>2</i>Suppression</span>
+            </div>
+            <h2>Désinstaller Bad Cheese</h2>
+            <p class="sub">Windows · 8,3 Go · préfixe Proton</p>
+          </div>
+          <div class="body">
+            <div class="backup-row">
+              <div class="backup">
+                <svg class="big" width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1Z"/><path d="m9 12 2 2 4-4"/></svg>
+                <div><b>Sauvegarde vérifiée</b><span>Une copie du dossier détecté est créée avant toute suppression.</span></div>
+              </div>
+              <div class="kept">
+                <b>Conservé</b>
+                <ul>
+                  <li><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="m5 12 4 4L19 6"/></svg>Dossier de sauvegarde</li>
+                  <li><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="m5 12 4 4L19 6"/></svg>Copie vérifiée</li>
+                  <li><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="m5 12 4 4L19 6"/></svg>Fiche du jeu</li>
+                </ul>
+              </div>
+            </div>
+            <p class="warn-line"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 8v5"/><path d="M12 17h.01"/><path d="M10.3 3.7 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z"/></svg><span>La détection peut manquer d’autres dossiers. Vérifie leur emplacement dans l’onglet Sauvegardes. Sans dossier non vide trouvé pour un jeu déjà lancé, la désinstallation est annulée.</span></p>
+          </div>
+          <footer>
+            <div class="tiny">Le préfixe Proton sera supprimé avec le jeu.</div>
+            <div class="actions">
+              <button class="btn">Annuler</button>
+              <button class="btn primary">Sauvegarder et désinstaller</button>
+            </div>
+          </footer>
+        </article>
+      </div>
+    </section>
+  </div>
+</div>
+</body>
+</html>

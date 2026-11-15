@@ -1,0 +1,17 @@
+# Steam Controller 2026 (Triton) : autorise l'interrupteur « Mode clavier/souris »
+# de la fiche Manettes à écrire lizard_mode sans root.
+#
+# Le paramètre est créé root:root 0644 par hid_steam. Les membres du groupe wheel
+# peuvent déjà élever leurs privilèges ; on leur donne donc l'écriture sur ce
+# seul réglage, sans ouvrir le fichier à tous les utilisateurs.
+#
+# Installation :
+#   sudo cp packaging/99-steam-controller.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --action=add --subsystem-match=input
+#
+# On passe par les nœuds input de la manette plutôt que par l'événement du
+# module : udev les traite à chaque connexion, y compris à chaud, et le
+# paramètre hid_steam existe déjà à ce moment-là.
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="130[2-5]", RUN+="/usr/bin/chgrp wheel /sys/module/hid_steam/parameters/lizard_mode"
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="130[2-5]", RUN+="/usr/bin/chmod 0660 /sys/module/hid_steam/parameters/lizard_mode"

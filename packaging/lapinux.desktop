@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Lapinux
+GenericName=Gestionnaire de jeux
+Comment=Bibliothèque Steam sans Steam, Proton, manettes et overlay
+TryExec=lapinux
+Exec=lapinux
+Icon=lapinux
+Terminal=false
+StartupWMClass=lapinux
+Categories=Game;Player;
+Keywords=steam;proton;gamepad;launcher;
+StartupNotify=true

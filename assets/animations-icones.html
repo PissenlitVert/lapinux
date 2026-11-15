@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lapinux — aperçu des animations</title>
+<style>
+:root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #141516; color: #ebecee; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1120px; margin: auto; padding: 48px 28px 80px; }
+header { border-bottom: 1px solid #404144; padding-bottom: 24px; }
+.eyebrow { color: #a0a2a6; font-size: 12px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+h1 { font-size: clamp(28px, 4vw, 42px); letter-spacing: -.04em; margin: 12px 0; }
+p { color: #a0a2a6; line-height: 1.6; max-width: 740px; }
+h2 { margin: 42px 0 16px; font-size: 22px; }
+button { background: #27282b; border: 1px solid #55575c; color: #fff; padding: 10px 16px; border-radius: 8px; font: inherit; cursor: pointer; }
+button:focus-visible { outline: 2px solid #8dd6e9; outline-offset: 3px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(195px, 1fr)); gap: 12px; }
+article { background: #1c1d1f; border: 1px solid #404144; border-radius: 12px; padding: 18px; }
+article h3 { font-size: 14px; margin: 0 0 14px; }
+.icons { display: flex; align-items: center; gap: 22px; min-height: 56px; }
+svg { flex: none; color: #ebecee; overflow: visible; }
+.large { width: 48px; height: 48px; }
+.small { width: 19px; height: 19px; color: #a0a2a6; }
+.m { animation-duration: 2s; animation-timing-function: ease-in-out; animation-iteration-count: infinite; transform-box: fill-box; transform-origin: center; }
+.book { animation-name: book; } .star { animation-name: star; } .lines { animation-name: lines; } .arrow { animation-name: arrow; }
+.controller-press { animation-name: controller-press; transform-box: view-box; transform-origin: 12px 12px; } .controller-vibration { animation-name: controller-vibration; } .brush { animation-name: brush; } .palette { animation-name: palette; } .head { animation-name: head; } .door { animation-name: door; } .sound-wave { animation-name: sound-wave; } .sun { animation-name: sun; }
+.gear { animation-name: gear; } .slider { animation-name: slider; } .colors { animation-name: colors; } .person { animation-name: person; }
+.disk-light { animation-name: disk-light; } .shutter { animation-name: shutter; } .orbit { animation-name: orbit; } .chip { animation-name: chip; }
+.heartbeat { animation-name: heartbeat; } .journal { animation-name: journal; } .ear-left { animation-name: ear-left; } .ear-right { animation-name: ear-right; } .friend { animation-name: friend; }
+.corners { animation-name: corners; } .loader { animation: bunny-hop 1.2s ease-in-out infinite; }
+.book-side { animation-name: book-side; } .lean-book { animation-name: lean-book; }
+.mountain { animation-name: mountain; } .journal-alt { animation-name: journal-alt; }
+.friend-left { animation-name: friend-left; } .friend-right { animation-name: friend-right; }
+@keyframes book { 0%,27.5%,100% { transform:translateY(0) } 13.75% { transform:translateY(-3px) } }
+@keyframes book-side { 0%,27.5%,100% { transform:translateY(0) } 13.75% { transform:translateY(-2px) } }
+@keyframes lean-book { 0%,27.5%,100% { transform:skewX(0) } 13.75% { transform:skewX(8deg) } }
+@keyframes mountain { 0%,27.5%,100% { transform:scaleY(1) } 13.75% { transform:scaleY(1.3) } }
+@keyframes journal-alt { 0%,27.5%,100% { transform:translateX(0) } 13.75% { transform:translateX(1.8px) } }
+@keyframes friend-left { 0%,27.5%,100% { transform:translateX(0) } 13.75% { transform:translateX(-.7px) } }
+@keyframes friend-right { 0%,27.5%,100% { transform:translateX(0) } 13.75% { transform:translateX(.7px) } }
+@keyframes star { 0%,27.5%,100% { transform:rotate(0) } 13.75% { transform:rotate(24deg) } }
+@keyframes lines { 0%,27.5%,100% { transform:scaleX(1) } 13.75% { transform:scaleX(.7) } }
+@keyframes arrow { 0%,27.5%,100% { transform:translateY(0) } 13.75% { transform:translateY(2px) } }
+@keyframes controller-press { 0%,27.5%,100% { transform:translateY(0) rotate(0) } 13.75% { transform:translateY(-.5px) rotate(-8deg) } }
+@keyframes controller-vibration { 0%,27.5%,100% { opacity:0 } 13.75% { opacity:1 } }
+@keyframes brush { 0%,27.5%,100% { opacity:0 } 13.75% { opacity:1 } }
+@keyframes palette { 0%,27.5%,100% { opacity:1 } 13.75% { opacity:.55 } }
+@keyframes head { 0%,27.5%,100% { transform:translateY(0) } 13.75% { transform:translateY(-1.5px) } }
+@keyframes door { 0%,27.5%,100% { transform:scaleX(1) skewY(0) } 13.75% { transform:scaleX(.375) skewY(12deg) } }
+@keyframes sound-wave { 0%,27.5%,100% { opacity:0 } 13.75% { opacity:1 } }
+@keyframes sun { 0%,27.5%,100% { transform:scale(1) } 13.75% { transform:scale(1.67) } }
+@keyframes gear { 0%,27.5%,100% { transform:rotate(0) } 13.75% { transform:rotate(45deg) } }
+@keyframes slider { 0%,27.5%,100% { transform:translateY(0) } 13.75% { transform:translateY(2px) } }
+@keyframes colors { 0%,27.5%,100% { transform:scale(1) } 13.75% { transform:scale(1.76) } }
+@keyframes person { 0%,27.5%,100% { transform:translateX(0) } 13.75% { transform:translateX(1.6px) } }
+@keyframes disk-light { 0%,27.5%,100% { transform:scale(1) } 13.75% { transform:scale(2.4) } }
+@keyframes shutter { 0%,27.5%,100% { transform:scaleX(1) } 13.75% { transform:scaleX(.67) } }
+@keyframes orbit { 0%,27.5%,100% { transform:rotate(0) } 13.75% { transform:rotate(37deg) } }
+@keyframes chip { 0%,27.5%,100% { transform:scale(1) } 13.75% { transform:scale(1.23) } }
+@keyframes heartbeat { 0%,27.5%,100% { transform:scaleY(1) } 13.75% { transform:scaleY(1.33) } }
+@keyframes journal { 0%,27.5%,100% { transform:translateX(0) } 13.75% { transform:translateX(-1.2px) } }
+@keyframes ear-left { 0%,27.5%,100% { d:path('M8 9.44 C6 7 5.5 3 7 3 C8.6 3 10.2 6.2 10.5 8.78') } 13.75% { d:path('M8 9.44 C5 7 4.5 3 6 3 C7.6 3 10.2 6.2 10.5 8.78') } }
+@keyframes ear-right { 0%,27.5%,100% { d:path('M16 9.42 C18 7 18.5 3 17 3 C15.4 3 13.8 6.2 13.5 8.79') } 13.75% { d:path('M16 9.42 C19 7 19.5 3 18 3 C16.4 3 13.8 6.2 13.5 8.79') } }
+@keyframes friend { 0%,27.5%,100% { transform:translateX(0) } 13.75% { transform:translateX(-1px) } }
+@keyframes corners { 0%,27.5%,100% { transform:scale(1) } 13.75% { transform:scale(1.11) } }
+@keyframes bunny-hop { 0%, 100% { transform:translateY(0) } 50% { transform:translateY(-2px) } }
+.rabbit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(205px, 1fr)); gap: 12px; }
+.rabbit-card { display: flex; flex-direction: column; }
+.rabbit-title { color: #fff; font-size: 15px; margin: 0 0 5px; }
+.rabbit-title strong { color: #8dd6e9; margin-right: 6px; }
+.rabbit-visuals { display: flex; align-items: center; gap: 24px; min-height: 116px; padding: 14px 8px; }
+.rabbit-big { width: 82px; height: 82px; }
+.rabbit-tiny { width: 18px; height: 18px; color: #a0a2a6; }
+.rabbit-note { font-size: 12px; color: #a0a2a6; margin: 0; }
+.rabbit-move { animation-duration: 1.4s; animation-timing-function: ease-in-out; animation-iteration-count: infinite; transform-box: fill-box; transform-origin: center; }
+.rabbit-hop { animation-name: rabbit-hop; } .rabbit-float { animation-name: rabbit-float; }
+.rabbit-rock { animation-name: rabbit-rock; } .rabbit-squash { animation-name: rabbit-squash; transform-origin: center bottom; }
+.rabbit-ear { animation-name: rabbit-ear; transform-origin: center bottom; }
+.rabbit-blink { animation-name: rabbit-blink; } .rabbit-peek { animation-name: rabbit-peek; }
+.rabbit-run { animation-name: rabbit-run; } .rabbit-stars { animation-name: rabbit-stars; }
+@keyframes rabbit-hop { 0%, 100% { transform: translateY(0); } 45% { transform: translateY(-7px); } }
+@keyframes rabbit-float { 0%, 100% { transform: translateY(0) rotate(-3deg); } 50% { transform: translateY(-4px) rotate(3deg); } }
+@keyframes rabbit-rock { 0%, 100% { transform: rotate(-9deg); } 50% { transform: rotate(9deg); } }
+@keyframes rabbit-squash { 0%, 100% { transform: scale(1); } 30% { transform: scale(1.08,.91); } 60% { transform: translateY(-5px) scale(.95,1.06); } }
+@keyframes rabbit-ear { 0%, 100% { transform: rotate(-12deg); } 50% { transform: rotate(12deg); } }
+@keyframes rabbit-blink { 0%, 42%, 54%, 100% { transform: scaleY(1); } 48% { transform: scaleY(.12); } }
+@keyframes rabbit-peek { 0%, 100% { transform: translateY(9px); } 50% { transform: translateY(0); } }
+@keyframes rabbit-run { 0%,100% { transform: translate(0,0) rotate(0); } 30% { transform: translate(3px,-5px) rotate(-7deg); } 60% { transform: translate(-2px,0) rotate(4deg); } }
+@keyframes rabbit-stars { 0%, 100% { opacity:.25; transform: scale(.7); } 50% { opacity:1; transform: scale(1); } }
+.star-orbit { animation: star-orbit 3s linear infinite; transform-origin: 32px 32px; }
+.star-tail { animation: star-tail 1.6s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+.star-wink { animation: star-wink 2s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+.star-dream { animation: star-dream 2.2s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+@keyframes star-orbit { to { transform: rotate(360deg); } }
+@keyframes star-tail { 0%,100% { opacity:.35; transform: translate(-3px,3px); } 50% { opacity:1; transform: translate(2px,-2px); } }
+@keyframes star-wink { 0%,42%,54%,100% { transform: scaleY(1); } 48% { transform: scaleY(.1); } }
+@keyframes star-dream { 0%,100% { opacity:.4; transform: translateY(2px) scale(.8); } 50% { opacity:1; transform: translateY(-2px) scale(1); } }
+/* Les six variantes conservent exactement la silhouette A au repos. */
+.home-options { display:grid; grid-template-columns:repeat(auto-fit,minmax(205px,1fr)); gap:12px; }
+.home-choice { display:flex; flex-direction:column; min-height:190px; }
+.home-choice h3 { margin:0; font-size:15px; }
+.home-choice h3 strong { color:#ebecee; margin-right:7px; }
+.home-visuals { display:flex; align-items:center; gap:30px; min-height:92px; padding:12px 8px; }
+.home-big { width:54px; height:54px; }
+.home-tab { display:flex; align-items:center; gap:6px; height:34px; padding:0 10px; border-radius:7px; background:#3a3b3e; color:#ebecee; font-size:13px; font-weight:600; }
+.home-tab svg { width:19px; height:19px; }
+.home-description { margin:0; font-size:12px; line-height:1.5; color:#a0a2a6; }
+.home-motion { animation-duration:2.4s; animation-timing-function:ease-in-out; animation-iteration-count:infinite; transform-box:view-box; transform-origin:12px 12px; }
+.home-roof-peak { animation-name:home-roof-peak; }
+.home-door { animation-name:home-door; transform-origin:10px 20px; }
+.home-bounce { animation-name:home-bounce; }
+.home-roof-rise { animation-name:home-roof-rise; }
+.home-outline { stroke-dasharray:55; animation-name:home-outline; }
+.home-tilt { animation-name:home-tilt; transform-origin:12px 20px; }
+@keyframes home-roof-peak { 0%,30%,100% { d:path('M3.5 11 L12 4 L20.5 11'); } 15% { d:path('M3.5 11 L12 3 L20.5 11'); } }
+@keyframes home-door { 0%,30%,100% { transform:scaleX(1); } 15% { transform:scaleX(.38) skewY(-10deg); } }
+@keyframes home-bounce { 0%,30%,100% { transform:translateY(0); } 15% { transform:translateY(-2px); } }
+@keyframes home-roof-rise { 0%,30%,100% { transform:translateY(0); } 15% { transform:translateY(-1.8px); } }
+@keyframes home-outline { 0%,30%,100% { stroke-dashoffset:0; } 15% { stroke-dashoffset:15; } }
+@keyframes home-tilt { 0%,30%,100% { transform:rotate(0); } 15% { transform:rotate(-8deg); } }
+.paused .m, .paused .loader, .paused .rabbit-move, .paused .star-orbit, .paused .star-tail, .paused .star-wink, .paused .star-dream, .paused .home-motion { animation-play-state: paused; }
+.description { font-size: 12px; color: #a0a2a6; margin: 12px 0 0; }
+.size-demo { background: #1c1d1f; border: 1px solid #404144; border-radius: 12px; padding: 20px; overflow-x: auto; }
+.size-demo h3 { font-size: 14px; margin: 0 0 12px; }
+.demo-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.demo-group { display: flex; background: #27282b; border: 1px solid #404144; border-radius: 9px; padding: 1px; }
+.demo-segment { width: 34px; height: 32px; display: grid; place-items: center; flex: none; }
+.demo-segment + .demo-segment { border-left: 1px solid #404144; }
+.demo-icon { width: 19px; height: 19px; color: #a0a2a6; }
+.demo-rail { width: 200px; margin-top: 12px; background: #141516; border: 1px solid #404144; border-radius: 9px; padding: 6px; }
+.demo-row { height: 34px; display: flex; align-items: center; gap: 8px; padding: 0 12px; font-size: 12.5px; color: #a0a2a6; }
+.demo-row.selected { background: #27282b; border-radius: 7px; color: #ebecee; }
+.demo-note { font-size: 12px; color: #a0a2a6; margin: 12px 0 0; }
+@media (prefers-reduced-motion: reduce) { .m, .loader, .rabbit-move, .star-orbit, .star-tail, .star-wink, .star-dream, .home-motion { animation-play-state: paused; } }
+</style>
+</head>
+<body><main>
+<header>
+<div class="eyebrow">Lapinux · aperçu animé</div>
+<h1>Les icônes prennent vie</h1>
+<p>Voici les icônes choisies, animées en boucle pour les comparer. Dans Lapinux, le mouvement se joue brièvement au survol ou au focus, puis l’icône reste immobile.</p>
+<p>Chaque dessin apparaît en grand et à sa taille approximative dans la navigation. Bibliothèque et Captures ont aussi une animation différente dans les réglages. En cours de téléchargement, la jaquette du jeu continue à remplacer l’icône.</p>
+<button id="pause" type="button" aria-pressed="false">Mettre en pause</button>
+<p id="reduced" hidden>Les animations sont arrêtées car la réduction des animations est activée dans ton système.</p>
+</header>
+<section aria-labelledby="home-animation-title">
+<h2 id="home-animation-title">Animations pour ton icône Accueil</h2>
+<p>Six façons d’animer la maison A, montrées en grand et dans un onglet de 19 points. Les mouvements tournent en boucle ici pour les comparer ; dans Lapinux, celui que tu choisiras se jouera brièvement au survol ou au focus.</p>
+<div id="home-animations" class="home-options"></div>
+</section>
+<section aria-labelledby="size-title"><h2 id="size-title">Tailles des icônes ajustées</h2><p>Maquette indicative de la barre classique et des réglages : les dessins utilisent une base de 19 points, dans des boutons et lignes de 34 points.</p><div id="size-demo" class="size-demo"></div></section>
+<section aria-labelledby="fresh-stars-title"><h2 id="fresh-stars-title">Nouveaux lapins étoilés 🐰✨</h2><p>Huit nouvelles silhouettes, de AA à AH : lapins entiers, oreilles tombantes et styles différents. Le petit dessin donne une idée de leur taille dans les chargements. Dis-moi ceux qui te plaisent !</p><div id="fresh-star-rabbits" class="rabbit-grid"></div></section>
+<section aria-labelledby="chosen-title"><h2 id="chosen-title">Tes cinq lapins retenus ✨</h2><p>M, Q, R, S et AE sont les modèles choisis pour les chargements aléatoires dans Lapinux. Le petit dessin montre leur taille approximative dans l’interface.</p><div id="chosen-rabbits" class="rabbit-grid"></div></section>
+<section aria-labelledby="new-stars-title"><h2 id="new-stars-title">Nouvelles propositions étoilées 🌟</h2><p>Six nouvelles idées, de U à Z. Elles restent des propositions : indique-moi celles que tu veux ajouter au tirage.</p><div id="new-star-rabbits" class="rabbit-grid"></div></section>
+<section aria-labelledby="stars-title"><h2 id="stars-title">Variantes du lapin étoilé ✨</h2><p>Les autres variantes restent ici pour comparaison.</p><div id="star-rabbits" class="rabbit-grid"></div></section>
+<section aria-labelledby="rabbits-title"><h2 id="rabbits-title">Quel lapin pour les chargements ?</h2><p>Voici 12 propositions animées : chaque lapin est montré en grand et à la taille approximative d’un indicateur de chargement. Donne-moi la lettre de ton préféré !</p><div id="rabbits" class="rabbit-grid"></div></section>
+<section><h2>Amis, plein écran et chargement</h2><div id="controls" class="grid"></div></section>
+<section><h2>Navigation principale</h2><div id="navigation" class="grid"></div></section>
+<section><h2>Rubriques des réglages</h2><div id="settings" class="grid"></div></section>
+</main><script>
+// Même maison A pour chaque proposition ; seuls les groupes animés changent.
+const homeAnimations = [
+  ['A', 'Pointe du toit', 'La pointe du toit se soulève doucement : c’est le mouvement actuel.', 'home-roof-peak', '', '', ''],
+  ['B', 'Porte entrouverte', 'La porte pivote légèrement, comme une invitation à entrer.', '', '', 'home-door', ''],
+  ['C', 'Petit bond', 'La maison entière fait un petit saut sur place.', '', '', '', 'home-bounce'],
+  ['D', 'Toit soulevé', 'Tout le toit se lève puis se repose sur la maison.', 'home-roof-rise', '', '', ''],
+  ['E', 'Trait vivant', 'Les contours se dessinent brièvement puis reviennent.', 'home-outline', 'home-outline', 'home-outline', ''],
+  ['F', 'Maison qui salue', 'La maison se penche délicatement sur le côté.', '', '', '', 'home-tilt']
+];
+function homeAnimationSvg(roof, walls, door, whole, size) {
+  const motion = name => name ? ` class="home-motion ${name}"` : '';
+  return `<svg class="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><g${motion(whole)}><path${motion(roof)} d="M3.5 11 L12 4 L20.5 11"/><path${motion(walls)} d="M6 10 L6 20 L18 20 L18 10"/><path${motion(door)} d="M10 20 L10 14 L14 14 L14 20"/></g></svg>`;
+}
+document.getElementById('home-animations').innerHTML = homeAnimations.map(([letter, name, description, roof, walls, door, whole]) => `
+  <article class="home-choice"><h3><strong>${letter}</strong> ${name}</h3>
+    <div class="home-visuals">${homeAnimationSvg(roof, walls, door, whole, 'home-big')}
+      <div class="home-tab">${homeAnimationSvg(roof, walls, door, whole, '')}<span>Accueil</span></div>
+    </div><p class="home-description">${description}</p>
+  </article>`).join('');
+
+// Galerie de propositions : indépendantes du chargement actuel dans Lapinux.
+const rabbits = [
+  ['A', 'Tête sauteuse', 'La version actuelle : une tête aux longues oreilles sautille.', `<g class="rabbit-move rabbit-hop"><path d="M20 27C15 15 16 5 21 5s7 10 7 18M44 27C49 15 48 5 43 5s-7 10-7 18M20 27C4 33 10 57 32 57s28-24 12-30M28 23c2-1 6-1 8 0"/><circle cx="24" cy="42" r="2" fill="currentColor" stroke="none"/><circle cx="40" cy="42" r="2" fill="currentColor" stroke="none"/></g>`],
+  ['B', 'Grandes oreilles', 'Seules les oreilles se balancent, la tête reste tranquille.', `<g class="rabbit-move rabbit-ear"><path d="M22 28C13 15 13 3 19 3c5 0 10 11 10 22M42 28C51 15 51 3 45 3c-5 0-10 11-10 22"/></g><path d="M17 31c0-8 7-11 15-11s15 3 15 11v9c0 9-7 16-15 16s-15-7-15-16z"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 46 2 2 2-2"/>`],
+  ['C', 'Bélier', 'Un lapin aux oreilles tombantes se balance doucement.', `<g class="rabbit-move rabbit-rock"><path d="M19 29C7 25 5 36 10 47c2 5 7 4 8 0M45 29c12-4 14 7 9 18-2 5-7 4-8 0"/><circle cx="32" cy="35" r="16"/><circle cx="26" cy="36" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="36" r="1.8" fill="currentColor" stroke="none"/><path d="m30 42 2 2 2-2M27 47c3 2 7 2 10 0"/></g>`],
+  ['D', 'Boule de poils', 'Un petit lapin rond se tasse puis rebondit.', `<g class="rabbit-move rabbit-squash"><path d="M22 23C15 13 17 5 21 5s7 9 8 16M42 23c7-10 5-18 1-18s-7 9-8 16"/><circle cx="32" cy="39" r="17"/><circle cx="26" cy="38" r="2" fill="currentColor" stroke="none"/><circle cx="38" cy="38" r="2" fill="currentColor" stroke="none"/><path d="M29 45q3 4 6 0M21 53l-3 3M43 53l3 3"/></g>`],
+  ['E', 'Clin d’œil', 'Le lapin ferme un œil en attendant.', `<path d="M21 26C16 15 17 5 22 5s6 10 7 17M43 26C48 15 47 5 42 5s-6 10-7 17M19 29C8 34 12 56 32 56s24-22 13-27M29 22h6"/><circle cx="25" cy="39" r="2" fill="currentColor" stroke="none"/><g class="rabbit-move rabbit-blink"><circle cx="39" cy="39" r="2" fill="currentColor" stroke="none"/></g><path d="M29 45q3 3 6 0"/>`],
+  ['F', 'Curieux', 'Un lapin se hisse pour regarder par-dessus le bord.', `<g class="rabbit-move rabbit-peek"><path d="M21 32C15 17 17 5 22 5s7 12 7 23M43 32C49 17 47 5 42 5s-7 12-7 23M17 39c0-9 6-14 15-14s15 5 15 14v12H17z"/><circle cx="26" cy="40" r="2" fill="currentColor" stroke="none"/><circle cx="38" cy="40" r="2" fill="currentColor" stroke="none"/><path d="m30 46 2 2 2-2"/></g><path d="M10 51h44M20 51v5M44 51v5"/>`],
+  ['G', 'Petit saut', 'Un lapin entier bondit sur place.', `<g class="rabbit-move rabbit-hop"><path d="M19 32c-4-10 0-18 4-17 3 1 5 7 5 11M34 25c0-12 4-20 8-19 4 2 2 12-1 20"/><path d="M18 35c-3 9 4 16 14 16 6 0 9-3 11-7 5-1 8-5 8-10 0-6-4-10-10-10-5 0-9 2-12 6-5-2-9 0-11 5zM22 51l-3 4h10M35 50l4 5h8"/><circle cx="43" cy="32" r="1.7" fill="currentColor" stroke="none"/><circle cx="15" cy="40" r="3"/></g><path d="M15 59h35" opacity=".45"/>`],
+  ['H', 'Lapin coureur', 'Une silhouette de profil s’élance comme dans un jeu.', `<g class="rabbit-move rabbit-run"><path d="M19 35c0-7 7-11 15-10l4-8 2-9c1-3 5-2 4 1l-1 9c6 1 9 5 9 10 0 5-3 8-8 9-2 6-6 10-14 10H19c-5 0-8-3-8-6 0-4 3-6 8-6zM20 47l-5 7h10M36 45l5 8h8M16 35l-4-3"/><circle cx="46" cy="27" r="1.7" fill="currentColor" stroke="none"/></g><path d="M8 57h45" opacity=".45"/>`],
+  ['I', 'Assis', 'Un lapin assis se dandine de gauche à droite.', `<g class="rabbit-move rabbit-rock"><path d="M23 24C17 12 18 3 22 3c5 0 7 11 7 19M41 24C47 12 46 3 42 3c-5 0-7 11-7 19"/><circle cx="32" cy="29" r="12"/><path d="M23 38c-5 4-7 9-6 15h30c1-6-1-11-6-15M17 53c-3 0-4 3-1 4h11M47 53c3 0 4 3 1 4H37"/><circle cx="28" cy="29" r="1.5" fill="currentColor" stroke="none"/><circle cx="36" cy="29" r="1.5" fill="currentColor" stroke="none"/></g>`],
+  ['J', 'Silhouette', 'Une forme pleine et simple rebondit, pensée pour les petites tailles.', `<g class="rabbit-move rabbit-hop" fill="currentColor" stroke="none"><ellipse cx="23" cy="20" rx="5" ry="16" transform="rotate(-12 23 20)"/><ellipse cx="41" cy="20" rx="5" ry="16" transform="rotate(12 41 20)"/><ellipse cx="32" cy="41" rx="19" ry="16"/></g>`],
+  ['K', 'Lapin étoilé', 'Deux petites étoiles scintillent autour du lapin.', `<path d="M21 27C15 17 17 5 22 5s7 10 7 19M43 27C49 17 47 5 42 5s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 24h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 45 2 2 2-2"/><g class="rabbit-move rabbit-stars"><path d="M7 16v8M3 20h8M56 36v8M52 40h8"/></g>`],
+  ['L', 'Pixel', 'Un lapin carré à l’esprit rétro fait un petit saut.', `<g class="rabbit-move rabbit-hop"><path d="M18 25V7h8v16h12V7h8v18h5v26h-5v5H18v-5h-5V25z"/><path d="M22 37h4v4h-4zM38 37h4v4h-4zM28 47h8"/></g>`]
+];
+const starRabbits = [
+  ['M', 'Étoiles jumelles', 'Deux étoiles brillent en alternance autour du lapin.', `<path d="M21 27C15 17 17 5 22 5s7 10 7 19M43 27C49 17 47 5 42 5s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 24h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 45 2 2 2-2"/><g class="rabbit-move rabbit-stars"><path d="M7 16v8M3 20h8"/></g><g class="rabbit-move rabbit-stars" style="animation-delay:-.7s"><path d="M56 36v8M52 40h8"/></g>`],
+  ['N', 'Poussière d’étoiles', 'Trois petites étincelles apparaissent autour du visage.', `<path d="M21 27C15 17 17 5 22 5s7 10 7 19M43 27C49 17 47 5 42 5s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 24h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 45 2 2 2-2"/><path class="rabbit-move rabbit-stars" d="M8 26v7M4.5 29.5h7"/><path class="rabbit-move rabbit-stars" style="animation-delay:-.45s" d="M55 13v9M50.5 17.5h9"/><circle class="rabbit-move rabbit-stars" style="animation-delay:-.9s" cx="54" cy="50" r="1.7" fill="currentColor" stroke="none"/>`],
+  ['O', 'Étoile filante', 'Une étoile passe au-dessus des oreilles.', `<path d="M21 27C15 17 17 5 22 5s7 10 7 19M43 27C49 17 47 5 42 5s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 24h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 45 2 2 2-2"/><g class="star-tail"><path d="M47 7v8M43 11h8M49 17l6 4M52 13l6 4"/></g>`],
+  ['P', 'Petit astre', 'Un point étoilé tourne autour d’une tête ronde.', `<path d="M20 25C15 14 17 4 22 4s7 10 7 18M44 25C49 14 47 4 42 4s-7 10-7 18M20 25L19 29c-9 8-5 25 13 25s22-17 13-25L44 25M29 22h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 45 2 2 2-2"/><g class="star-orbit"><circle cx="55" cy="32" r="2.6" fill="currentColor" stroke="none"/></g>`],
+  ['Q', 'Couronne magique', 'Trois étoiles forment une petite couronne au-dessus du lapin.', `<path d="M21 27C15 17 17 7 22 7s7 10 7 19M43 27C49 17 47 7 42 7s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 26h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 45 2 2 2-2"/><g class="rabbit-move rabbit-stars"><path d="M32 3v8M28 7h8M10 16v6M7 19h6M54 16v6M51 19h6"/></g>`],
+  ['R', 'Rêve de lune', 'Un croissant de lune et une étoile flottent près du lapin.', `<path d="M21 27C15 17 17 5 22 5s7 10 7 19M43 27C49 17 47 5 42 5s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 24h6"/><path d="M23 39q3 2 6 0M35 39q3 2 6 0m-11 6 2 2 2-2"/><g class="star-dream"><path d="M52 12a7 7 0 0 0 5 12A7 7 0 0 1 52 12zM8 20v8M4 24h8"/></g>`],
+  ['S', 'Étoile complice', 'Le lapin fait un clin d’œil pendant que son étoile brille.', `<path d="M21 27C15 17 17 5 22 5s7 10 7 19M43 27C49 17 47 5 42 5s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 24h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle class="star-wink" cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="M29 45q3 3 6 0"/><path class="rabbit-move rabbit-stars" d="M55 17v12M49 23h12"/>`],
+  ['T', 'Petit bond étoilé', 'Le lapin sautille tandis qu’une étoile scintille à côté.', `<g class="rabbit-move rabbit-hop"><path d="M21 27C15 17 17 5 22 5s7 10 7 19M43 27C49 17 47 5 42 5s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 24h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 45 2 2 2-2"/></g><path class="rabbit-move rabbit-stars" d="M55 23v10M50 28h10"/>`]
+];
+const bunnyFace = `<path d="M21 27C15 17 17 5 22 5s7 10 7 19M43 27C49 17 47 5 42 5s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 24h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 45 2 2 2-2"/>`;
+const newStarRabbits = [
+  ['U', 'Constellation', 'Trois étoiles scintillent reliées par un chemin discret.', `${bunnyFace}<path d="M5 20l6 8-4 9" opacity=".45"/><g class="rabbit-move rabbit-stars"><path d="M5 16v8M1 20h8M11 25v6M8 28h6M7 34v6M4 37h6"/></g>`],
+  ['V', 'Halo d’étoiles', 'Un petit astre tourne autour du visage comme une orbite.', `${bunnyFace}<g class="star-orbit"><path d="M54 28v8M50 32h8"/><circle cx="11" cy="19" r="1.3" fill="currentColor" stroke="none"/></g>`],
+  ['W', 'Pétillant', 'Des étoiles s’illuminent de chaque côté, en alternance.', `${bunnyFace}<g class="rabbit-move rabbit-stars"><path d="M7 19v10M2 24h10M11 41v6M8 44h6"/></g><g class="rabbit-move rabbit-stars" style="animation-delay:-.7s"><path d="M55 19v10M50 24h10M53 42v6M50 45h6"/></g>`],
+  ['X', 'Météore', 'Une étoile et sa traînée traversent le ciel près du lapin.', `${bunnyFace}<g class="star-tail"><path d="M53 9v10M48 14h10M49 22l-5 5M53 23l-4 4"/></g>`],
+  ['Y', 'Doux rêve', 'Le lapin ferme les yeux sous une lune et des étoiles.', `<path d="M21 27C15 17 17 5 22 5s7 10 7 19M43 27C49 17 47 5 42 5s-7 10-7 19M21 27L19 30c-9 7-5 24 13 24s22-17 13-24L43 27M29 24h6M23 39q3 2 6 0M35 39q3 2 6 0m-11 6 2 2 2-2"/><g class="star-dream"><path d="M51 9a8 8 0 0 0 6 13A8 8 0 0 1 51 9zM7 18v8M3 22h8M8 36v5M5.5 38.5h5"/></g>`],
+  ['Z', 'Saut cosmique', 'Le lapin bondit doucement entre deux étoiles brillantes.', `<g class="rabbit-move rabbit-hop">${bunnyFace}</g><g class="rabbit-move rabbit-stars"><path d="M6 17v10M1 22h10M57 34v10M52 39h10"/></g>`]
+];
+const freshStarRabbits = [
+  ['AA', 'Lapin voyageur', 'Un lapin de profil bondit sous une étoile filante.', `<g class="rabbit-move rabbit-run"><path d="M15 39c0-6 6-10 13-10 2-5 6-8 11-8l2-12c.4-3 4-4 5-1l-1 14c4 2 6 5 6 9 0 5-3 8-8 9-2 5-6 8-13 8H18c-5 0-8-2-8-5 0-2 2-4 5-4zM19 48l-4 6h9M34 47l4 7h8"/><circle cx="44" cy="30" r="1.6" fill="currentColor" stroke="none"/><circle cx="11" cy="36" r="3"/></g><g class="star-tail"><path d="M54 8v8M50 12h8M49 19l-5 3"/></g>`],
+  ['AB', 'Bélier céleste', 'Un lapin aux oreilles tombantes rêve parmi les étoiles.', `<g class="rabbit-move rabbit-float"><path d="M19 28C8 23 6 33 10 44c2 6 6 6 8 1M45 28c11-5 13 5 9 16-2 6-6 6-8 1"/><circle cx="32" cy="35" r="15"/><path d="M23 35q3 2 6 0M35 35q3 2 6 0M30 42l2 2 2-2"/></g><g class="rabbit-move rabbit-stars"><path d="M7 13v8M3 17h8M56 16v8M52 20h8"/></g>`],
+  ['AC', 'Lapin dans la lune', 'Un lapin endormi repose au creux d’un croissant lumineux.', `<path d="M17 15C8 21 8 39 17 49c8 9 24 9 33-1-14 4-28-6-27-21 0-4 1-8 3-11"/><g class="star-dream"><path d="M24 37c2-7 8-10 14-7 4 1 6 5 6 9 0 5-4 8-10 8h-9M28 30c-3-8-1-13 2-13 3 1 4 6 4 12M35 29c0-7 3-12 6-11 3 2 1 8-1 12M36 37q2 2 4 0"/><path d="M50 9v8M46 13h8M13 12v6M10 15h6"/></g>`],
+  ['AD', 'Petit astronaute', 'Un lapin casqué flotte dans l’espace avec ses étoiles.', `<g class="rabbit-move rabbit-float"><circle cx="32" cy="33" r="17"/><path d="M23 23C19 14 20 7 23 7s6 8 6 14M41 23C45 14 44 7 41 7s-6 8-6 14M20 35c1-7 6-11 12-11s11 4 12 11c0 8-5 12-12 12s-12-4-12-12zM22 50v6h20v-6"/><circle cx="27" cy="35" r="1.5" fill="currentColor" stroke="none"/><circle cx="37" cy="35" r="1.5" fill="currentColor" stroke="none"/></g><path class="rabbit-move rabbit-stars" d="M7 14v8M3 18h8M56 20v8M52 24h8"/>`],
+  ['AE', 'Oreilles scintillantes', 'Une tête ronde dont les oreilles font apparaître des étincelles.', `<g class="rabbit-move rabbit-ear"><path d="M21 27C16 16 17 5 22 5s7 10 7 19M43 27C48 16 47 5 42 5s-7 10-7 19"/></g><path d="M21 27L19 30c-9 7-5 24 13 24s22-17 13-24l-2-3M29 24h6"/><circle cx="26" cy="39" r="1.8" fill="currentColor" stroke="none"/><circle cx="38" cy="39" r="1.8" fill="currentColor" stroke="none"/><path d="m30 45 2 2 2-2"/><g class="rabbit-move rabbit-stars"><path d="M7 15v9M2.5 19.5h9M57 15v9M52.5 19.5h9"/></g>`],
+  ['AF', 'Lapin et étoile', 'Un petit lapin tient une étoile entre ses pattes.', `<g class="rabbit-move rabbit-squash"><path d="M22 25C17 15 18 5 22 5s7 9 7 18M42 25C47 15 46 5 42 5s-7 9-7 18M21 27c-8 6-5 19 4 22M43 27c8 6 5 19-4 22M29 23h6"/><circle cx="26" cy="36" r="1.7" fill="currentColor" stroke="none"/><circle cx="38" cy="36" r="1.7" fill="currentColor" stroke="none"/><path d="m32 40 2.3 4.3 4.8.7-3.5 3.5.8 4.8-4.4-2.3-4.4 2.3.8-4.8-3.5-3.5 4.8-.7zM21 51l4-3M43 51l-4-3"/></g><path class="rabbit-move rabbit-stars" d="M8 17v8M4 21h8M56 17v8M52 21h8"/>`],
+  ['AG', 'Veilleur de nuit', 'Un lapin assis regarde les étoiles qui clignotent.', `<g class="rabbit-move rabbit-rock"><path d="M24 26C18 15 19 5 23 5s7 10 7 19M40 26C46 15 45 5 41 5s-7 10-7 19"/><circle cx="32" cy="32" r="10"/><path d="M25 40c-5 3-7 8-6 13h26c1-5-1-10-6-13M19 53l-3 4h10M45 53l3 4H38"/><circle cx="28" cy="32" r="1.5" fill="currentColor" stroke="none"/><circle cx="36" cy="32" r="1.5" fill="currentColor" stroke="none"/></g><g class="rabbit-move rabbit-stars"><path d="M8 12v8M4 16h8M56 13v8M52 17h8M54 32v6M51 35h6"/></g>`],
+  ['AH', 'Lapin comète', 'Un lapin stylisé traverse une traînée d’étoiles.', `<g class="rabbit-move rabbit-float"><path d="M24 27C18 16 19 5 23 5s7 10 7 19M40 27C46 16 45 5 41 5s-7 10-7 19M24 27c-8 4-9 16-3 22 6 7 17 7 23 0s5-18-4-22M30 24h4"/><circle cx="27" cy="38" r="1.7" fill="currentColor" stroke="none"/><circle cx="37" cy="38" r="1.7" fill="currentColor" stroke="none"/><path d="M29 45q3 3 6 0"/></g><g class="star-tail"><path d="M8 26v8M4 30h8M8 39l7-3M6 45l9-4M54 13v8M50 17h8"/></g>`]
+];
+function renderRabbits(target, choices) {
+  document.getElementById(target).innerHTML = choices.map(([letter, name, description, drawing]) => {
+    const svg = size => `<svg class="${size}" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${drawing}</svg>`;
+    return `<article class="rabbit-card"><h3 class="rabbit-title"><strong>${letter}</strong> ${name}</h3><div class="rabbit-visuals">${svg('rabbit-big')}${svg('rabbit-tiny')}</div><p class="rabbit-note">${description}</p></article>`;
+  }).join('');
+}
+renderRabbits('fresh-star-rabbits', freshStarRabbits);
+renderRabbits('chosen-rabbits', [...starRabbits.filter(([letter]) => ['M', 'Q', 'R', 'S'].includes(letter)), ...freshStarRabbits.filter(([letter]) => letter === 'AE')]);
+renderRabbits('new-star-rabbits', newStarRabbits);
+renderRabbits('star-rabbits', starRabbits);
+renderRabbits('rabbits', rabbits);
+// Chaque groupe mobile correspond à une partie du dessin natif.
+const designs = {
+ library: ['Un livre sort de l’étagère', `<path d="M3 5.5h4v13H3zM3 15.5h4M15 6l3.5-1 3 12.5-3.5 1z"/><g class="m book"><path d="M9 5.5h4v13H9zM9 15.5h4"/></g>`],
+ collections: ['L’étoile pivote', `<rect x="5" y="6" width="14" height="14" rx="2"/><path d="M8 3h11l2 2v11"/><path class="m star" d="M12 9.5l1.2 2.3 2.6.4-1.9 1.8.5 2.6-2.4-1.3-2.4 1.3.5-2.6-1.9-1.8 2.6-.4z"/>`],
+ news: ['Les titres se déploient en cascade', `<path d="M5 4h14v16H5zM3 7v13h14"/><path class="m lines" d="M8 8h8M8 11h8M8 14h5M8 17h7"/>`],
+ downloads: ['La flèche descend vers le plateau', `<path class="m arrow" d="M12 3v11M8 10l4 4 4-4"/><path d="M4 15v3l1 2h14l1-2v-3"/>`],
+ controllers: ['La manette pivote et deux traits évoquent une vibration', `<g class="m controller-press"><path d="M7.5 6h9c3.9 0 4 5 4.8 8.8.8 3.3-1.7 5.2-3.5 3L16 15.4H8l-1.8 2.4c-1.8 2.2-4.3.3-3.5-3.0l1-4.4C4.4 7.6 5.5 6 7.5 6zM6.5 10.4h4M8.5 8.4v4"/><circle cx="15.5" cy="9.8" r=".85" fill="currentColor" stroke="none"/><circle cx="18" cy="12.3" r=".85" fill="currentColor" stroke="none"/></g><path class="m controller-vibration" d="M.5 9.5v3M23.5 9.5v3"/>`],
+ profile: ['La tête se soulève', `<circle class="m head" cx="12" cy="8" r="3.5"/><path d="M5 20v-1.5c0-7.3 14-7.3 14 0V20z"/>`],
+ stores: ['Le battant de la porte pivote dans son cadre', `<path d="M4 10v9h16v-9M3 6l1-3h16l1 3v2c0 2.3-2.2 2.7-3.6 1.7-1 1-2.4 1-3.4 0-1 1-2.4 1-3.4 0-1 1-2.4 1-3.4 0C5.8 10.7 3 10.3 3 8V6M7 19v-5h4v5"/><path class="m door" style="transform-origin:left top" d="M7 14h4v5"/>`],
+ captures: ['Le soleil de l’image grandit', `<rect x="3" y="4" width="18" height="16" rx="2"/><circle class="m sun" cx="8" cy="9" r="1.5"/><path d="m4 17 5-5 3.5 3.5 2.5-2.5 5 5"/>`],
+ general: ['Un réglage descend', `<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18M7 12h4M7 16h7"/><circle class="m slider" cx="16.5" cy="12" r=".7" fill="currentColor" stroke="none"/><circle cx="16.5" cy="16" r=".7" fill="currentColor" stroke="none"/>`],
+ appearance: ['Un pinceau apparaît sur la palette', `<g class="m palette"><path d="M12 3a9 9 0 1 0 0 18h1a2 2 0 0 0 1.6-3.2 1.7 1.7 0 0 1 1.4-2.8h1.5a3.5 3.5 0 0 0 3.5-3.5C21 6.8 17 3 12 3z"/><circle cx="7.5" cy="11" r=".85" fill="currentColor" stroke="none"/><circle cx="10" cy="7.5" r=".85" fill="currentColor" stroke="none"/><circle cx="14" cy="7.5" r=".85" fill="currentColor" stroke="none"/><circle cx="17" cy="10" r=".85" fill="currentColor" stroke="none"/></g><g class="m brush"><path d="M12 14.5l6.5-7 1.5 1.5-6.5 7zM12 14.5c-1.5.2-2 2.3-3 3 2.1.1 4.2.1 4.5-1.5"/></g>`],
+ accounts: ['Le second compte s’écarte', `<circle cx="9" cy="8" r="3"/><path d="M3.5 19v-1c0-6 11-6 11 0v1z"/><path class="m person" d="M16 5.5a3 3 0 0 1 0 5.8M16.5 14c2.5.3 4 1.7 4 4v1"/>`],
+ storage: ['Le voyant du disque s’allume', `<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 15h18"/><circle cx="7" cy="17" r=".7" fill="currentColor" stroke="none"/><circle class="m disk-light" cx="10" cy="17" r=".7" fill="currentColor" stroke="none"/>`],
+ saves: ['Le volet de la disquette se referme', `<path d="M4 3h13l3 3v14H4zM7 20v-7h10v7M13 5v2"/><path class="m shutter" d="M7 3v6h9V3"/>`],
+ protons: ['Les orbites tournent', `<circle cx="12" cy="12" r="1.5"/><g class="m orbit"><ellipse cx="12" cy="12" rx="9" ry="4"/><ellipse cx="12" cy="12" rx="9" ry="4" transform="rotate(60 12 12)"/><ellipse cx="12" cy="12" rx="9" ry="4" transform="rotate(120 12 12)"/></g>`],
+ system: ['Le cœur de la puce réagit', `<rect x="6" y="6" width="12" height="12" rx="2"/><rect class="m chip" x="9" y="9" width="6" height="6" rx=".5"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/>`],
+ doctor: ['La courbe de diagnostic bat', `<rect x="3" y="4" width="18" height="16" rx="2"/><path class="m heartbeat" d="M5 12h3l1.5-3 3 6 2-4 1 1H19"/>`],
+ logs: ['Les lignes du journal alternent', `<path d="M5 3h11l3 3v15H5zM15 3v4h4"/><path class="m journal" d="M8 10h8M8 16h6"/><path class="m journal-alt" d="M8 13h8"/>`],
+ application: ['Les deux oreilles du lapin gigotent ensemble', `<path class="m ear-left" d="M8 9.44 C6 7 5.5 3 7 3 C8.6 3 10.2 6.2 10.5 8.78"/><path class="m ear-right" d="M16 9.42 C18 7 18.5 3 17 3 C15.4 3 13.8 6.2 13.5 8.79"/><path d="M7 10C5.3 11.1 4.5 12.8 4.5 14.5C4.5 18.3 7.8 21 12 21C16.2 21 19.5 18.3 19.5 14.5C19.5 10.5 16 8.7 12 8.7C10 8.7 8.3 9.1 7 10zM9 14h.1M15 14h.1M11 17h2"/>`],
+ notifications: ['Une seconde onde arrondie apparaît puis disparaît', `<path d="M3 10h4l9-4v12l-9-4H3zM7 14l1.4 5H11l-1.2-3.7M18 9c2.5 1.5 2.5 4.5 0 6"/><path class="m sound-wave" d="M20.5 7c3.5 2.5 3.5 7.5 0 10"/>`],
+ friends: ['Les deux amis se saluent', `<g class="m friend-left"><circle cx="7.5" cy="8" r="2.8"/><path d="M3 18.5c0-6 9-6 9 0"/></g><g class="m friend-right"><circle cx="16.5" cy="8" r="2.8"/><path d="M12 18.5c0-6 9-6 9 0"/></g><path d="M3 19h18"/>`],
+ fullscreen: ['Les quatre flèches s’ouvrent vers les coins', `<path class="m corners" d="M7 3H3v4M17 3h4v4M7 21H3v-4M17 21h4v-4M8.5 8.5 5 5M15.5 8.5 19 5M8.5 15.5 5 19M15.5 15.5 19 19"/>`],
+ loading: ['Un petit lapin saute pendant le chargement', `<g class="loader"><path d="M8 10C6 6 6 3 7.5 3S10 6.5 10 9M16 10C18 6 18 3 16.5 3S14 6.5 14 9M8 10C2 12 4 21 12 21s10-9 4-11M10 9c1-.5 3-.5 4 0"/><circle cx="9" cy="15" r=".8" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r=".8" fill="currentColor" stroke="none"/></g>`]
+};
+const gearPoints = [];
+for (let tooth = 0; tooth < 8; tooth++) for (const [offset,radius] of [[-.5,7.2],[-.34,9.2],[.34,9.2],[.5,7.2]]) {
+  const angle=(tooth+offset)*Math.PI*2/8; gearPoints.push(`${12+radius*Math.cos(angle)},${12+radius*Math.sin(angle)}`);
+}
+designs.settings=['Les huit dents de l’engrenage tournent', `<polygon class="m gear" points="${gearPoints.join(' ')}"/><circle cx="12" cy="12" r="3.1"/>`];
+designs.librarySettings = ['Les livres se réorganisent', `<g class="m book-side"><path d="M3 5.5h4v13H3zM3 15.5h4"/></g><path d="M9 5.5h4v13H9zM9 15.5h4"/><path class="m lean-book" style="transform-origin:center bottom" d="M15 6l3.5-1 3 12.5-3.5 1z"/>`];
+designs.capturesSettings = ['Les montagnes de l’image se soulèvent', `<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8" cy="9" r="1.5"/><path class="m mountain" style="transform-origin:center bottom" d="m4 17 5-5 3.5 3.5 2.5-2.5 5 5"/>`];
+const navigation = [['Bibliothèque','library'],['Collections','collections'],['Actualités','news'],['Téléchargements','downloads'],['Manettes','controllers'],['Profil','profile'],['Boutiques','stores'],['Captures','captures'],['Réglages','settings']];
+const settings = [['Général','general'],['Apparence','appearance'],['Bibliothèque','librarySettings'],['Comptes','accounts'],['Stockage','storage'],['Sauvegardes','saves'],['Protons','protons'],['Captures','capturesSettings'],['Système','system'],['Diagnostic','doctor'],['Journaux','logs'],['Application','application']];
+const controls = [['Amis','friends'],['Plein écran','fullscreen'],['Notifications','notifications'],['Chargement','loading']];
+function icon(drawing,size) { return `<svg class="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${drawing}</svg>`; }
+function render(target,items) {
+  document.getElementById(target).innerHTML = items.map(([title,key]) => {
+    const [description,drawing]=designs[key];
+    return `<article><h3>${title}</h3><div class="icons">${icon(drawing,'large')}${icon(drawing,'small')}</div><p class="description">${description}</p></article>`;
+  }).join('');
+}
+render('navigation',navigation); render('settings',settings); render('controls',controls);
+// Représentation indicative des dimensions et des mêmes tracés que la barre native.
+const demoSvg = drawing => `<svg class="demo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${drawing}</svg>`;
+const demoControls = [
+  ['Plein écran', `<path d="M7 3H3v4M17 3h4v4M7 21H3v-4M17 21h4v-4M8.5 8.5 5 5M15.5 8.5 19 5M8.5 15.5 5 19M15.5 15.5 19 19"/>`],
+  ['Notifications', designs.notifications[1]],
+  ['Amis', `<circle cx="7.5" cy="8" r="2.8"/><path d="M3 18.5c0-6 9-6 9 0M12 18.5c0-6 9-6 9 0M3 19h18"/><circle cx="16.5" cy="8" r="2.8"/>`],
+  ['Réglages', designs.settings[1]]
+];
+const demoSettings = [
+  ['Général', designs.general[1]], ['En jeu', designs.controllers[1]],
+  ['Apparence', designs.appearance[1]], ['Bibliothèque', designs.library[1]],
+  ['Comptes', designs.accounts[1]]
+];
+document.getElementById('size-demo').innerHTML = `<h3>Barre supérieure · tailles ajustées</h3><div class="demo-bar"><div class="demo-group">${['library','collections','news','downloads','controllers','profile','stores','captures'].map(key => `<div class="demo-segment" title="${key}">${demoSvg(designs[key][1])}</div>`).join('')}</div><div class="demo-group">${demoControls.map(([name,drawing]) => `<div class="demo-segment" title="${name}" aria-label="${name}">${demoSvg(drawing)}</div>`).join('')}</div></div><p class="demo-note">Mégaphone : entre Plein écran et Amis. Les zones de clic restent inchangées dans l’application.</p><h3 style="margin-top:22px">Rail des réglages</h3><div class="demo-rail">${demoSettings.map(([name,drawing],index) => `<div class="demo-row${index === 1 ? ' selected' : ''}">${demoSvg(drawing)}<span>${name}</span></div>`).join('')}</div><p class="demo-note">Cette page est une maquette approximative, pas une capture de l’application native.</p>`;
+const pause = document.getElementById('pause');
+pause.addEventListener('click', () => {
+  const paused = document.body.classList.toggle('paused');
+  pause.setAttribute('aria-pressed', String(paused));
+  pause.textContent = paused ? 'Reprendre' : 'Mettre en pause';
+});
+if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  document.getElementById('reduced').hidden = false;
+  pause.hidden = true;
+}
+</script></body></html>

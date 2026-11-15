@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in Lapinux does not work as expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Remove tokens, account names and private paths
+        before posting. For a security problem, use SECURITY.md instead.
+  - type: input
+    id: version
+    attributes:
+      label: Lapinux version
+      placeholder: 0.1.1 (output of `lapinux --version`)
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and desktop
+      placeholder: Fedora 42, GNOME 48, Wayland
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: GPU and driver
+      placeholder: RX 6800, Mesa 25.1
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Manettes
+        2. Select a profile
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual result
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Useful output
+      description: "`lapinux cli doctor`, journal lines, or a screenshot."
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before posting
+      options:
+        - label: I removed credentials and personal paths.
+          required: true
+        - label: I checked that the game itself does not require a store client or a DRM bypass.
+          required: true

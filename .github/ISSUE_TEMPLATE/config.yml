@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installation and troubleshooting
+    url: https://github.com/PissenlitVert/lapinux/blob/main/docs/INSTALLATION.md
+    about: Dependencies, service, udev and storage.
+  - name: Themes, plugins and palettes
+    url: https://github.com/PissenlitVert/lapinux-configurations
+    about: The community catalog lives in its own repository.

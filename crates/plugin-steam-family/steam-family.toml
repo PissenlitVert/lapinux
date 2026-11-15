@@ -1,0 +1,12 @@
+id = "steam-family"
+name = "Steam Famille"
+version = "0.1.0"
+author = "Lapinux"
+description = "Affiche les jeux familiaux connus de Lapinux et ouvre leur fiche."
+
+[native]
+library = "liblapinux_plugin_steam_family.so"
+
+[page]
+title = "Steam Famille"
+subtitle = "Jeux partagés connus du compte connecté."

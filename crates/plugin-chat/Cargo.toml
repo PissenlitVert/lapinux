@@ -1,0 +1,13 @@
+[package]
+name = "lapinux-plugin-chat"
+version = "4.0.0"
+edition = "2021"
+description = "Plugin natif chat rain pour Lapinux"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lapinux-plugin-api = { path = "../plugin-api" }
+serde_json = "1"

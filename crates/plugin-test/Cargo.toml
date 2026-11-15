@@ -1,0 +1,12 @@
+[package]
+name = "lapinux-plugin-test"
+version = "0.1.1"
+edition = "2021"
+description = "Petit plugin natif de test pour Lapinux"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lapinux-plugin-api = { path = "../plugin-api" }

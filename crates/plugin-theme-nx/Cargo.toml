@@ -1,0 +1,13 @@
+[package]
+name = "lapinux-plugin-theme-nx"
+version = "1.0.0"
+edition = "2021"
+description = "Thème natif NX pour Lapinux"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lapinux-plugin-api = { path = "../plugin-api" }
+serde_json = "1"
