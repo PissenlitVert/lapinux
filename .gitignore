@@ -19,3 +19,7 @@
 /screenshots/*
 # Conversations importées : elles contiennent des clés d'API et des jetons.
 .cloud-attachments/
+
+# Maquettes et plans de conception : hors dépôt public
+/assets/*.html
+/assets/plan-*.png
