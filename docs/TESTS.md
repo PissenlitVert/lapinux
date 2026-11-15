@@ -97,8 +97,7 @@ and a temporary profile.
   Ubuntu 22.04 with `/dev/fuse` and `libfuse2`, without
   `--appimage-extract-and-run`. `cli doctor` and `cli config` also pass in
   Ubuntu 24.04 and Fedora. The local runtime used was not independently
-  authenticated; the image remains unsigned. See
-  [AUDIT-PUBLICATION.md](AUDIT-PUBLICATION.md).
+  authenticated; the image remains unsigned.
 
 ## Addendum: diagnostics and security (13 November 2026)
 

@@ -96,8 +96,8 @@ erase them by saving the configuration again.
 
 The logging paths reviewed do not directly record authentication secrets; this
 does not guarantee that every log and error message is free of personal data.
-The Steam session is written as `0600`, but its replacement is not atomic; see the
-[audit](AUDIT-PUBLICATION.md). Covers chosen by hand live in `data/artwork`,
+The Steam session is written as `0600`, but its replacement is not atomic.
+Covers chosen by hand live in `data/artwork`,
 outside the cache, so they survive a cleanup.
 
 ## Conventions

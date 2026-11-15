@@ -119,8 +119,8 @@ sha256sum dist/Lapinux-<version>-x86_64.AppImage
 ## 8. Publish
 
 1. Everything must be committed on `master`, with tests and i18n green.
-2. Re-read [AUDIT-PUBLICATION.md](AUDIT-PUBLICATION.md): licences, runtime,
-   glibc compatibility and personal data in the sources.
+2. Re-check the release: licences, runtime, glibc compatibility and personal
+   data in the sources.
 3. Make the repository public only after that review.
 4. Create a `v<version>` tag and a GitHub release containing the AppImage, its
    SHA-256 and the known limits (tested distributions, FUSE, desktop).

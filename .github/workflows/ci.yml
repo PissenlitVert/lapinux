@@ -34,6 +34,9 @@ jobs:
       - name: Garde i18n
         run: ./scripts/check-i18n.sh
 
+      - name: Liens de la documentation
+        run: ./scripts/check-docs.sh
+
       - name: Vérification du workspace
         run: cargo check --workspace
 

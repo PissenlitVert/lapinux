@@ -14,8 +14,7 @@ are out of scope.
   store client; their coverage remains partial and depends on the games and
   services available. Remote Play is not implemented. Chat goes through the CM
   session: Steam only returns a limited window and the local archive keeps only
-  what was already received. See
-  [RECHERCHE-HISTORIQUE-CHAT-STEAM.md](RECHERCHE-HISTORIQUE-CHAT-STEAM.md).
+  what was already received.
 - Cloud sync compares local and remote data; conflicts and errors must be
   handled before overwriting a save. Capabilities and guarantees vary by store
   and game.

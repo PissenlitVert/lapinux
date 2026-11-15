@@ -11,11 +11,10 @@ introduces Lapinux and points here.
 | [FEATURES.md](FEATURES.md) | learning what Lapinux does | complete reference, by area |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | hitting a problem | symptom → check → fix |
 | [LIMITS.md](LIMITS.md) | evaluating the project | what is not done, and why |
-| [RECHERCHE-HISTORIQUE-CHAT-STEAM.md](RECHERCHE-HISTORIQUE-CHAT-STEAM.md) | looking for a chat history | Steam methods, the two-week window, evidence and the offline probe |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | contributing | crates, IPC, persistence, conventions, where to add code |
 | [TESTS.md](TESTS.md) | contributing | test suite, smoke test, probes |
-| [AUDIT-PUBLICATION.md](AUDIT-PUBLICATION.md) | preparing a release | risks, careful cleanup and remaining checks |
-| [RECHERCHE-HOTE-NATIF.md](RECHERCHE-HOTE-NATIF.md) | researching | measurement notes on `lapinux-probe` |
+
+Internal design notes and release audits are kept outside this repository.
 
 ## Other notices
 
